@@ -9,6 +9,8 @@ class Container:
     name: str
     image: str
     status: str
+    mounts: list[str]
+    networks: list[str]
 
 
 @dataclass
@@ -18,6 +20,7 @@ class Image:
     tag: str
     size: str
     is_dangling: bool
+    used_by: list[str]
 
 
 @dataclass
@@ -25,6 +28,7 @@ class Volume:
     name: str
     driver: str
     mountpoint: str
+    used_by: list[str]
 
 
 @dataclass
@@ -33,6 +37,15 @@ class Network:
     name: str
     driver: str
     scope: str
+    used_by: list[str]
+
+
+@dataclass
+class DockerSnapshot:
+    containers: list[Container]
+    images: list[Image]
+    volumes: list[Volume]
+    networks: list[Network]
 
 
 def fetch_raw_containers() -> str:
@@ -80,7 +93,7 @@ def fetch_raw_volumes() -> str:
 def fetch_raw_networks() -> str:
     try:
         result = subprocess.run(
-            ["docker", "volume", "ls", "--format", "{{json .}}"],
+            ["docker", "network", "ls", "--format", "{{json .}}"],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -91,7 +104,7 @@ def fetch_raw_networks() -> str:
         return ""
 
 
-def get_container() -> list[Container] | None:
+def get_container() -> list[Container]:
     raw_data = fetch_raw_containers()
     if not raw_data:
         return []
@@ -102,14 +115,39 @@ def get_container() -> list[Container] | None:
         if not line:
             continue
         try:
-            jsondata = json.loads(line)
-            all_containers = Container(
-                id=jsondata.get("ID"),
-                name=jsondata.get("Names"),
-                image=jsondata.get("Image"),
-                status=jsondata.get("Status"),
+            data = json.loads(line)
+            cid = data.get("ID", "")
+
+            inspect_raw = subprocess.run(
+                ["docker", "inspect", "--format", "{{json .}}", cid],
+                stdout=subprocess.PIPE,
+                text=True,
+                check=False,
+            ).stdout.strip()
+
+            mount_names = []
+            network_names = []
+
+            if inspect_raw:
+                inspect_data = json.loads(inspect_raw)
+
+                for m in inspect_data.get("Mounts", []):
+                    vol_name = m.get("Name") or m.get("Source", "")
+                    if vol_name:
+                        mount_names.append(vol_name)
+
+                net_dict = inspect_data.get("NetworkSettings", {}).get("Networks", {})
+                network_names = list(net_dict.keys())
+
+            c = Container(
+                id=cid,
+                name=data.get("Names", "").lstrip("/"),
+                image=data.get("Image", ""),
+                status=data.get("Status", ""),
+                mounts=mount_names,
+                networks=network_names,
             )
-            containers.append(all_containers)
+            containers.append(c)
         except json.JSONDecodeError:
             continue
     return containers
@@ -136,6 +174,7 @@ def get_image() -> list[Image]:
                     jsondata.get("Repository") == "<none>"
                     and jsondata.get("Tag") == "<none>"
                 ),
+                used_by=[],
             )
             images.append(all_images)
         except json.JSONDecodeError:
@@ -159,6 +198,7 @@ def get_volume() -> list[Volume]:
                 name=jsondata.get("Name"),
                 driver=jsondata.get("Driver"),
                 mountpoint=jsondata.get("Mountpoint"),
+                used_by=[],
             )
             volumes.append(all_volumes)
         except json.JSONDecodeError:
@@ -183,6 +223,7 @@ def get_network() -> list[Network]:
                 name=jsondata.get("Name"),
                 driver=jsondata.get("Driver"),
                 scope=jsondata.get("Scope"),
+                used_by=[],
             )
             networks.append(all_volumes)
         except json.JSONDecodeError:
@@ -190,14 +231,31 @@ def get_network() -> list[Network]:
     return networks
 
 
-if __name__ == "__main__":
-    container_data, image_data, volume_data, network_data = (
+def fetch_snapshot() -> DockerSnapshot:
+    containers, images, volumes, networks = (
         get_container(),
         get_image(),
         get_volume(),
         get_network(),
     )
-    print(container_data)
-    print(image_data)
-    print(volume_data)
-    print(network_data)
+
+    for i in images:
+        for c in containers:
+            if c.image == i.repository or c.image == f"{i.repository}:{i.tag}":
+                i.used_by.append(c.name)
+
+    for v in volumes:
+        for c in containers:
+            if v.name in c.mounts:
+                v.used_by.append(c.name)
+
+    for n in networks:
+        for c in containers:
+            if n.name in c.networks:
+                n.used_by.append(c.name)
+
+    return DockerSnapshot(containers, images, volumes, networks)
+
+
+if __name__ == "__main__":
+    print(fetch_snapshot())
