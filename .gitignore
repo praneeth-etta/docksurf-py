@@ -3,3 +3,4 @@ __pycache__
 *.pyc
 status.md
 .vscode/
+.ruff_cache/
