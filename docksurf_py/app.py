@@ -29,27 +29,22 @@ class DockSurfApp(App):
             "Name",
             "Image",
             "Status",
-            "ID",
-            "Network",
-            "Mounts",
         ),
         "table-images": (
             "Repository",
             "Tag",
             "Size",
-            "Dangling",
-            "Used By",
+            "Status",
         ),
         "table-volumes": (
             "Name",
             "Driver",
-            "Used By",
+            "Status",
         ),
         "table-networks": (
             "Name",
             "Driver",
             "Scope",
-            "Used By",
         ),
     }
 
@@ -87,29 +82,29 @@ class DockSurfApp(App):
         for c in self.snapshot.containers:
             table.add_row(
                 c.name,
-                c.image,
+                c.image_name,
                 c.status,
-                c.id[:12],
-                str(len(c.networks)),
-                str(len(c.mounts)),
             )
 
     def _populate_image_table(self, table: DataTable) -> None:
         for i in self.snapshot.images:
-            used_str = ", ".join(i.used_by) if i.used_by else "None"
-            table.add_row(i.repository, i.tag, i.size, str(i.is_dangling), used_str)
+            if i.used_by:
+                status = "[green]In Use[/]"
+            elif i.is_dangling:
+                status = "[red]Dangling[/]"
+            else:
+                status = "[yellow]Unused[/]"
+            table.add_row(i.repository, i.tag, i.size, status)
 
     def _populate_volume_table(self, table: DataTable) -> None:
         for v in self.snapshot.volumes:
-            used_str = ", ".join(v.used_by) if v.used_by else "Orphaned"
-            table.add_row(
-                v.name[:20] + "..." if len(v.name) > 20 else v.name, v.driver, used_str
-            )
+            status = "[green]In Use[/]" if v.used_by else "[yellow]Orphaned[/]"
+            name = v.name[:20] + "..." if len(v.name) > 20 else v.name
+            table.add_row(name, v.driver, status)
 
     def _populate_network_table(self, table: DataTable) -> None:
         for n in self.snapshot.networks:
-            used_str = ", ".join(n.used_by) if n.used_by else "None"
-            table.add_row(n.name, n.driver, n.scope, used_str)
+            table.add_row(n.name, n.driver, n.scope)
 
     def populate_tables(self) -> None:
         table_con = self.query_one("#table-containers", DataTable)
@@ -145,8 +140,10 @@ class DockSurfApp(App):
 
         details = {
             "ID": c.id,
-            "Image": c.image,
+            "Image SHA": c.image_id,
             "Status": f"{status_color}{c.status}[/]",
+            "Created": c.created,
+            "Ports": c.ports if c.ports else "None",
             "Networks": "\n".join(c.networks) if c.networks else "None",
             "Mounts": "\n".join(c.mounts) if c.mounts else "None",
         }
@@ -161,10 +158,8 @@ class DockSurfApp(App):
 
         details = {
             "ID": image.id,
-            "Size": image.size,
-            "Dangling": "[red]True[/red]"
-            if image.is_dangling
-            else "[green]False[/green]",
+            "Created": image.created,
+            "Architecture": image.architecture,
             "Used By": "\n".join(image.used_by) if image.used_by else "None",
         }
         pane.update_details(f"Image: {image.repository}:{image.tag}", details)
@@ -177,8 +172,8 @@ class DockSurfApp(App):
         volume = self.snapshot.volumes[row]
 
         details = {
-            "Driver": volume.driver,
             "Mountpoint": volume.mountpoint,
+            "Labels": volume.labels if volume.labels else "None",
             "Used By": "\n".join(volume.used_by)
             if volume.used_by
             else "[yellow]Orphaned (Safe to delete)[/yellow]",
@@ -194,8 +189,8 @@ class DockSurfApp(App):
 
         details = {
             "ID": network.id,
-            "Scope": network.scope,
-            "Driver": network.driver,
+            "Subnet": network.subnet,
+            "Gateway": network.gateway,
             "Used By": "\n".join(network.used_by) if network.used_by else "None",
         }
         pane.update_details(f"Network: {network.name}", details)
