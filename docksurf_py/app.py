@@ -4,7 +4,14 @@ from typing import Callable, TypeVar
 from textual import on, work
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal
-from textual.widgets import DataTable, Footer, Header, TabbedContent, TabPane
+from textual.widgets import (
+    DataTable,
+    Footer,
+    Header,
+    LoadingIndicator,
+    TabbedContent,
+    TabPane,
+)
 
 from docksurf_py.docker import (
     Container,
@@ -39,6 +46,7 @@ def _status_markup(status: str) -> str:
 
 class DockSurfApp(App):
     snapshot: DockerSnapshot | None = None
+    _refresh_in_progress = False
     BINDINGS = [
         ("q", "quit", "Quit"),
         ("r", "refresh", "Refresh"),
@@ -96,13 +104,23 @@ class DockSurfApp(App):
             yield DetailPane(
                 "Select an item on the left to view details...", id="detail-pane"
             )
+        yield LoadingIndicator(id="refresh-loading")
         yield Footer()
 
     def on_mount(self) -> None:
         self.setup_tables()
-        self.populate_tables()
+        self.start_refresh()
 
     def action_refresh(self) -> None:
+        self.start_refresh()
+
+    def start_refresh(self) -> None:
+        """Start one snapshot refresh and expose its progress in the UI."""
+        if self._refresh_in_progress:
+            return
+
+        self._refresh_in_progress = True
+        self.query_one("#refresh-loading", LoadingIndicator).display = True
         self.populate_tables()
 
     def setup_tables(self) -> None:
@@ -148,8 +166,25 @@ class DockSurfApp(App):
 
     @work(thread=True)
     def populate_tables(self) -> None:
-        self.snapshot = fetch_snapshot()
-        self.call_from_thread(self._apply_snapshot, self.snapshot)
+        try:
+            snapshot = fetch_snapshot()
+        except Exception as exc:
+            self.call_from_thread(self._finish_refresh, None, str(exc))
+        else:
+            self.call_from_thread(self._finish_refresh, snapshot, None)
+
+    def _finish_refresh(
+        self, snapshot: DockerSnapshot | None, error: str | None
+    ) -> None:
+        """Apply a worker result and restore the idle refresh state."""
+        try:
+            if snapshot is not None:
+                self._apply_snapshot(snapshot)
+            elif error:
+                self.notify(f"Refresh failed: {error}", severity="error")
+        finally:
+            self._refresh_in_progress = False
+            self.query_one("#refresh-loading", LoadingIndicator).display = False
 
     @on(TabbedContent.TabActivated)
     def clear_on_tab_switch(self) -> None:

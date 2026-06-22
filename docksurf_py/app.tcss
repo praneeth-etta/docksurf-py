@@ -12,3 +12,13 @@ TabbedContent {
     height: 100%;
     padding: 1 2;
 }
+
+/* Customize the refresh overlay here without changing application logic. */
+#refresh-loading {
+    display: none;
+    overlay: screen;
+    width: 100%;
+    height: 100%;
+    align: center middle;
+    background: $surface 35%;
+}
