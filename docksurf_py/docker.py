@@ -3,6 +3,7 @@ import logging
 import subprocess
 from collections import defaultdict
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
 
@@ -14,7 +15,7 @@ class Container:
     image_id: str
     image_name: str
     status: str
-    ports: list[str]
+    ports: str
     mounts: list[str]
     networks: list[str]
     created: str
@@ -73,6 +74,44 @@ def parse_json_lines(raw: str):
                 continue
 
 
+def format_relative_time(ts: str) -> str:
+    """Convert a Docker timestamp string to a human-readable relative age."""
+    if not ts:
+        return "Unknown"
+    ts_clean = ts.replace(" UTC", "").strip()
+    formats = [
+        "%Y-%m-%d %H:%M:%S %z",
+        "%Y-%m-%dT%H:%M:%S.%fZ",
+        "%Y-%m-%dT%H:%M:%SZ",
+        "%Y-%m-%d %H:%M:%S",
+    ]
+    dt = None
+    for fmt in formats:
+        try:
+            dt = datetime.strptime(ts_clean, fmt)
+            break
+        except ValueError:
+            continue
+    if dt is None:
+        return ts
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    diff = int((datetime.now(timezone.utc) - dt).total_seconds())
+    if diff < 0:
+        return "just now"
+    if diff < 60:
+        return f"{diff}s ago"
+    if diff < 3600:
+        return f"{diff // 60}m ago"
+    if diff < 86400:
+        return f"{diff // 3600}h ago"
+    if diff < 86400 * 30:
+        return f"{diff // 86400}d ago"
+    if diff < 86400 * 365:
+        return f"{diff // (86400 * 30)}mo ago"
+    return f"{diff // (86400 * 365)}y ago"
+
+
 def run_docker_command(*args: str) -> str:
     try:
         result = subprocess.run(
@@ -91,28 +130,36 @@ def run_docker_command(*args: str) -> str:
         return ""
 
 
-def inspect_containers(container_ids: list[str]) -> dict:
-    if not container_ids:
-        return {}
+def _run_management_command(*args: str) -> tuple[bool, str]:
+    """Run a docker management command; return (success, message)."""
+    result = subprocess.run(["docker", *args], capture_output=True, text=True)
+    if result.returncode == 0:
+        return True, result.stdout.strip() or "OK"
+    return False, result.stderr.strip() or "Command failed"
+
+
+def _docker_inspect(*ids: str) -> list[dict]:
 
     result = subprocess.run(
-        ["docker", "inspect", *container_ids],
+        ["docker", "inspect", *ids],
         capture_output=True,
         text=True,
         check=False,
     )
-
     if result.returncode != 0:
-        logger.warning(
-            "docker inspect failed for %d containers",
-            len(container_ids),
-        )
-        return {}
-
+        logger.warning("docker inspect failed")
+        return []
     if not result.stdout:
+        return []
+    inspect_data = json.loads(result.stdout)
+    return inspect_data
+
+
+def inspect_containers(container_ids: list[str]) -> dict:
+    if not container_ids:
         return {}
 
-    inspect_data = json.loads(result.stdout)
+    inspect_data = _docker_inspect(*container_ids)
 
     return {item["Id"][:12]: item for item in inspect_data}
 
@@ -121,21 +168,7 @@ def inspect_networks(network_ids: list[str]) -> dict:
     if not network_ids:
         return {}
 
-    result = subprocess.run(
-        ["docker", "inspect", *network_ids],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-
-    if result.returncode != 0:
-        logger.warning("docker inspect failed for %d networks", len(network_ids))
-        return {}
-
-    if not result.stdout:
-        return {}
-
-    inspect_data = json.loads(result.stdout)
+    inspect_data = _docker_inspect(*network_ids)
     lookup = {}
 
     for item in inspect_data:
@@ -162,12 +195,10 @@ def fetch_raw_images() -> str:
 
 
 def fetch_raw_volumes() -> str:
-
     return run_docker_command("volume", "ls", "--format", "{{json .}}")
 
 
 def fetch_raw_networks() -> str:
-
     return run_docker_command("network", "ls", "--format", "{{json .}}")
 
 
@@ -315,6 +346,58 @@ def fetch_snapshot() -> DockerSnapshot:
         network.used_by.extend(network_usage.get(network.name, []))
 
     return DockerSnapshot(containers, images, volumes, networks)
+
+
+# ---------------------------------------------------------------------------
+# Management commands
+# ---------------------------------------------------------------------------
+
+
+def stop_container(container_id: str) -> tuple[bool, str]:
+    return _run_management_command("stop", container_id)
+
+
+def start_container(container_id: str) -> tuple[bool, str]:
+    return _run_management_command("start", container_id)
+
+
+def restart_container(container_id: str) -> tuple[bool, str]:
+    return _run_management_command("restart", container_id)
+
+
+def remove_container(container_id: str, force: bool = False) -> tuple[bool, str]:
+    args = ["rm"]
+    if force:
+        args.append("--force")
+    args.append(container_id)
+    return _run_management_command(*args)
+
+
+def remove_image(image_id: str, force: bool = False) -> tuple[bool, str]:
+    args = ["rmi"]
+    if force:
+        args.append("--force")
+    args.append(image_id)
+    return _run_management_command(*args)
+
+
+def remove_volume(volume_name: str) -> tuple[bool, str]:
+    return _run_management_command("volume", "rm", volume_name)
+
+
+def remove_network(network_name: str) -> tuple[bool, str]:
+    return _run_management_command("network", "rm", network_name)
+
+
+def fetch_logs(container_id: str, tail: int = 500) -> str:
+    """Fetch recent log lines for a container; merges stdout+stderr."""
+    result = subprocess.run(
+        ["docker", "logs", "--tail", str(tail), container_id],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    return (result.stdout or "").strip()
 
 
 if __name__ == "__main__":

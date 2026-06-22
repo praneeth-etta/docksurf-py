@@ -1,0 +1,14 @@
+#main-container {
+    height: 100%;
+}
+
+TabbedContent {
+    width: 40%;
+    border-right: solid $primary-background-lighten-2;
+}
+
+#detail-pane {
+    width: 60%;
+    height: 100%;
+    padding: 1 2;
+}
