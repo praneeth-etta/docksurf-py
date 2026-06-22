@@ -2,10 +2,14 @@ import json
 import logging
 import subprocess
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import TypeAlias
 
 logger = logging.getLogger(__name__)
+
+CommandResult: TypeAlias = tuple[bool, str]
 
 
 @dataclass(slots=True)
@@ -130,7 +134,7 @@ def run_docker_command(*args: str) -> str:
         return ""
 
 
-def _run_management_command(*args: str) -> tuple[bool, str]:
+def _run_management_command(*args: str) -> CommandResult:
     """Run a docker management command; return (success, message)."""
     result = subprocess.run(["docker", *args], capture_output=True, text=True)
     if result.returncode == 0:
@@ -316,11 +320,17 @@ def get_networks() -> list[Network]:
 
 
 def fetch_snapshot() -> DockerSnapshot:
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        f_containers = pool.submit(get_containers)
+        f_images = pool.submit(get_images)
+        f_volumes = pool.submit(get_volumes)
+        f_networks = pool.submit(get_networks)
+
     containers, images, volumes, networks = (
-        get_containers(),
-        get_images(),
-        get_volumes(),
-        get_networks(),
+        f_containers.result(),
+        f_images.result(),
+        f_volumes.result(),
+        f_networks.result(),
     )
 
     image_usage = defaultdict(list)
@@ -348,24 +358,22 @@ def fetch_snapshot() -> DockerSnapshot:
     return DockerSnapshot(containers, images, volumes, networks)
 
 
-# ---------------------------------------------------------------------------
 # Management commands
-# ---------------------------------------------------------------------------
 
 
-def stop_container(container_id: str) -> tuple[bool, str]:
+def stop_container(container_id: str) -> CommandResult:
     return _run_management_command("stop", container_id)
 
 
-def start_container(container_id: str) -> tuple[bool, str]:
+def start_container(container_id: str) -> CommandResult:
     return _run_management_command("start", container_id)
 
 
-def restart_container(container_id: str) -> tuple[bool, str]:
+def restart_container(container_id: str) -> CommandResult:
     return _run_management_command("restart", container_id)
 
 
-def remove_container(container_id: str, force: bool = False) -> tuple[bool, str]:
+def remove_container(container_id: str, force: bool = False) -> CommandResult:
     args = ["rm"]
     if force:
         args.append("--force")
@@ -373,7 +381,7 @@ def remove_container(container_id: str, force: bool = False) -> tuple[bool, str]
     return _run_management_command(*args)
 
 
-def remove_image(image_id: str, force: bool = False) -> tuple[bool, str]:
+def remove_image(image_id: str, force: bool = False) -> CommandResult:
     args = ["rmi"]
     if force:
         args.append("--force")
@@ -381,11 +389,11 @@ def remove_image(image_id: str, force: bool = False) -> tuple[bool, str]:
     return _run_management_command(*args)
 
 
-def remove_volume(volume_name: str) -> tuple[bool, str]:
+def remove_volume(volume_name: str) -> CommandResult:
     return _run_management_command("volume", "rm", volume_name)
 
 
-def remove_network(network_name: str) -> tuple[bool, str]:
+def remove_network(network_name: str) -> CommandResult:
     return _run_management_command("network", "rm", network_name)
 
 

@@ -1,7 +1,7 @@
 import subprocess
 from typing import Callable, TypeVar
 
-from textual import on
+from textual import on, work
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal
 from textual.widgets import DataTable, Footer, Header, TabbedContent, TabPane
@@ -73,6 +73,12 @@ class DockSurfApp(App):
             "Scope",
         ),
     }
+    _TAB_RESOURCES = {
+        "tab-containers": lambda s: s.containers,
+        "tab-images": lambda s: s.images,
+        "tab-volumes": lambda s: s.volumes,
+        "tab-networks": lambda s: s.networks,
+    }
     _CONTAINER_TAB_HINT = "Switch to the Containers tab and select a container"
 
     def compose(self) -> ComposeResult:
@@ -129,30 +135,28 @@ class DockSurfApp(App):
         for n in self.snapshot.networks:
             table.add_row(n.name, n.driver, n.scope)
 
-    def populate_tables(self) -> None:
-        table_con = self.query_one("#table-containers", DataTable)
-        table_img = self.query_one("#table-images", DataTable)
-        table_vol = self.query_one("#table-volumes", DataTable)
-        table_net = self.query_one("#table-networks", DataTable)
+    def _apply_snapshot(self, snapshot: DockerSnapshot) -> None:
+        self.snapshot = snapshot
 
         for table_id in self.TABLE_COLUMNS:
             self.query_one(f"#{table_id}", DataTable).clear(columns=False)
 
-        self.snapshot = fetch_snapshot()
+        self._populate_container_table(self.query_one("#table-containers", DataTable))
+        self._populate_image_table(self.query_one("#table-images", DataTable))
+        self._populate_volume_table(self.query_one("#table-volumes", DataTable))
+        self._populate_network_table(self.query_one("#table-networks", DataTable))
 
-        self._populate_container_table(table_con)
-        self._populate_image_table(table_img)
-        self._populate_volume_table(table_vol)
-        self._populate_network_table(table_net)
+    @work(thread=True)
+    def populate_tables(self) -> None:
+        self.snapshot = fetch_snapshot()
+        self.call_from_thread(self._apply_snapshot, self.snapshot)
 
     @on(TabbedContent.TabActivated)
     def clear_on_tab_switch(self) -> None:
         pane = self.query_one("#detail-pane", DetailPane)
         pane.clear_details()
 
-    # ------------------------------------------------------------------
     # Detail pane renderers
-    # ------------------------------------------------------------------
 
     def _show_container_details(self, pane: DetailPane, row: int) -> None:
         c = self.snapshot.containers[row]
@@ -229,9 +233,7 @@ class DockSurfApp(App):
         except IndexError:
             pane.clear_details()
 
-    # ------------------------------------------------------------------
     # Focused-resource helpers
-    # ------------------------------------------------------------------
 
     def _get_focused_resource(self, tab_id: str, resources: list[T]) -> T | None:
         if not self.snapshot:
@@ -246,29 +248,25 @@ class DockSurfApp(App):
             return None
         return resources[row]
 
+    def _get_focused(self, tab_id: str):
+        if not self.snapshot:
+            return None
+        resources = self._TAB_RESOURCES[tab_id](self.snapshot)
+        return self._get_focused_resource(tab_id, resources)
+
     def _get_focused_container(self) -> Container | None:
-        return self._get_focused_resource(
-            "tab-containers", self.snapshot.containers if self.snapshot else []
-        )
+        return self._get_focused("tab-containers")
 
     def _get_focused_image(self) -> Image | None:
-        return self._get_focused_resource(
-            "tab-images", self.snapshot.images if self.snapshot else []
-        )
+        return self._get_focused("tab-images")
 
     def _get_focused_volume(self) -> Volume | None:
-        return self._get_focused_resource(
-            "tab-volumes", self.snapshot.volumes if self.snapshot else []
-        )
+        return self._get_focused("tab-volumes")
 
     def _get_focused_network(self) -> Network | None:
-        return self._get_focused_resource(
-            "tab-networks", self.snapshot.networks if self.snapshot else []
-        )
+        return self._get_focused("tab-networks")
 
-    # ------------------------------------------------------------------
     # Container actions
-    # ------------------------------------------------------------------
 
     def _run_on_focused_container(
         self,
@@ -343,9 +341,7 @@ class DockSurfApp(App):
         with self.suspend():
             subprocess.run(["docker", "exec", "-it", c.id, "sh"])
 
-    # ------------------------------------------------------------------
     # Delete action (context-sensitive across all tabs)
-    # ------------------------------------------------------------------
 
     def _apply_if_confirmed(
         self, confirmed: bool, command_fn, success_msg: str
