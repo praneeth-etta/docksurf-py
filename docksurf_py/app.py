@@ -51,7 +51,13 @@ from docksurf_py.docker import (
     start_container,
     stop_container,
 )
-from docksurf_py.widgets import ConfirmDialog, DetailPane, LogPane, SearchBar
+from docksurf_py.widgets import (
+    ConfirmDialog,
+    DetailPane,
+    HelpScreen,
+    LogPane,
+    SearchBar,
+)
 
 T = TypeVar("T")
 
@@ -81,6 +87,7 @@ class DockSurfApp(App):
         ("x", "restart_container", "Restart"),
         ("d", "delete", "Delete"),
         ("/", "open_search", "Search"),
+        ("?", "help", "Help"),
     ]
     CSS_PATH = "app.tcss"
     TABLE_COLUMNS: dict[TableID, tuple[str, ...]] = {
@@ -111,7 +118,6 @@ class DockSurfApp(App):
                 with TabPane("Networks", id=TabID.NETWORKS):
                     yield DataTable(id=TableID.NETWORKS)
             yield DetailPane(
-                "Select an item on the left to view details...",
                 id=DETAIL_PANE_ID,
             )
             yield LogPane(id=LOG_PANE_ID)
@@ -222,7 +228,7 @@ class DockSurfApp(App):
             "Networks": "\n".join(c.networks) if c.networks else "None",
             "Mounts": "\n".join(c.mounts) if c.mounts else "None",
         }
-        pane.update_details(f"Container: {c.name}", details)
+        pane.update_details(f"Container: {c.name}", details, env_vars=c.env)
 
     def _show_image_details(self, pane: DetailPane, row: int) -> None:
         image = self.snapshot.images[row]
@@ -420,6 +426,9 @@ class DockSurfApp(App):
             return
         with self.suspend():
             subprocess.run(["docker", "exec", "-it", c.id, "sh"])
+
+    def action_help(self) -> None:
+        self.push_screen(HelpScreen(self.BINDINGS))
 
     # Delete (context-sensitive)
     def _apply_if_confirmed(

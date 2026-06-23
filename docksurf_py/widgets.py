@@ -13,11 +13,11 @@ from rich.panel import Panel
 from rich.table import Table
 from textual import on
 from textual.app import ComposeResult
-from textual.containers import Horizontal, Vertical
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.message import Message
 from textual.screen import ModalScreen
 from textual.widget import Widget
-from textual.widgets import Button, Input, Label, RichLog, Static
+from textual.widgets import Button, Collapsible, Input, Label, RichLog, Static
 
 from docksurf_py.constants import (
     BTN_CANCEL_ID,
@@ -30,10 +30,18 @@ from docksurf_py.constants import (
 from docksurf_py.docker import LogStream
 
 
-class DetailPane(Static):
-    """A custom widget that displays a beautiful key-value table."""
+class DetailPane(VerticalScroll):
+    """A custom container that displays a key-value table and collapsible extras."""
 
-    def update_details(self, title: str, data: dict) -> None:
+    def on_mount(self) -> None:
+        self.clear_details()
+
+    def update_details(
+        self, title: str, data: dict, env_vars: list[str] | None = None
+    ) -> None:
+        for child in self.children:
+            child.remove()
+
         table = Table(show_header=False, expand=True, box=None)
         table.add_column("Property", style="cyan", justify="right", width=15)
         table.add_column("Value")
@@ -41,10 +49,21 @@ class DetailPane(Static):
         for key, value in data.items():
             table.add_row(f"[b]{key}[/b]", str(value))
 
-        self.update(Panel(table, title=f"[b]{title}[/b]", border_style="blue"))
+        self.mount(Static(Panel(table, title=f"[b]{title}[/b]", border_style="blue")))
+
+        if env_vars:
+            env_text = "\n".join(env_vars)
+            env_static = Static(env_text)
+            env_static.styles.padding = (1, 2)
+
+            self.mount(
+                Collapsible(env_static, title="Environment Variables", collapsed=True)
+            )
 
     def clear_details(self) -> None:
-        self.update(Panel("Select an item to view details.", border_style="dim"))
+        for child in self.children:
+            child.remove()
+        self.mount(Static(Panel("Select an item to view details.", border_style="dim")))
 
 
 class ConfirmDialog(ModalScreen):
@@ -163,3 +182,47 @@ class SearchBar(Input):
         self.display = False
         self.value = ""
         self.app.query_one(type(self)).post_message(Input.Changed(self, ""))
+
+
+class HelpScreen(ModalScreen):
+    """Keybindings cheat sheet"""
+
+    _CONTAINER_ONLY = frozenset(
+        {
+            "view_logs",
+            "close_logs",
+            "follow_logs",
+            "toggle_log_expand",
+            "exec_container",
+            "stop_container",
+            "start_container",
+            "restart_container",
+        }
+    )
+
+    def __init__(self, app_bindings: list) -> None:
+        super().__init__()
+        self._app_bindings = app_bindings
+
+    def on_key(self, event) -> None:
+        if event.key in ("escape", "question_mark"):
+            self.dismiss()
+
+    def compose(self) -> ComposeResult:
+        table = Table(title="Keybindings", box=None, expand=True, show_edge=False)
+        table.add_column("Key", style="cyan bold", width=8)
+        table.add_column("Action", style="white")
+        table.add_column("Applies To", style="dim", width=18)
+
+        for key, action, description in self._app_bindings:
+            scope = "Containers only" if action in self._CONTAINER_ONLY else "Global"
+            table.add_row(f"[bold]{key}[/bold]", description, scope)
+
+        with Vertical():
+            yield Label("[b]Help[/b]", id="help-title")
+            yield Static(table)
+            yield Button("Close", variant="primary", id="help-close")
+
+    @on(Button.Pressed, "#help-close")
+    def _close(self) -> None:
+        self.dismiss()

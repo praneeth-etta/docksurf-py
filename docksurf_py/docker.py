@@ -27,6 +27,7 @@ class Container:
     mounts: list[str]
     networks: list[str]
     created: str
+    env: list[str]
 
 
 @dataclass(slots=True)
@@ -259,6 +260,8 @@ def get_containers() -> list[Container]:
 
         inspect = inspect_lookup.get(cid, {})
 
+        env_vars = inspect.get("Config", {}).get("Env", {})
+
         mounts = [
             m.get("Name") or m.get("Source", "")
             for m in inspect.get("Mounts", [])
@@ -277,6 +280,7 @@ def get_containers() -> list[Container]:
                 mounts=mounts,
                 networks=networks,
                 created=row.get("CreatedAt", ""),
+                env=env_vars,
             )
         )
     return containers
