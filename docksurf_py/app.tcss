@@ -1,3 +1,14 @@
+/* =========================================================================
+   app.tcss — Single source of truth for all application styles.
+
+   Sections:
+     1. Layout
+     2. Overlays & overlays
+     3. ConfirmDialog  (migrated from widgets.py DEFAULT_CSS)
+     4. LogPane        (migrated from widgets.py DEFAULT_CSS)
+   ========================================================================= */
+
+
 #main-container {
     height: 100%;
 }
@@ -13,7 +24,7 @@ TabbedContent {
     padding: 1 2;
 }
 
-/* Customize the refresh overlay here without changing application logic. */
+
 #refresh-loading {
     display: none;
     overlay: screen;
@@ -30,5 +41,74 @@ TabbedContent {
     border-top: tall $primary;
     margin-bottom: 1;
     background: $surface;
+    padding: 0 1;
+}
+
+
+ConfirmDialog {
+    align: center middle;
+}
+
+ConfirmDialog > Vertical {
+    width: 62;
+    height: auto;
+    border: thick $primary;
+    background: $surface;
+    padding: 2 4;
+}
+
+ConfirmDialog Label {
+    text-align: center;
+    width: 100%;
+    margin-bottom: 2;
+}
+
+ConfirmDialog Horizontal {
+    align: center middle;
+    height: auto;
+}
+
+ConfirmDialog Button {
+    margin: 0 2;
+}
+
+
+LogPane {
+    width: 60%;
+    height: 100%;
+    display: none;
+}
+
+LogPane.expanded {
+    width: 100%;
+}
+
+LogPane #log-pane-toolbar {
+    height: 1;
+    background: $primary;
+}
+
+LogPane #log-pane-header {
+    width: 1fr;
+    color: $text;
+    padding: 0 1;
+    height: 1;
+}
+
+LogPane #expand-btn {
+    width: auto;
+    min-width: 5;
+    height: 1;
+    border: none;
+    background: $primary-darken-1;
+    color: $text;
+}
+
+LogPane #expand-btn:hover {
+    background: $primary-lighten-1;
+}
+
+LogPane #log-pane-view {
+    height: 1fr;
     padding: 0 1;
 }

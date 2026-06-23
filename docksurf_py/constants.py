@@ -1,0 +1,50 @@
+from enum import StrEnum
+
+
+# Tab & Table IDs
+class TabID(StrEnum):
+    CONTAINERS = "tab-containers"
+    IMAGES = "tab-images"
+    VOLUMES = "tab-volumes"
+    NETWORKS = "tab-networks"
+
+
+class TableID(StrEnum):
+    CONTAINERS = "table-containers"
+    IMAGES = "table-images"
+    VOLUMES = "table-volumes"
+    NETWORKS = "table-networks"
+
+
+# Generic widget IDs
+LOG_PANE_ID = "log-pane"
+LOG_PANE_VIEW_ID = "log-pane-view"
+LOG_PANE_HEADER_ID = "log-pane-header"
+LOG_PANE_TOOLBAR_ID = "log-pane-toolbar"
+BTN_EXPAND_ID = "expand-btn"
+
+DETAIL_PANE_ID = "detail-pane"
+SEARCH_BAR_ID = "search-bar"
+MAIN_CONTAINER_ID = "main-container"
+REFRESH_LOADING_ID = "refresh-loading"
+
+# Confirm-dialog button IDs
+BTN_CONFIRM_ID = "confirm"
+BTN_CANCEL_ID = "cancel"
+
+
+STATUS_GREEN = "green"
+STATUS_RED = "red"
+STATUS_YELLOW = "yellow"
+
+
+def markup_green(text: str) -> str:
+    return f"[{STATUS_GREEN}]{text}[/]"
+
+
+def markup_red(text: str) -> str:
+    return f"[{STATUS_RED}]{text}[/]"
+
+
+def markup_yellow(text: str) -> str:
+    return f"[{STATUS_YELLOW}]{text}[/]"

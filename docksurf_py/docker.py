@@ -1,3 +1,7 @@
+"""
+docker.py — All system-level Docker execution lives here.
+"""
+
 import json
 import logging
 import subprocess
@@ -5,7 +9,7 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import TypeAlias
+from typing import Iterator, TypeAlias
 
 logger = logging.getLogger(__name__)
 
@@ -65,16 +69,71 @@ class DockerSnapshot:
     networks: list[Network]
 
 
+class LogStream:
+    """
+    Wraps a `docker logs -f` subprocess and exposes it as a line iterator.
+
+    Usage::
+
+        stream = LogStream(container_id)
+        for line in stream:
+            ...              # runs until stop() is called or process exits
+        stream.stop()        # safe to call even after the loop ends
+
+    The underlying process is always cleaned up — either by the iterator's
+    finally-block or by an explicit call to ``stop()``.
+    """
+
+    def __init__(self, container_id: str) -> None:
+        self._container_id = container_id
+        self._process: subprocess.Popen | None = None
+        self._active = False
+
+    def _start(self) -> None:
+        self._process = subprocess.Popen(
+            ["docker", "logs", "-f", self._container_id],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        self._active = True
+
+    def __iter__(self) -> Iterator[str]:
+        self._start()
+        assert self._process and self._process.stdout
+        try:
+            for raw_line in self._process.stdout:
+                if not self._active:
+                    break
+                yield raw_line.rstrip()
+        finally:
+            self._cleanup()
+
+    def stop(self) -> None:
+        """Signal the iterator to stop and terminate the subprocess."""
+        self._active = False
+        self._cleanup()
+
+    def _cleanup(self) -> None:
+        if self._process is not None:
+            try:
+                self._process.terminate()
+                self._process.wait(timeout=2)
+            except Exception:
+                pass
+            finally:
+                self._process = None
+
+
+# Helpers
 def parse_json_lines(raw: str):
     for line in raw.splitlines():
         if line.strip():
             try:
                 yield json.loads(line)
             except json.JSONDecodeError as exc:
-                logger.warning(
-                    "Failed to parse Docker JSON line: %s",
-                    exc,
-                )
+                logger.warning("Failed to parse Docker JSON line: %s", exc)
                 continue
 
 
@@ -123,73 +182,12 @@ def run_docker_command(*args: str) -> str:
         )
         return result.stdout.strip()
     except subprocess.CalledProcessError as exc:
-        logger.warning(
-            "Docker command failed: docker %s",
-            " ".join(args),
-        )
-        logger.debug(
-            "stderr: %s",
-            exc.stderr,
-        )
+        logger.warning("Docker command failed: docker %s", " ".join(args))
+        logger.debug("stderr: %s", exc.stderr)
         return ""
 
 
-def _run_management_command(*args: str) -> CommandResult:
-    """Run a docker management command; return (success, message)."""
-    result = subprocess.run(["docker", *args], capture_output=True, text=True)
-    if result.returncode == 0:
-        return True, result.stdout.strip() or "OK"
-    return False, result.stderr.strip() or "Command failed"
-
-
-def _docker_inspect(*ids: str) -> list[dict]:
-
-    result = subprocess.run(
-        ["docker", "inspect", *ids],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if result.returncode != 0:
-        logger.warning("docker inspect failed")
-        return []
-    if not result.stdout:
-        return []
-    inspect_data = json.loads(result.stdout)
-    return inspect_data
-
-
-def inspect_containers(container_ids: list[str]) -> dict:
-    if not container_ids:
-        return {}
-
-    inspect_data = _docker_inspect(*container_ids)
-
-    return {item["Id"][:12]: item for item in inspect_data}
-
-
-def inspect_networks(network_ids: list[str]) -> dict:
-    if not network_ids:
-        return {}
-
-    inspect_data = _docker_inspect(*network_ids)
-    lookup = {}
-
-    for item in inspect_data:
-        net_id = item.get("Id", "")[:12]
-        subnet = "N/A"
-        gateway = "N/A"
-
-        ipam_config = item.get("IPAM", {}).get("Config", {})
-        if ipam_config and isinstance(ipam_config, list) and len(ipam_config) > 0:
-            subnet = ipam_config[0].get("Subnet", "N/A")
-            gateway = ipam_config[0].get("Gateway", "N/A")
-
-        lookup[net_id] = {"subnet": subnet, "gateway": gateway}
-
-    return lookup
-
-
+# Raw fetchers
 def fetch_raw_containers() -> str:
     return run_docker_command("ps", "-a", "--format", "{{json .}}")
 
@@ -206,17 +204,54 @@ def fetch_raw_networks() -> str:
     return run_docker_command("network", "ls", "--format", "{{json .}}")
 
 
+def _docker_inspect(*ids: str) -> list[dict]:
+
+    result = subprocess.run(
+        ["docker", "inspect", *ids],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        logger.warning("docker inspect failed")
+        return []
+    if not result.stdout:
+        return []
+    return json.loads(result.stdout)
+
+
+# Inspect helpers
+def inspect_containers(container_ids: list[str]) -> dict:
+    if not container_ids:
+        return {}
+    inspect_data = _docker_inspect(*container_ids)
+    return {item["Id"][:12]: item for item in inspect_data}
+
+
+def inspect_networks(network_ids: list[str]) -> dict:
+    if not network_ids:
+        return {}
+    inspect_data = _docker_inspect(*network_ids)
+    lookup = {}
+    for item in inspect_data:
+        net_id = item.get("Id", "")[:12]
+        subnet = gateway = "N/A"
+        ipam_config = item.get("IPAM", {}).get("Config", {})
+        if ipam_config and isinstance(ipam_config, list) and len(ipam_config) > 0:
+            subnet = ipam_config[0].get("Subnet", "N/A")
+            gateway = ipam_config[0].get("Gateway", "N/A")
+        lookup[net_id] = {"subnet": subnet, "gateway": gateway}
+    return lookup
+
+
+# Entity builders
 def get_containers() -> list[Container]:
     raw_data = fetch_raw_containers()
     if not raw_data:
         return []
 
     container_rows = list(parse_json_lines(raw_data))
-
-    container_ids = [row["ID"] for row in container_rows]
-
-    inspect_lookup = inspect_containers(container_ids)
-
+    inspect_lookup = inspect_containers([row["ID"] for row in container_rows])
     containers = []
 
     for row in container_rows:
@@ -231,19 +266,19 @@ def get_containers() -> list[Container]:
         ]
 
         networks = list(inspect.get("NetworkSettings", {}).get("Networks", {}).keys())
-
-        c = Container(
-            id=cid,
-            name=row.get("Names", "").lstrip("/"),
-            image_id=inspect.get("Image", ""),
-            image_name=row.get("Image", ""),
-            status=row.get("Status", ""),
-            ports=row.get("Ports", ""),
-            mounts=mounts,
-            networks=networks,
-            created=row.get("CreatedAt", ""),
+        containers.append(
+            Container(
+                id=cid,
+                name=row.get("Names", "").lstrip("/"),
+                image_id=inspect.get("Image", ""),
+                image_name=row.get("Image", ""),
+                status=row.get("Status", ""),
+                ports=row.get("Ports", ""),
+                mounts=mounts,
+                networks=networks,
+                created=row.get("CreatedAt", ""),
+            )
         )
-        containers.append(c)
     return containers
 
 
@@ -255,20 +290,20 @@ def get_images() -> list[Image]:
     images = []
 
     for data in parse_json_lines(raw_data):
-        all_images = Image(
-            id=data.get("ID"),
-            repository=data.get("Repository"),
-            tag=data.get("Tag"),
-            size=data.get("Size"),
-            is_dangling=(
-                data.get("Repository") == "<none>" and data.get("Tag") == "<none>"
-            ),
-            used_by=[],
-            created=data.get("CreatedAt", ""),
-            architecture=data.get("Architecture"),
+        images.append(
+            Image(
+                id=data.get("ID"),
+                repository=data.get("Repository"),
+                tag=data.get("Tag"),
+                size=data.get("Size"),
+                is_dangling=(
+                    data.get("Repository") == "<none>" and data.get("Tag") == "<none>"
+                ),
+                used_by=[],
+                created=data.get("CreatedAt", ""),
+                architecture=data.get("Architecture"),
+            )
         )
-        images.append(all_images)
-
     return images
 
 
@@ -280,14 +315,15 @@ def get_volumes() -> list[Volume]:
     volumes = []
 
     for data in parse_json_lines(raw_data):
-        all_volumes = Volume(
-            name=data.get("Name"),
-            driver=data.get("Driver"),
-            mountpoint=data.get("Mountpoint"),
-            used_by=[],
-            labels=data.get("Labels"),
+        volumes.append(
+            Volume(
+                name=data.get("Name"),
+                driver=data.get("Driver"),
+                mountpoint=data.get("Mountpoint"),
+                used_by=[],
+                labels=data.get("Labels"),
+            )
         )
-        volumes.append(all_volumes)
     return volumes
 
 
@@ -305,17 +341,17 @@ def get_networks() -> list[Network]:
     for data in network_rows:
         nid = data.get("ID", "")
         net_info = inspect_lookup.get(nid, {})
-
-        all_networks = Network(
-            id=nid,
-            name=data.get("Name", ""),
-            driver=data.get("Driver", ""),
-            subnet=net_info.get("subnet", "N/A"),
-            gateway=net_info.get("gateway", "N/A"),
-            scope=data.get("Scope", ""),
-            used_by=[],
+        networks.append(
+            Network(
+                id=nid,
+                name=data.get("Name", ""),
+                driver=data.get("Driver", ""),
+                subnet=net_info.get("subnet", "N/A"),
+                gateway=net_info.get("gateway", "N/A"),
+                scope=data.get("Scope", ""),
+                used_by=[],
+            )
         )
-        networks.append(all_networks)
     return networks
 
 
@@ -339,19 +375,15 @@ def fetch_snapshot() -> DockerSnapshot:
 
     for c in containers:
         image_usage[c.image_id].append(c.name)
-
         for mount in c.mounts:
             volume_usage[mount].append(c.name)
-
         for network in c.networks:
             network_usage[network].append(c.name)
 
     for image in images:
         image.used_by.extend(image_usage.get(image.id, []))
-
     for volume in volumes:
         volume.used_by.extend(volume_usage.get(volume.name, []))
-
     for network in networks:
         network.used_by.extend(network_usage.get(network.name, []))
 
@@ -359,6 +391,12 @@ def fetch_snapshot() -> DockerSnapshot:
 
 
 # Management commands
+def _run_management_command(*args: str) -> CommandResult:
+    """Run a docker management command; return (success, message)."""
+    result = subprocess.run(["docker", *args], capture_output=True, text=True)
+    if result.returncode == 0:
+        return True, result.stdout.strip() or "OK"
+    return False, result.stderr.strip() or "Command failed"
 
 
 def stop_container(container_id: str) -> CommandResult:

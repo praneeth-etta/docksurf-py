@@ -1,3 +1,11 @@
+"""
+app.py — The Controller Layer.
+
+Responsibilities:
+  - Route user actions to docker.py (infrastructure).
+  - Push results into widgets.py (view).
+"""
+
 import subprocess
 from typing import Callable, TypeVar
 
@@ -14,6 +22,18 @@ from textual.widgets import (
     TabPane,
 )
 
+from docksurf_py.constants import (
+    DETAIL_PANE_ID,
+    LOG_PANE_ID,
+    MAIN_CONTAINER_ID,
+    REFRESH_LOADING_ID,
+    SEARCH_BAR_ID,
+    TabID,
+    TableID,
+    markup_green,
+    markup_red,
+    markup_yellow,
+)
 from docksurf_py.docker import (
     Container,
     DockerSnapshot,
@@ -39,10 +59,10 @@ T = TypeVar("T")
 def _status_markup(status: str) -> str:
     lower = status.lower()
     if "up" in lower or "running" in lower:
-        return f"[green]{status}[/]"
+        return markup_green(status)
     if "exited" in lower or "dead" in lower:
-        return f"[red]{status}[/]"
-    return f"[yellow]{status}[/]"
+        return markup_red(status)
+    return markup_yellow(status)
 
 
 class DockSurfApp(App):
@@ -63,71 +83,53 @@ class DockSurfApp(App):
         ("/", "open_search", "Search"),
     ]
     CSS_PATH = "app.tcss"
-    TABLE_COLUMNS = {
-        "table-containers": (
-            "Name",
-            "Image",
-            "Status",
-        ),
-        "table-images": (
-            "Repository",
-            "Tag",
-            "Size",
-            "Status",
-        ),
-        "table-volumes": (
-            "Name",
-            "Driver",
-            "Status",
-        ),
-        "table-networks": (
-            "Name",
-            "Driver",
-            "Scope",
-        ),
+    TABLE_COLUMNS: dict[TableID, tuple[str, ...]] = {
+        TableID.CONTAINERS: ("Name", "Image", "Status"),
+        TableID.IMAGES: ("Repository", "Tag", "Size"),
+        TableID.VOLUMES: ("Name", "Status"),
+        TableID.NETWORKS: ("Name", "Driver", "Scope"),
     }
-    _TAB_RESOURCES = {
-        "tab-containers": lambda s: s.containers,
-        "tab-images": lambda s: s.images,
-        "tab-volumes": lambda s: s.volumes,
-        "tab-networks": lambda s: s.networks,
+    _TAB_RESOURCES: dict[TabID, Callable[[DockerSnapshot], list]] = {
+        TabID.CONTAINERS: lambda s: s.containers,
+        TabID.IMAGES: lambda s: s.images,
+        TabID.VOLUMES: lambda s: s.volumes,
+        TabID.NETWORKS: lambda s: s.networks,
     }
     _CONTAINER_TAB_HINT = "Switch to the Containers tab and select a container"
 
+    # Lifecycle - Compose
     def compose(self) -> ComposeResult:
         yield Header()
-        with Horizontal(id="main-container"):
+        with Horizontal(id=MAIN_CONTAINER_ID):
             with TabbedContent():
-                with TabPane("Containers", id="tab-containers"):
-                    yield DataTable(id="table-containers")
-                with TabPane("Images", id="tab-images"):
-                    yield DataTable(id="table-images")
-                with TabPane("Volumes", id="tab-volumes"):
-                    yield DataTable(id="table-volumes")
-                with TabPane("Networks", id="tab-networks"):
-                    yield DataTable(id="table-networks")
+                with TabPane("Containers", id=TabID.CONTAINERS):
+                    yield DataTable(id=TableID.CONTAINERS)
+                with TabPane("Images", id=TabID.IMAGES):
+                    yield DataTable(id=TableID.IMAGES)
+                with TabPane("Volumes", id=TabID.VOLUMES):
+                    yield DataTable(id=TableID.VOLUMES)
+                with TabPane("Networks", id=TabID.NETWORKS):
+                    yield DataTable(id=TableID.NETWORKS)
             yield DetailPane(
-                "Select an item on the left to view details...", id="detail-pane"
+                "Select an item on the left to view details...",
+                id=DETAIL_PANE_ID,
             )
-            yield LogPane(id="log-pane")
-        yield LoadingIndicator(id="refresh-loading")
-        yield SearchBar(placeholder="🔍 Filter...", id="search-bar")
+            yield LogPane(id=LOG_PANE_ID)
+        yield LoadingIndicator(id=REFRESH_LOADING_ID)
+        yield SearchBar(placeholder="🔍 Filter...", id=SEARCH_BAR_ID)
         yield Footer()
 
+    # Lifecycle - Mount & Refresh
     def on_mount(self) -> None:
         self.setup_tables()
         self.start_refresh()
 
-    def action_refresh(self) -> None:
-        self.start_refresh()
-
+    # Refresh & table setup
     def start_refresh(self) -> None:
-        """Start one snapshot refresh and expose its progress in the UI."""
         if self._refresh_in_progress:
             return
-
         self._refresh_in_progress = True
-        self.query_one("#refresh-loading", LoadingIndicator).display = True
+        self.query_one(f"#{REFRESH_LOADING_ID}", LoadingIndicator).display = True
         self.populate_tables()
 
     def setup_tables(self) -> None:
@@ -135,41 +137,6 @@ class DockSurfApp(App):
             table = self.query_one(f"#{table_id}", DataTable)
             table.add_columns(*columns)
             table.cursor_type = "row"
-
-    def _populate_container_table(self, table: DataTable) -> None:
-        for c in self.snapshot.containers:
-            table.add_row(c.name, c.image_name, _status_markup(c.status))
-
-    def _populate_image_table(self, table: DataTable) -> None:
-        for i in self.snapshot.images:
-            if i.used_by:
-                status = "[green]In Use[/]"
-            elif i.is_dangling:
-                status = "[red]Dangling[/]"
-            else:
-                status = "[yellow]Unused[/]"
-            table.add_row(i.repository, i.tag, i.size, status)
-
-    def _populate_volume_table(self, table: DataTable) -> None:
-        for v in self.snapshot.volumes:
-            status = "[green]In Use[/]" if v.used_by else "[yellow]Orphaned[/]"
-            name = v.name[:20] + "..." if len(v.name) > 20 else v.name
-            table.add_row(name, v.driver, status)
-
-    def _populate_network_table(self, table: DataTable) -> None:
-        for n in self.snapshot.networks:
-            table.add_row(n.name, n.driver, n.scope)
-
-    def _apply_snapshot(self, snapshot: DockerSnapshot) -> None:
-        self.snapshot = snapshot
-
-        for table_id in self.TABLE_COLUMNS:
-            self.query_one(f"#{table_id}", DataTable).clear(columns=False)
-
-        self._populate_container_table(self.query_one("#table-containers", DataTable))
-        self._populate_image_table(self.query_one("#table-images", DataTable))
-        self._populate_volume_table(self.query_one("#table-volumes", DataTable))
-        self._populate_network_table(self.query_one("#table-networks", DataTable))
 
     @work(thread=True)
     def populate_tables(self) -> None:
@@ -180,10 +147,21 @@ class DockSurfApp(App):
         else:
             self.call_from_thread(self._finish_refresh, snapshot, None)
 
+    def _apply_snapshot(self, snapshot: DockerSnapshot) -> None:
+        self.snapshot = snapshot
+        for table_id in self.TABLE_COLUMNS:
+            self.query_one(f"#{table_id}", DataTable).clear(columns=False)
+
+        self._populate_container_table(
+            self.query_one(f"#{TableID.CONTAINERS}", DataTable)
+        )
+        self._populate_image_table(self.query_one(f"#{TableID.IMAGES}", DataTable))
+        self._populate_volume_table(self.query_one(f"#{TableID.VOLUMES}", DataTable))
+        self._populate_network_table(self.query_one(f"#{TableID.NETWORKS}", DataTable))
+
     def _finish_refresh(
         self, snapshot: DockerSnapshot | None, error: str | None
     ) -> None:
-        """Apply a worker result and restore the idle refresh state."""
         try:
             if snapshot is not None:
                 self._apply_snapshot(snapshot)
@@ -191,27 +169,54 @@ class DockSurfApp(App):
                 self.notify(f"Refresh failed: {error}", severity="error")
         finally:
             self._refresh_in_progress = False
-            self.query_one("#refresh-loading", LoadingIndicator).display = False
+            self.query_one(f"#{REFRESH_LOADING_ID}", LoadingIndicator).display = False
 
-    @on(TabbedContent.TabActivated)
-    def clear_on_tab_switch(self) -> None:
-        pane = self.query_one("#detail-pane", DetailPane)
-        pane.clear_details()
+    # populate_tables Helpers
+    def _populate_container_table(
+        self,
+        table: DataTable,
+        items: list[Container] | None = None,
+    ) -> None:
+        for c in items if items is not None else self.snapshot.containers:
+            table.add_row(c.name, c.image_name, _status_markup(c.status))
 
-    # Detail pane renderers
+    def _populate_image_table(
+        self,
+        table: DataTable,
+        items: list[Image] | None = None,
+    ) -> None:
+        for i in items if items is not None else self.snapshot.images:
+            table.add_row(i.repository, i.tag, i.size)
 
+    def _populate_volume_table(
+        self,
+        table: DataTable,
+        items: list[Volume] | None = None,
+    ) -> None:
+        for v in items if items is not None else self.snapshot.volumes:
+            status = markup_green("In Use") if v.used_by else markup_yellow("Orphaned")
+            name = v.name[:50] + "..." if len(v.name) > 50 else v.name
+            table.add_row(name, status)
+
+    def _populate_network_table(
+        self,
+        table: DataTable,
+        items: list[Network] | None = None,
+    ) -> None:
+        for n in items if items is not None else self.snapshot.networks:
+            table.add_row(n.name, n.driver, n.scope)
+
+    # Detail Pane
     def _show_container_details(self, pane: DetailPane, row: int) -> None:
         c = self.snapshot.containers[row]
         status_color = (
-            "[green]" if "Up" in c.status or "running" in c.status else "[red]"
+            markup_green if ("Up" in c.status or "running" in c.status) else markup_red
         )
         details = {
             "ID": c.id,
             "Image": c.image_name,
-            "Image SHA": (c.image_id[:24] + "...")
-            if len(c.image_id) > 24
-            else c.image_id,
-            "Status": f"{status_color}{c.status}[/]",
+            "Image SHA": c.image_id,
+            "Status": status_color(c.status),
             "Created": format_relative_time(c.created),
             "Ports": c.ports if c.ports else "None",
             "Networks": "\n".join(c.networks) if c.networks else "None",
@@ -221,6 +226,14 @@ class DockSurfApp(App):
 
     def _show_image_details(self, pane: DetailPane, row: int) -> None:
         image = self.snapshot.images[row]
+
+        if image.used_by:
+            status = markup_green("In Use")
+        elif image.is_dangling:
+            status = markup_red("Dangling (safe to delete)")
+        else:
+            status = markup_yellow("Unused (not referenced by any container)")
+
         details = {
             "ID": (image.id[:24] + "...")
             if image.id and len(image.id) > 24
@@ -229,6 +242,7 @@ class DockSurfApp(App):
             "Created": format_relative_time(image.created),
             "Architecture": image.architecture or "N/A",
             "Used By": "\n".join(image.used_by) if image.used_by else "None",
+            "Status": status,
         }
         pane.update_details(f"Image: {image.repository}:{image.tag}", details)
 
@@ -236,11 +250,12 @@ class DockSurfApp(App):
         volume = self.snapshot.volumes[row]
         details = {
             "Mountpoint": volume.mountpoint,
+            "Driver": volume.driver,
             "Labels": volume.labels if volume.labels else "None",
             "Used By": (
                 "\n".join(volume.used_by)
                 if volume.used_by
-                else "[yellow]Orphaned (safe to delete)[/yellow]"
+                else markup_yellow("Orphaned (safe to delete)")
             ),
         }
         pane.update_details(f"Volume: {volume.name}", details)
@@ -259,25 +274,26 @@ class DockSurfApp(App):
     def update_details(self, event: DataTable.RowHighlighted) -> None:
         if not self.snapshot:
             return
-
-        pane = self.query_one("#detail-pane", DetailPane)
+        pane = self.query_one(f"#{DETAIL_PANE_ID}", DetailPane)
         table_id = event.control.id
-
         try:
-            if table_id == "table-containers":
+            if table_id == TableID.CONTAINERS:
                 self._show_container_details(pane, event.cursor_row)
-            elif table_id == "table-images":
+            elif table_id == TableID.IMAGES:
                 self._show_image_details(pane, event.cursor_row)
-            elif table_id == "table-volumes":
+            elif table_id == TableID.VOLUMES:
                 self._show_volume_details(pane, event.cursor_row)
-            elif table_id == "table-networks":
+            elif table_id == TableID.NETWORKS:
                 self._show_network_details(pane, event.cursor_row)
         except IndexError:
             pane.clear_details()
 
-    # Focused-resource helpers
+    @on(TabbedContent.TabActivated)
+    def clear_on_tab_switch(self) -> None:
+        self.query_one(f"#{DETAIL_PANE_ID}", DetailPane).clear_details()
 
-    def _get_focused_resource(self, tab_id: str, resources: list[T]) -> T | None:
+    # Focused-resource helpers
+    def _get_focused_resource(self, tab_id: TabID, resources: list[T]) -> T | None:
         if not self.snapshot:
             return None
         tabbed = self.query_one(TabbedContent)
@@ -290,26 +306,26 @@ class DockSurfApp(App):
             return None
         return resources[row]
 
-    def _get_focused(self, tab_id: str):
+    def _get_focused(self, tab_id: TabID):
         if not self.snapshot:
             return None
-        resources = self._TAB_RESOURCES[tab_id](self.snapshot)
-        return self._get_focused_resource(tab_id, resources)
+        return self._get_focused_resource(
+            tab_id, self._TAB_RESOURCES[tab_id](self.snapshot)
+        )
 
     def _get_focused_container(self) -> Container | None:
-        return self._get_focused("tab-containers")
+        return self._get_focused(TabID.CONTAINERS)
 
     def _get_focused_image(self) -> Image | None:
-        return self._get_focused("tab-images")
+        return self._get_focused(TabID.IMAGES)
 
     def _get_focused_volume(self) -> Volume | None:
-        return self._get_focused("tab-volumes")
+        return self._get_focused(TabID.VOLUMES)
 
     def _get_focused_network(self) -> Network | None:
-        return self._get_focused("tab-networks")
+        return self._get_focused(TabID.NETWORKS)
 
     # Container actions
-
     def _run_on_focused_container(
         self,
         command: Callable[[str], tuple[bool, str]],
@@ -317,17 +333,13 @@ class DockSurfApp(App):
         guard: Callable[[Container], str | None] = lambda _: None,
     ) -> None:
         c = self._get_focused_container()
-
         if c is None:
             self.notify(self._CONTAINER_TAB_HINT, severity="warning")
             return
-
         if reason := guard(c):
             self.notify(reason, severity="information")
             return
-
         ok, err = command(c.id)
-
         if ok:
             self.notify(success_msg(c))
             self.populate_tables()
@@ -363,30 +375,29 @@ class DockSurfApp(App):
         if c is None:
             self.notify(self._CONTAINER_TAB_HINT, severity="warning")
             return
-        log_pane = self.query_one("#log-pane", LogPane)
+        log_pane = self.query_one(f"#{LOG_PANE_ID}", LogPane)
         log_pane.load(c.id, c.name, fetch_logs(c.id))
-        self.query_one("#detail-pane", DetailPane).display = False
+        self.query_one(f"#{DETAIL_PANE_ID}", DetailPane).display = False
         log_pane.display = True
 
     def action_close_logs(self) -> None:
-        log_pane = self.query_one("#log-pane", LogPane)
+        log_pane = self.query_one(f"#{LOG_PANE_ID}", LogPane)
         if not log_pane.display:
             return
         log_pane.stop_follow()
-        # Collapse before hiding so state is clean on next open
         if log_pane.has_class("expanded"):
             self._set_log_expanded(log_pane, False)
         log_pane.display = False
-        self.query_one("#detail-pane", DetailPane).display = True
+        self.query_one(f"#{DETAIL_PANE_ID}", DetailPane).display = True
 
     def action_follow_logs(self) -> None:
-        log_pane = self.query_one("#log-pane", LogPane)
+        log_pane = self.query_one(f"#{LOG_PANE_ID}", LogPane)
         if not log_pane.display:
             return
         log_pane.toggle_follow()
 
     def action_toggle_log_expand(self) -> None:
-        log_pane = self.query_one("#log-pane", LogPane)
+        log_pane = self.query_one(f"#{LOG_PANE_ID}", LogPane)
         if not log_pane.display:
             return
         self._set_log_expanded(log_pane, not log_pane.has_class("expanded"))
@@ -396,17 +407,13 @@ class DockSurfApp(App):
         self.action_toggle_log_expand()
 
     def _set_log_expanded(self, log_pane: LogPane, expanded: bool) -> None:
-        tabbed = self.query_one(TabbedContent)
-        tabbed.display = not expanded
+        self.query_one(TabbedContent).display = not expanded
         log_pane.set_expanded(expanded)
 
     def action_exec_container(self) -> None:
         c = self._get_focused_container()
         if c is None:
-            self.notify(
-                self._CONTAINER_TAB_HINT,
-                severity="warning",
-            )
+            self.notify(self._CONTAINER_TAB_HINT, severity="warning")
             return
         if "Up" not in c.status:
             self.notify(f"{c.name} is not running", severity="warning")
@@ -414,8 +421,7 @@ class DockSurfApp(App):
         with self.suspend():
             subprocess.run(["docker", "exec", "-it", c.id, "sh"])
 
-    # Delete action (context-sensitive across all tabs)
-
+    # Delete (context-sensitive)
     def _apply_if_confirmed(
         self, confirmed: bool, command_fn, success_msg: str
     ) -> None:
@@ -431,11 +437,9 @@ class DockSurfApp(App):
     async def action_delete(self) -> None:
         if not self.snapshot:
             return
+        active = self.query_one(TabbedContent).active
 
-        tabbed = self.query_one(TabbedContent)
-        active = tabbed.active
-
-        if active == "tab-containers":
+        if active == TabID.CONTAINERS:
             c = self._get_focused_container()
             if c is None:
                 self.notify("No container selected", severity="warning")
@@ -453,7 +457,7 @@ class DockSurfApp(App):
                 f"Removed container: {c.name}",
             )
 
-        elif active == "tab-images":
+        elif active == TabID.IMAGES:
             img = self._get_focused_image()
             if img is None:
                 self.notify("No image selected", severity="warning")
@@ -471,7 +475,7 @@ class DockSurfApp(App):
                 f"Remove image {img.repository}:{img.tag}",
             )
 
-        elif active == "tab-volumes":
+        elif active == TabID.VOLUMES:
             vol = self._get_focused_volume()
             if vol is None:
                 self.notify("No volume selected", severity="warning")
@@ -491,14 +495,15 @@ class DockSurfApp(App):
                 f"Removed volume {vol.name}",
             )
 
-        elif active == "tab-networks":
+        elif active == TabID.NETWORKS:
             net = self._get_focused_network()
             if net is None:
                 self.notify("No network selected", severity="warning")
                 return
             if net.name in ("bridge", "host", "none"):
                 self.notify(
-                    f"Cannot remove built-in network '{net.name}'", severity="warning"
+                    f"Cannot remove built-in network '{net.name}'",
+                    severity="warning",
                 )
                 return
             confirmed = await self.push_screen_wait(
@@ -510,23 +515,22 @@ class DockSurfApp(App):
                 f"Removed network {net.name}",
             )
 
-    # Search Filters
-
+    # Search
     def action_open_search(self) -> None:
-        search_bar = self.query_one("#search-bar", Input)
+        search_bar = self.query_one(f"#{SEARCH_BAR_ID}", Input)
         search_bar.display = True
         search_bar.focus()
 
-    @on(Input.Changed, "#search-bar")
+    @on(Input.Changed, f"#{SEARCH_BAR_ID}")
     def on_search_changed(self, event: Input.Changed) -> None:
         self._apply_filter(event.value)
 
-    @on(Input.Submitted, "#search-bar")
+    @on(Input.Submitted, f"#{SEARCH_BAR_ID}")
     def on_search_escape(self, event: Input.Submitted) -> None:
         self._close_search()
 
     def _close_search(self) -> None:
-        search_bar = self.query_one("#search-bar", Input)
+        search_bar = self.query_one(f"#{SEARCH_BAR_ID}", Input)
         search_bar.display = False
         search_bar.value = ""
         self._apply_filter("")
@@ -536,12 +540,9 @@ class DockSurfApp(App):
             return
 
         q = query.lower()
-        tabbed = self.query_one(TabbedContent)
-        active = tabbed.active
+        active = self.query_one(TabbedContent).active
 
-        if active == "tab-containers":
-            table = self.query_one("#table-containers", DataTable)
-            table.clear(columns=False)
+        if active == TabID.CONTAINERS:
             filtered = [
                 c
                 for c in self.snapshot.containers
@@ -549,61 +550,46 @@ class DockSurfApp(App):
                 or q in c.image_name.lower()
                 or q in c.status.lower()
             ]
-            for c in filtered:
-                table.add_row(c.name, c.image_name, _status_markup(c.status))
-
-        elif active == "tab-images":
-            table = self.query_one("#table-images", DataTable)
+            table = self.query_one(f"#{TableID.CONTAINERS}", DataTable)
             table.clear(columns=False)
+            self._populate_container_table(table, filtered)
+
+        elif active == TabID.IMAGES:
             filtered = [
                 i
                 for i in self.snapshot.images
                 if q in (i.repository or "").lower() or q in (i.tag or "").lower()
             ]
-            for i in filtered:
-                status = (
-                    "[green]In Use[/]"
-                    if i.used_by
-                    else "[red]Dangling[/]"
-                    if i.is_dangling
-                    else "[yellow]Unused[/]"
-                )
-                table.add_row(i.repository, i.tag, i.size, status)
-
-        elif active == "tab-volumes":
-            table = self.query_one("#table-volumes", DataTable)
+            table = self.query_one(f"#{TableID.IMAGES}", DataTable)
             table.clear(columns=False)
+            self._populate_image_table(table, filtered)
+
+        elif active == TabID.VOLUMES:
             filtered = [
                 v
                 for v in self.snapshot.volumes
                 if q in v.name.lower() or q in v.driver.lower()
             ]
-            for v in filtered:
-                status = "[green]In Use[/]" if v.used_by else "[yellow]Orphaned[/]"
-                name = v.name[:20] + "..." if len(v.name) > 20 else v.name
-                table.add_row(name, v.driver, status)
-
-        elif active == "tab-networks":
-            table = self.query_one("#table-networks", DataTable)
+            table = self.query_one(f"#{TableID.VOLUMES}", DataTable)
             table.clear(columns=False)
+            self._populate_volume_table(table, filtered)
+
+        elif active == TabID.NETWORKS:
             filtered = [
                 n
                 for n in self.snapshot.networks
                 if q in n.name.lower() or q in n.driver.lower()
             ]
-            for n in filtered:
-                table.add_row(n.name, n.driver, n.scope)
+            table = self.query_one(f"#{TableID.NETWORKS}", DataTable)
+            table.clear(columns=False)
+            self._populate_network_table(table, filtered)
 
 
 def main():
     import logging
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(levelname)s: %(message)s",
-    )
-    app = DockSurfApp()
-    app.run()
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+    DockSurfApp().run()
 
 
 if __name__ == "__main__":
