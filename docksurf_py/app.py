@@ -8,6 +8,7 @@ from textual.widgets import (
     DataTable,
     Footer,
     Header,
+    Input,
     LoadingIndicator,
     TabbedContent,
     TabPane,
@@ -30,7 +31,7 @@ from docksurf_py.docker import (
     start_container,
     stop_container,
 )
-from docksurf_py.widgets import ConfirmDialog, DetailPane, LogsScreen
+from docksurf_py.widgets import ConfirmDialog, DetailPane, LogPane, SearchBar
 
 T = TypeVar("T")
 
@@ -51,11 +52,15 @@ class DockSurfApp(App):
         ("q", "quit", "Quit"),
         ("r", "refresh", "Refresh"),
         ("l", "view_logs", "Logs"),
+        ("L", "close_logs", "Close Logs"),
+        ("f", "follow_logs", "Follow"),
+        ("z", "toggle_log_expand", "Expand Logs"),
         ("e", "exec_container", "Exec"),
         ("s", "stop_container", "Stop"),
         ("S", "start_container", "Start"),
         ("x", "restart_container", "Restart"),
         ("d", "delete", "Delete"),
+        ("/", "open_search", "Search"),
     ]
     CSS_PATH = "app.tcss"
     TABLE_COLUMNS = {
@@ -104,7 +109,9 @@ class DockSurfApp(App):
             yield DetailPane(
                 "Select an item on the left to view details...", id="detail-pane"
             )
+            yield LogPane(id="log-pane")
         yield LoadingIndicator(id="refresh-loading")
+        yield SearchBar(placeholder="🔍 Filter...", id="search-bar")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -354,13 +361,44 @@ class DockSurfApp(App):
     def action_view_logs(self) -> None:
         c = self._get_focused_container()
         if c is None:
-            self.notify(
-                self._CONTAINER_TAB_HINT,
-                severity="warning",
-            )
+            self.notify(self._CONTAINER_TAB_HINT, severity="warning")
             return
-        logs = fetch_logs(c.id)
-        self.push_screen(LogsScreen(c.name, logs))
+        log_pane = self.query_one("#log-pane", LogPane)
+        log_pane.load(c.id, c.name, fetch_logs(c.id))
+        self.query_one("#detail-pane", DetailPane).display = False
+        log_pane.display = True
+
+    def action_close_logs(self) -> None:
+        log_pane = self.query_one("#log-pane", LogPane)
+        if not log_pane.display:
+            return
+        log_pane.stop_follow()
+        # Collapse before hiding so state is clean on next open
+        if log_pane.has_class("expanded"):
+            self._set_log_expanded(log_pane, False)
+        log_pane.display = False
+        self.query_one("#detail-pane", DetailPane).display = True
+
+    def action_follow_logs(self) -> None:
+        log_pane = self.query_one("#log-pane", LogPane)
+        if not log_pane.display:
+            return
+        log_pane.toggle_follow()
+
+    def action_toggle_log_expand(self) -> None:
+        log_pane = self.query_one("#log-pane", LogPane)
+        if not log_pane.display:
+            return
+        self._set_log_expanded(log_pane, not log_pane.has_class("expanded"))
+
+    @on(LogPane.ToggleExpand)
+    def on_log_pane_toggle_expand(self) -> None:
+        self.action_toggle_log_expand()
+
+    def _set_log_expanded(self, log_pane: LogPane, expanded: bool) -> None:
+        tabbed = self.query_one(TabbedContent)
+        tabbed.display = not expanded
+        log_pane.set_expanded(expanded)
 
     def action_exec_container(self) -> None:
         c = self._get_focused_container()
@@ -471,6 +509,90 @@ class DockSurfApp(App):
                 lambda: remove_network(net.name),
                 f"Removed network {net.name}",
             )
+
+    # Search Filters
+
+    def action_open_search(self) -> None:
+        search_bar = self.query_one("#search-bar", Input)
+        search_bar.display = True
+        search_bar.focus()
+
+    @on(Input.Changed, "#search-bar")
+    def on_search_changed(self, event: Input.Changed) -> None:
+        self._apply_filter(event.value)
+
+    @on(Input.Submitted, "#search-bar")
+    def on_search_escape(self, event: Input.Submitted) -> None:
+        self._close_search()
+
+    def _close_search(self) -> None:
+        search_bar = self.query_one("#search-bar", Input)
+        search_bar.display = False
+        search_bar.value = ""
+        self._apply_filter("")
+
+    def _apply_filter(self, query: str) -> None:
+        if not self.snapshot:
+            return
+
+        q = query.lower()
+        tabbed = self.query_one(TabbedContent)
+        active = tabbed.active
+
+        if active == "tab-containers":
+            table = self.query_one("#table-containers", DataTable)
+            table.clear(columns=False)
+            filtered = [
+                c
+                for c in self.snapshot.containers
+                if q in c.name.lower()
+                or q in c.image_name.lower()
+                or q in c.status.lower()
+            ]
+            for c in filtered:
+                table.add_row(c.name, c.image_name, _status_markup(c.status))
+
+        elif active == "tab-images":
+            table = self.query_one("#table-images", DataTable)
+            table.clear(columns=False)
+            filtered = [
+                i
+                for i in self.snapshot.images
+                if q in (i.repository or "").lower() or q in (i.tag or "").lower()
+            ]
+            for i in filtered:
+                status = (
+                    "[green]In Use[/]"
+                    if i.used_by
+                    else "[red]Dangling[/]"
+                    if i.is_dangling
+                    else "[yellow]Unused[/]"
+                )
+                table.add_row(i.repository, i.tag, i.size, status)
+
+        elif active == "tab-volumes":
+            table = self.query_one("#table-volumes", DataTable)
+            table.clear(columns=False)
+            filtered = [
+                v
+                for v in self.snapshot.volumes
+                if q in v.name.lower() or q in v.driver.lower()
+            ]
+            for v in filtered:
+                status = "[green]In Use[/]" if v.used_by else "[yellow]Orphaned[/]"
+                name = v.name[:20] + "..." if len(v.name) > 20 else v.name
+                table.add_row(name, v.driver, status)
+
+        elif active == "tab-networks":
+            table = self.query_one("#table-networks", DataTable)
+            table.clear(columns=False)
+            filtered = [
+                n
+                for n in self.snapshot.networks
+                if q in n.name.lower() or q in n.driver.lower()
+            ]
+            for n in filtered:
+                table.add_row(n.name, n.driver, n.scope)
 
 
 def main():

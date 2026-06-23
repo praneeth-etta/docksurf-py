@@ -1,107 +1,100 @@
-# docker-vis
+# docksurf-py
 
-A terminal UI for visualising Docker containers, images, volumes and networks
-in WSL — no GUI, no browser needed.
+A keyboard-driven terminal UI for visualising and managing Docker resources — containers, images, volumes, and networks. No GUI, no browser, no daemon socket needed.
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│  docker-vis                                          12:34:56 │
-├──────────────────┬───────────────────────────────────────────┤
-│  Overview Images │  ● api-server                             │
-│  Volumes Networks│  ─────────────────────────────────────── │
-│                  │  Info                                     │
-│  ◈ MY-APP        │  id           a1b2c3d4e5f6               │
-│  ● nginx-proxy   │  image        myapp-api:2.1               │
-│  ● api-server    │  status       running                     │
-│  ● worker        │  compose      my-app / api                │
-│  ● postgres      │                                           │
-│  ● redis         │  Live Stats                               │
-│                  │  cpu          ████░░░░░░  8.4%            │
-│  ◈ STANDALONE    │  memory       210MB / 2GB                 │
-│  ○ deploy-build  │                                           │
-│                  │  Networks                                  │
-│                  │  myapp_net    172.18.0.3                  │
-│                  │                                           │
-│                  │  Volumes                                   │
-│                  │  [uploads-vol] → /uploads                 │
-│                  │  [pgdata]      → /app/pgdata               │
-└──────────────────┴───────────────────────────────────────────┘
-  r Refresh  q Quit
+┌──────────────────────────────────────────────────────────────────┐
+│  DockSurf                                                12:34:56 │
+├──────────────────────────┬───────────────────────────────────────┤
+│ Containers Images        │  Container: api-server                │
+│ Volumes    Networks      │  ───────────────────────────────────  │
+│                          │  ID         a1b2c3d4e5f6...           │
+│  ● api-server            │  Image      myapp-api:2.1             │
+│  ● nginx-proxy           │  Status     Up 3 hours                │
+│  ● worker                │  Created    3 hours ago               │
+│  ○ deploy-build          │  Ports      0.0.0.0:8080->8080/tcp    │
+│                          │  Networks   myapp_net                  │
+│                          │  Mounts     /uploads, /app/pgdata      │
+│                          │                                        │
+└──────────────────────────┴───────────────────────────────────────┘
+  q Quit  r Refresh  l Logs  e Exec  s Stop  S Start  x Restart  d Delete
 ```
 
-## Install (WSL, Python 3.11+, uv)
+## Install (Python 3.11+, uv)
 
 ```bash
-# 1. Clone or copy this folder
-cd docker-vis
+git clone <repo>
+cd docksurf-py
 
-# 2. Create a virtual environment and install
-uv venv
-source .venv/bin/activate
+uv venv && source .venv/bin/activate
 uv pip install -e .
 
-# 3. Run
-docker-vis
+docksurf-py
 ```
 
 Or run directly without installing:
 
 ```bash
-uv run python -m docker_vis.app
+uv run python -m docksurf_py.app
 ```
 
 ## Keybindings
 
-| Key             | Action                     |
-|-----------------|----------------------------|
-| `Tab`           | Switch between sidebar tabs |
-| `↑` / `↓`       | Navigate list              |
-| `Enter`         | Select item / show detail  |
-| `r`             | Refresh all data           |
-| `q` / `Ctrl+C`  | Quit                       |
+### Global
+
+| Key        | Action                          |
+|------------|---------------------------------|
+| `r`        | Refresh all Docker data         |
+| `q`        | Quit                            |
+| `/`        | Filter current tab              |
+
+### Containers tab
+
+| Key        | Action                          |
+|------------|---------------------------------|
+| `l`        | Open log viewer (right pane)    |
+| `e`        | Exec into container (`sh`)      |
+| `s`        | Stop container                  |
+| `S`        | Start container                 |
+| `x`        | Restart container               |
+| `d`        | Delete resource (with confirm)  |
+
+### Log viewer
+
+| Key        | Action                                      |
+|------------|---------------------------------------------|
+| `f`        | Toggle live log streaming (`docker logs -f`)|
+| `z`        | Expand log pane to full width / collapse    |
+| `L`        | Close log viewer, return to detail pane     |
+
+The expand button (`⛶ Expand` / `⊡ Collapse`) in the log pane toolbar is also clickable.
 
 ## Tabs
 
-### Overview
-All containers, grouped by `docker-compose` project. Shows running status
-at a glance. Select a container to see: image, live CPU/memory stats,
-ports, networks with IPs, and volume mounts.
+**Containers** — all containers with status. Select one to see image, ports, networks, and mounts in the detail pane. Press `l` to stream logs inline.
 
-### Images
-All images grouped as **In Use**, **Unused**, and **Dangling**.
-Select an image to see size, layer count, parent image, and which
-containers use it. Dangling and unused images show a ready-to-copy
-`docker rmi` command.
+**Images** — all images tagged as In Use, Unused, or Dangling. Detail pane shows size, created date, architecture, and which containers use it.
 
-### Volumes
-All volumes grouped as **Mounted** (attached to at least one container)
-and **Orphaned** (safe to prune). Select a volume to see which containers
-mount it and where. Orphaned volumes show a ready-to-copy `docker volume rm`
-command.
+**Volumes** — all volumes tagged as In Use or Orphaned. Detail pane shows mountpoint, labels, and which containers mount it.
 
-### Networks
-All Docker networks with driver and scope. Select a network to see
-all attached containers.
+**Networks** — all networks with driver and scope. Detail pane shows subnet, gateway, and attached containers.
+
+## Architecture
+
+Three modules with strict layering:
+
+- **`docker.py`** — data layer. `fetch_snapshot()` shells out to the Docker CLI and returns a `DockerSnapshot` dataclass. No daemon socket needed.
+- **`widgets.py`** — UI components: `DetailPane`, `LogPane`, `ConfirmDialog`, `SearchBar`.
+- **`app.py`** — wires layout and events. 40/60 horizontal split: `TabbedContent` on the left, `DetailPane` / `LogPane` on the right.
 
 ## How data is fetched
 
-docker-vis shells out to the Docker CLI — no daemon socket access needed.
-Commands used:
+DockSurf talks to Docker exclusively through the CLI using `docker <cmd> --format '{{json .}}'` for structured output. Commands used:
+
 - `docker ps -a` + `docker inspect`
-- `docker stats --no-stream` (for live CPU/memory)
-- `docker images -a` + `docker history`
+- `docker images -a`
 - `docker volume ls` + `docker volume inspect`
 - `docker network ls` + `docker network inspect`
+- `docker logs` (static snapshot + live streaming via `docker logs -f`)
 
-All fetching happens in a background thread so the UI never freezes.
-Press `r` to refresh on demand.
-
-## Adding more features later
-
-The project is split into two files intentionally:
-
-- **`docker_vis/docker.py`** — pure data layer, returns dataclasses.
-  Add new fetchers here (e.g. `docker system df` for cache sizes).
-- **`docker_vis/widgets.py`** — pure UI layer, reads dataclasses.
-  Add new list items and detail panels here.
-- **`docker_vis/app.py`** — wires them together, handles layout and events.
+Snapshots are fetched in a background thread — the UI never freezes. Press `r` to refresh on demand.

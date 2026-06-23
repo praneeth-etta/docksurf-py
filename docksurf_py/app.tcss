@@ -22,3 +22,13 @@ TabbedContent {
     align: center middle;
     background: $surface 35%;
 }
+
+#search-bar {
+    display: none;
+    dock: bottom;
+    height: 3;
+    border-top: tall $primary;
+    margin-bottom: 1;
+    background: $surface;
+    padding: 0 1;
+}
