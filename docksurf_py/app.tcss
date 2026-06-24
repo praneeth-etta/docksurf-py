@@ -112,3 +112,44 @@ LogPane #log-pane-view {
     height: 1fr;
     padding: 0 1;
 }
+
+HelpScreen {
+    align: center middle;
+    background: $background 60%;
+}
+
+HelpScreen > Vertical {
+    width: 70;
+    height: auto;
+    max-height: 85%;
+    border: double $accent;
+    background: $surface;
+    padding: 1 3;
+}
+
+HelpScreen #help-title {
+    text-align: center;
+    width: 100%;
+    margin-bottom: 0;
+    color: $accent;
+    text-style: bold;
+}
+
+HelpScreen Static{
+    margin: 1 0;
+}
+
+HelpScreen Button {
+    margin-top: 1;
+    width: 100%;
+}
+
+#status-bar {
+    dock: bottom;
+    margin-bottom: 1; /* Leaves room for the built-in Footer */
+    width: 100%;
+    height: 1;
+    background: $surface-lighten-1;
+    color: $text;
+    padding: 0 2;
+}

@@ -25,6 +25,7 @@ BTN_EXPAND_ID = "expand-btn"
 
 DETAIL_PANE_ID = "detail-pane"
 SEARCH_BAR_ID = "search-bar"
+STATUS_BAR_ID = "status-bar"
 MAIN_CONTAINER_ID = "main-container"
 REFRESH_LOADING_ID = "refresh-loading"
 

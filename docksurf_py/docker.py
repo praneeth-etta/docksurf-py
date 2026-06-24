@@ -2,18 +2,25 @@
 docker.py — All system-level Docker execution lives here.
 """
 
-import json
 import logging
-import subprocess
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Iterator, TypeAlias
 
+import docker
+from docker.errors import APIError, DockerException, NotFound
+
 logger = logging.getLogger(__name__)
 
 CommandResult: TypeAlias = tuple[bool, str]
+
+try:
+    client = docker.from_env()
+except DockerException as e:
+    logger.exception(f"Failed to connect to Docker Daemon: {e}")
+    client = None
 
 
 @dataclass(slots=True)
@@ -27,6 +34,7 @@ class Container:
     mounts: list[str]
     networks: list[str]
     created: str
+    env: list[str]
 
 
 @dataclass(slots=True)
@@ -70,95 +78,56 @@ class DockerSnapshot:
 
 
 class LogStream:
-    """
-    Wraps a `docker logs -f` subprocess and exposes it as a line iterator.
-
-    Usage::
-
-        stream = LogStream(container_id)
-        for line in stream:
-            ...              # runs until stop() is called or process exits
-        stream.stop()        # safe to call even after the loop ends
-
-    The underlying process is always cleaned up — either by the iterator's
-    finally-block or by an explicit call to ``stop()``.
-    """
+    """Wraps docker SDK log generator"""
 
     def __init__(self, container_id: str) -> None:
         self._container_id = container_id
-        self._process: subprocess.Popen | None = None
         self._active = False
-
-    def _start(self) -> None:
-        self._process = subprocess.Popen(
-            ["docker", "logs", "-f", self._container_id],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-        )
-        self._active = True
+        self._generator = None
 
     def __iter__(self) -> Iterator[str]:
-        self._start()
-        assert self._process and self._process.stdout
+        if not client:
+            return
+
+        self._active = True
         try:
-            for raw_line in self._process.stdout:
+            container = client.containers.get(self._container_id)
+            self._generator = container.logs(stream=True, follow=True, tail=500)
+
+            for raw_line in self._generator:
                 if not self._active:
                     break
-                yield raw_line.rstrip()
+                yield raw_line.decode("utf-8", errors="replace").rstrip()
+        except NotFound:
+            yield f"Container {self._container_id} not found"
+        except Exception as e:
+            yield f"Log stream error: {e}"
         finally:
-            self._cleanup()
+            self.stop()
 
     def stop(self) -> None:
-        """Signal the iterator to stop and terminate the subprocess."""
         self._active = False
-        self._cleanup()
-
-    def _cleanup(self) -> None:
-        if self._process is not None:
-            try:
-                self._process.terminate()
-                self._process.wait(timeout=2)
-            except Exception:
-                pass
-            finally:
-                self._process = None
-
-
-# Helpers
-def parse_json_lines(raw: str):
-    for line in raw.splitlines():
-        if line.strip():
-            try:
-                yield json.loads(line)
-            except json.JSONDecodeError as exc:
-                logger.warning("Failed to parse Docker JSON line: %s", exc)
-                continue
+        if self._generator and hasattr(self._generator, "close"):
+            self._generator.close()
 
 
 def format_relative_time(ts: str) -> str:
     """Convert a Docker timestamp string to a human-readable relative age."""
     if not ts:
         return "Unknown"
-    ts_clean = ts.replace(" UTC", "").strip()
-    formats = [
-        "%Y-%m-%d %H:%M:%S %z",
-        "%Y-%m-%dT%H:%M:%S.%fZ",
-        "%Y-%m-%dT%H:%M:%SZ",
-        "%Y-%m-%d %H:%M:%S",
-    ]
-    dt = None
-    for fmt in formats:
-        try:
-            dt = datetime.strptime(ts_clean, fmt)
-            break
-        except ValueError:
-            continue
-    if dt is None:
+
+    # The SDK usually returns standard ISO formats
+    ts_clean = ts.split(".")[0] if "." in ts else ts
+    ts_clean = ts_clean.replace("Z", "")
+
+    try:
+        dt = datetime.fromisoformat(ts_clean)
+    except ValueError:
         return ts
+
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
+
     diff = int((datetime.now(timezone.utc) - dt).total_seconds())
     if diff < 0:
         return "just now"
@@ -175,180 +144,136 @@ def format_relative_time(ts: str) -> str:
     return f"{diff // (86400 * 365)}y ago"
 
 
-def run_docker_command(*args: str) -> str:
-    try:
-        result = subprocess.run(
-            ["docker", *args], capture_output=True, text=True, check=True
-        )
-        return result.stdout.strip()
-    except subprocess.CalledProcessError as exc:
-        logger.warning("Docker command failed: docker %s", " ".join(args))
-        logger.debug("stderr: %s", exc.stderr)
-        return ""
+def format_size(size_in_bytes: int | None) -> str:
+    if not size_in_bytes:
+        return "0B"
+    for unit in ["B", "KB", "MB", "GB", "TB"]:
+        if size_in_bytes < 1024.0:
+            return f"{size_in_bytes: .2f}{unit}"
+        size_in_bytes /= 1024.0
+    return f"{size_in_bytes: .2f}PB"
 
 
-# Raw fetchers
-def fetch_raw_containers() -> str:
-    return run_docker_command("ps", "-a", "--format", "{{json .}}")
-
-
-def fetch_raw_images() -> str:
-    return run_docker_command("images", "-a", "--no-trunc", "--format", "{{json .}}")
-
-
-def fetch_raw_volumes() -> str:
-    return run_docker_command("volume", "ls", "--format", "{{json .}}")
-
-
-def fetch_raw_networks() -> str:
-    return run_docker_command("network", "ls", "--format", "{{json .}}")
-
-
-def _docker_inspect(*ids: str) -> list[dict]:
-
-    result = subprocess.run(
-        ["docker", "inspect", *ids],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if result.returncode != 0:
-        logger.warning("docker inspect failed")
-        return []
-    if not result.stdout:
-        return []
-    return json.loads(result.stdout)
-
-
-# Inspect helpers
-def inspect_containers(container_ids: list[str]) -> dict:
-    if not container_ids:
-        return {}
-    inspect_data = _docker_inspect(*container_ids)
-    return {item["Id"][:12]: item for item in inspect_data}
-
-
-def inspect_networks(network_ids: list[str]) -> dict:
-    if not network_ids:
-        return {}
-    inspect_data = _docker_inspect(*network_ids)
-    lookup = {}
-    for item in inspect_data:
-        net_id = item.get("Id", "")[:12]
-        subnet = gateway = "N/A"
-        ipam_config = item.get("IPAM", {}).get("Config", {})
-        if ipam_config and isinstance(ipam_config, list) and len(ipam_config) > 0:
-            subnet = ipam_config[0].get("Subnet", "N/A")
-            gateway = ipam_config[0].get("Gateway", "N/A")
-        lookup[net_id] = {"subnet": subnet, "gateway": gateway}
-    return lookup
-
-
-# Entity builders
 def get_containers() -> list[Container]:
-    raw_data = fetch_raw_containers()
-    if not raw_data:
+    if not client:
         return []
 
-    container_rows = list(parse_json_lines(raw_data))
-    inspect_lookup = inspect_containers([row["ID"] for row in container_rows])
     containers = []
+    for c in client.containers.list(all=True):
+        attrs = c.attrs
 
-    for row in container_rows:
-        cid = row["ID"]
-
-        inspect = inspect_lookup.get(cid, {})
+        ports_list = []
+        port_bindings = attrs.get("NetworkSettings", {}).get("Ports", {}) or {}
+        for port, bindings in port_bindings.items():
+            if bindings:
+                for binding in bindings:
+                    host_ip = binding.get("HostIp", "")
+                    host_port = binding.get("HostPort", "")
+                    prefix = f"{host_ip}:" if host_ip else ""
+                    ports_list.append(f"{prefix}{host_port}->{port}")
+            else:
+                ports_list.append(port)
 
         mounts = [
             m.get("Name") or m.get("Source", "")
-            for m in inspect.get("Mounts", [])
+            for m in attrs.get("Mounts", [])
             if m.get("Name") or m.get("Source")
         ]
 
-        networks = list(inspect.get("NetworkSettings", {}).get("Networks", {}).keys())
+        networks = list(attrs.get("NetworkSettings", {}).get("Networks", {}).keys())
+        env_vars = attrs.get("Config", {}).get("Env", [])
+        image_tags = (
+            c.image.tags if c.image and c.image.tags else [attrs.get("Image", "")]
+        )
+
         containers.append(
             Container(
-                id=cid,
-                name=row.get("Names", "").lstrip("/"),
-                image_id=inspect.get("Image", ""),
-                image_name=row.get("Image", ""),
-                status=row.get("Status", ""),
-                ports=row.get("Ports", ""),
+                id=c.short_id,
+                name=c.name,
+                image_id=c.image.id if c.image else "",
+                image_name=image_tags[0],
+                status=c.status,
+                ports=", ".join(ports_list),
                 mounts=mounts,
                 networks=networks,
-                created=row.get("CreatedAt", ""),
+                created=attrs.get("Created", ""),
+                env=env_vars,
             )
         )
     return containers
 
 
 def get_images() -> list[Image]:
-    raw_data = fetch_raw_images()
-    if not raw_data:
+    if not client:
         return []
 
     images = []
+    for i in client.images.list(all=True):
+        tags = i.tags if i.tags else ["<none>:<none>"]
 
-    for data in parse_json_lines(raw_data):
-        images.append(
-            Image(
-                id=data.get("ID"),
-                repository=data.get("Repository"),
-                tag=data.get("Tag"),
-                size=data.get("Size"),
-                is_dangling=(
-                    data.get("Repository") == "<none>" and data.get("Tag") == "<none>"
-                ),
-                used_by=[],
-                created=data.get("CreatedAt", ""),
-                architecture=data.get("Architecture"),
+        for tag_str in tags:
+            repo, _, tag = tag_str.partition(":")
+            if not tag:
+                tag = "latest"
+
+            images.append(
+                Image(
+                    id=i.short_id,
+                    repository=repo,
+                    tag=tag,
+                    size=format_size(i.attrs.get("Size")),
+                    is_dangling=(repo == "<none>" and tag == "<none>"),
+                    used_by=[],
+                    created=i.attrs.get("Created", ""),
+                    architecture=i.attrs.get("Architecture", "unknown"),
+                )
             )
-        )
     return images
 
 
 def get_volumes() -> list[Volume]:
-    raw_data = fetch_raw_volumes()
-    if not raw_data:
+    if not client:
         return []
 
     volumes = []
+    for v in client.volumes.list():
+        labels = v.attrs.get("Labels", {})
+        label_str = ", ".join(f"{k}={v}" for k, v in labels.items()) if labels else ""
 
-    for data in parse_json_lines(raw_data):
         volumes.append(
             Volume(
-                name=data.get("Name"),
-                driver=data.get("Driver"),
-                mountpoint=data.get("Mountpoint"),
+                name=v.name,
+                driver=v.attrs.get("Driver", ""),
+                mountpoint=v.attrs.get("Mountpoint", ""),
                 used_by=[],
-                labels=data.get("Labels"),
+                labels=label_str,
             )
         )
     return volumes
 
 
 def get_networks() -> list[Network]:
-    raw_data = fetch_raw_networks()
-    if not raw_data:
+    if not client:
         return []
 
-    network_rows = list(parse_json_lines(raw_data))
-    network_ids = [row.get("ID") for row in network_rows if row.get("ID")]
-    inspect_lookup = inspect_networks(network_ids)
-
     networks = []
+    for n in client.networks.list():
+        ipam_config = n.attrs.get("IPAM", {}).get("Config", [])
+        subnet = "N/A"
+        gateway = "N/A"
 
-    for data in network_rows:
-        nid = data.get("ID", "")
-        net_info = inspect_lookup.get(nid, {})
+        if ipam_config and isinstance(ipam_config, list) and len(ipam_config) > 0:
+            subnet = ipam_config[0].get("Subnet", "N/A")
+            gateway = ipam_config[0].get("Gateway", "N/A")
+
         networks.append(
             Network(
-                id=nid,
-                name=data.get("Name", ""),
-                driver=data.get("Driver", ""),
-                subnet=net_info.get("subnet", "N/A"),
-                gateway=net_info.get("gateway", "N/A"),
-                scope=data.get("Scope", ""),
+                id=n.short_id,
+                name=n.name,
+                driver=n.attrs.get("Driver", ""),
+                subnet=subnet,
+                gateway=gateway,
+                scope=n.attrs.get("Scope", ""),
                 used_by=[],
             )
         )
@@ -356,6 +281,9 @@ def get_networks() -> list[Network]:
 
 
 def fetch_snapshot() -> DockerSnapshot:
+    if not client:
+        return DockerSnapshot([], [], [], [])
+
     with ThreadPoolExecutor(max_workers=4) as pool:
         f_containers = pool.submit(get_containers)
         f_images = pool.submit(get_images)
@@ -391,59 +319,69 @@ def fetch_snapshot() -> DockerSnapshot:
 
 
 # Management commands
-def _run_management_command(*args: str) -> CommandResult:
+def _run_management_command(action_callable, success_msg: str) -> CommandResult:
     """Run a docker management command; return (success, message)."""
-    result = subprocess.run(["docker", *args], capture_output=True, text=True)
-    if result.returncode == 0:
-        return True, result.stdout.strip() or "OK"
-    return False, result.stderr.strip() or "Command failed"
+    if not client:
+        return False, "Docker client not initialized"
+    try:
+        action_callable()
+        return True, success_msg
+    except APIError as e:
+        return False, str(e)
 
 
 def stop_container(container_id: str) -> CommandResult:
-    return _run_management_command("stop", container_id)
+    return _run_management_command(
+        lambda: client.containers.get(container_id).stop(), "OK"
+    )
 
 
 def start_container(container_id: str) -> CommandResult:
-    return _run_management_command("start", container_id)
+    return _run_management_command(
+        lambda: client.containers.get(container_id).start(), "OK"
+    )
 
 
 def restart_container(container_id: str) -> CommandResult:
-    return _run_management_command("restart", container_id)
+    return _run_management_command(
+        lambda: client.containers.get(container_id).restart(), "OK"
+    )
 
 
 def remove_container(container_id: str, force: bool = False) -> CommandResult:
-    args = ["rm"]
-    if force:
-        args.append("--force")
-    args.append(container_id)
-    return _run_management_command(*args)
+    return _run_management_command(
+        lambda: client.containers.get(container_id).remove(force=force), "OK"
+    )
 
 
 def remove_image(image_id: str, force: bool = False) -> CommandResult:
-    args = ["rmi"]
-    if force:
-        args.append("--force")
-    args.append(image_id)
-    return _run_management_command(*args)
+    return _run_management_command(
+        lambda: client.images.remove(image=image_id, force=force), "OK"
+    )
 
 
 def remove_volume(volume_name: str) -> CommandResult:
-    return _run_management_command("volume", "rm", volume_name)
+    return _run_management_command(
+        lambda: client.volumes.get(volume_name).remove(), "OK"
+    )
 
 
 def remove_network(network_name: str) -> CommandResult:
-    return _run_management_command("network", "rm", network_name)
+    return _run_management_command(
+        lambda: client.networks.get(network_name).remove(), "OK"
+    )
 
 
 def fetch_logs(container_id: str, tail: int = 500) -> str:
-    """Fetch recent log lines for a container; merges stdout+stderr."""
-    result = subprocess.run(
-        ["docker", "logs", "--tail", str(tail), container_id],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-    )
-    return (result.stdout or "").strip()
+    """Fetch recent log lines for a container."""
+    if not client:
+        return "Docker client not initialized"
+    try:
+        container = client.containers.get(container_id)
+        logs = container.logs(tail=tail, stdout=True, stderr=True)
+        return logs.decode("utf-8", errors="replace").strip()
+    except Exception as e:
+        return f"Error fetching logs: {e}"
 
 
 if __name__ == "__main__":
