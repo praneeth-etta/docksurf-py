@@ -119,7 +119,7 @@ HelpScreen {
 }
 
 HelpScreen > Vertical {
-    width: 55;
+    width: 70;
     height: auto;
     max-height: 85%;
     border: double $accent;
@@ -130,7 +130,7 @@ HelpScreen > Vertical {
 HelpScreen #help-title {
     text-align: center;
     width: 100%;
-    margin-bottom: 1;
+    margin-bottom: 0;
     color: $accent;
     text-style: bold;
 }
@@ -142,4 +142,14 @@ HelpScreen Static{
 HelpScreen Button {
     margin-top: 1;
     width: 100%;
+}
+
+#status-bar {
+    dock: bottom;
+    margin-bottom: 1; /* Leaves room for the built-in Footer */
+    width: 100%;
+    height: 1;
+    background: $surface-lighten-1;
+    color: $text;
+    padding: 0 2;
 }

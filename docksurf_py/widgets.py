@@ -13,11 +13,20 @@ from rich.panel import Panel
 from rich.table import Table
 from textual import on
 from textual.app import ComposeResult
+from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.message import Message
 from textual.screen import ModalScreen
 from textual.widget import Widget
-from textual.widgets import Button, Collapsible, Input, Label, RichLog, Static
+from textual.widgets import (
+    Button,
+    Collapsible,
+    DataTable,
+    Input,
+    Label,
+    RichLog,
+    Static,
+)
 
 from docksurf_py.constants import (
     BTN_CANCEL_ID,
@@ -28,6 +37,21 @@ from docksurf_py.constants import (
     LOG_PANE_VIEW_ID,
 )
 from docksurf_py.docker import LogStream
+
+
+class ContainerTable(DataTable):
+    """A Table specifically for Containers with context-aware bindings."""
+
+    BINDINGS = [
+        Binding("s", "stop_container", "Stop"),
+        Binding("S", "start_container", "Start"),
+        Binding("x", "restart_container", "Restart"),
+        Binding("e", "exec_container", "Exec"),
+        Binding("l", "view_logs", "Logs"),
+        Binding("f", "follow_logs", "Follow"),
+        Binding("z", "toggle_log_expand", "Expand Logs", show=False),
+        Binding("d", "delete", "Delete"),
+    ]
 
 
 class DetailPane(VerticalScroll):
@@ -197,6 +221,7 @@ class HelpScreen(ModalScreen):
             "stop_container",
             "start_container",
             "restart_container",
+            "delete",
         }
     )
 
@@ -214,9 +239,21 @@ class HelpScreen(ModalScreen):
         table.add_column("Action", style="white")
         table.add_column("Applies To", style="dim", width=18)
 
-        for key, action, description in self._app_bindings:
-            scope = "Containers only" if action in self._CONTAINER_ONLY else "Global"
+        for item in self._app_bindings:
+            if isinstance(item, tuple):
+                key, action, description = item
+            else:
+                key, action, description = item.key, item.action, item.description
+
+            if not description:
+                continue
+
+            scope = "Container only" if action in self._CONTAINER_ONLY else "Global"
             table.add_row(f"[bold]{key}[/bold]", description, scope)
+
+        table.add_section()
+        table.add_row("[bold]Tab[/bold]", "Switch between tab panels", "Global")
+        table.add_row("[bold]↑ / ↓[/bold]", "Navigate rows in a table", "Global")
 
         with Vertical():
             yield Label("[b]Help[/b]", id="help-title")
@@ -226,3 +263,27 @@ class HelpScreen(ModalScreen):
     @on(Button.Pressed, "#help-close")
     def _close(self) -> None:
         self.dismiss()
+
+
+class StatusBar(Static):
+    """Displays global resource counts and status."""
+
+    def on_mount(self) -> None:
+        self.update_stats([], [], [])
+
+    def update_stats(self, containers: list, images: list, volumes: list) -> None:
+        running = sum(
+            1
+            for c in containers
+            if "up" in c.status.lower() or "running" in c.status.lower()
+        )
+        stopped = len(containers) - running
+
+        orphaned_volumes = sum(1 for v in volumes if not v.used_by)
+
+        text = (
+            f"[bold cyan]Containers:[/bold cyan] {running} running / {stopped} stopped  |  "
+            f"[bold cyan]Images:[/bold cyan] {len(images)} total  |  "
+            f"[bold cyan]Volumes:[/bold cyan] {orphaned_volumes} orphaned"
+        )
+        self.update(text)

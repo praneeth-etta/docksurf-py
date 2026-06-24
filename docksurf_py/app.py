@@ -28,6 +28,7 @@ from docksurf_py.constants import (
     MAIN_CONTAINER_ID,
     REFRESH_LOADING_ID,
     SEARCH_BAR_ID,
+    STATUS_BAR_ID,
     TabID,
     TableID,
     markup_green,
@@ -53,10 +54,12 @@ from docksurf_py.docker import (
 )
 from docksurf_py.widgets import (
     ConfirmDialog,
+    ContainerTable,
     DetailPane,
     HelpScreen,
     LogPane,
     SearchBar,
+    StatusBar,
 )
 
 T = TypeVar("T")
@@ -75,19 +78,19 @@ class DockSurfApp(App):
     snapshot: DockerSnapshot | None = None
     _refresh_in_progress = False
     BINDINGS = [
-        ("q", "quit", "Quit"),
+        ("?", "help", "Help"),
         ("r", "refresh", "Refresh"),
+        ("/", "open_search", "Search"),
+        ("q", "quit", "Quit"),
+        ("s", "stop_container", "Stop"),
+        ("S", "start_container", "Start"),
+        ("x", "restart_container", "Restart"),
+        ("e", "exec_container", "Exec"),
+        ("d", "delete", "Delete"),
         ("l", "view_logs", "Logs"),
         ("L", "close_logs", "Close Logs"),
         ("f", "follow_logs", "Follow"),
         ("z", "toggle_log_expand", "Expand Logs"),
-        ("e", "exec_container", "Exec"),
-        ("s", "stop_container", "Stop"),
-        ("S", "start_container", "Start"),
-        ("x", "restart_container", "Restart"),
-        ("d", "delete", "Delete"),
-        ("/", "open_search", "Search"),
-        ("?", "help", "Help"),
     ]
     CSS_PATH = "app.tcss"
     TABLE_COLUMNS: dict[TableID, tuple[str, ...]] = {
@@ -110,7 +113,7 @@ class DockSurfApp(App):
         with Horizontal(id=MAIN_CONTAINER_ID):
             with TabbedContent():
                 with TabPane("Containers", id=TabID.CONTAINERS):
-                    yield DataTable(id=TableID.CONTAINERS)
+                    yield ContainerTable(id=TableID.CONTAINERS)
                 with TabPane("Images", id=TabID.IMAGES):
                     yield DataTable(id=TableID.IMAGES)
                 with TabPane("Volumes", id=TabID.VOLUMES):
@@ -123,6 +126,7 @@ class DockSurfApp(App):
             yield LogPane(id=LOG_PANE_ID)
         yield LoadingIndicator(id=REFRESH_LOADING_ID)
         yield SearchBar(placeholder="🔍 Filter...", id=SEARCH_BAR_ID)
+        yield StatusBar(id=STATUS_BAR_ID)
         yield Footer()
 
     # Lifecycle - Mount & Refresh
@@ -164,6 +168,9 @@ class DockSurfApp(App):
         self._populate_image_table(self.query_one(f"#{TableID.IMAGES}", DataTable))
         self._populate_volume_table(self.query_one(f"#{TableID.VOLUMES}", DataTable))
         self._populate_network_table(self.query_one(f"#{TableID.NETWORKS}", DataTable))
+
+        status_bar = self.query_one(f"#{STATUS_BAR_ID}", StatusBar)
+        status_bar.update_stats(snapshot.containers, snapshot.images, snapshot.volumes)
 
     def _finish_refresh(
         self, snapshot: DockerSnapshot | None, error: str | None
@@ -428,7 +435,22 @@ class DockSurfApp(App):
             subprocess.run(["docker", "exec", "-it", c.id, "sh"])
 
     def action_help(self) -> None:
-        self.push_screen(HelpScreen(self.BINDINGS))
+        help_data = [
+            ("q", "quit", "Quit"),
+            ("r", "refresh", "Refresh"),
+            ("/", "open_search", "Search"),
+            ("?", "help", "Help"),
+            ("d", "delete", "Delete selected resource"),
+            ("s", "stop_container", "Stop container"),
+            ("S", "start_container", "Start container"),
+            ("x", "restart_container", "Restart container"),
+            ("e", "exec_container", "Exec shell in container"),
+            ("l", "view_logs", "Open log viewer"),
+            ("L", "close_logs", "Close log viewer"),
+            ("f", "follow_logs", "Toggle live log streaming"),
+            ("z", "toggle_log_expand", "Expand / collapse log pane"),
+        ]
+        self.push_screen(HelpScreen(help_data))
 
     # Delete (context-sensitive)
     def _apply_if_confirmed(
