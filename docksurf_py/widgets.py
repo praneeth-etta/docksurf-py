@@ -57,37 +57,43 @@ class ContainerTable(DataTable):
 class DetailPane(VerticalScroll):
     """A custom container that displays a key-value table and collapsible extras."""
 
-    def on_mount(self) -> None:
-        self.clear_details()
+    _panel: Static
+    _env_collapsible: "Collapsible | None" = None
+
+    def compose(self) -> ComposeResult:
+        self._panel = Static(
+            Panel("Select an item to view details.", border_style="dim")
+        )
+        yield self._panel
 
     def update_details(
         self, title: str, data: dict, env_vars: list[str] | None = None
     ) -> None:
-        for child in self.children:
-            child.remove()
-
         table = Table(show_header=False, expand=True, box=None)
         table.add_column("Property", style="cyan", justify="right", width=15)
         table.add_column("Value")
-
         for key, value in data.items():
             table.add_row(f"[b]{key}[/b]", str(value))
 
-        self.mount(Static(Panel(table, title=f"[b]{title}[/b]", border_style="blue")))
+        self._panel.update(Panel(table, title=f"[b]{title}[/b]", border_style="blue"))
+
+        if self._env_collapsible is not None:
+            self._env_collapsible.remove()
+            self._env_collapsible = None
 
         if env_vars:
-            env_text = "\n".join(env_vars)
-            env_static = Static(env_text)
+            env_static = Static("\n".join(env_vars))
             env_static.styles.padding = (1, 2)
-
-            self.mount(
-                Collapsible(env_static, title="Environment Variables", collapsed=True)
+            self._env_collapsible = Collapsible(
+                env_static, title="Environment Variables", collapsed=True
             )
+            self.mount(self._env_collapsible)
 
     def clear_details(self) -> None:
-        for child in self.children:
-            child.remove()
-        self.mount(Static(Panel("Select an item to view details.", border_style="dim")))
+        self._panel.update(Panel("Select an item to view details.", border_style="dim"))
+        if self._env_collapsible is not None:
+            self._env_collapsible.remove()
+            self._env_collapsible = None
 
 
 class ConfirmDialog(ModalScreen):
@@ -196,7 +202,6 @@ class LogPane(Widget):
         self.stop_follow()
 
 
-# SearchBar
 class SearchBar(Input):
     """Search bar that closes itself on Escape."""
 

@@ -37,20 +37,12 @@ from docksurf_py.constants import (
 )
 from docksurf_py.docker import (
     Container,
+    DockerClient,
     DockerSnapshot,
     Image,
     Network,
     Volume,
-    fetch_logs,
-    fetch_snapshot,
     format_relative_time,
-    remove_container,
-    remove_image,
-    remove_network,
-    remove_volume,
-    restart_container,
-    start_container,
-    stop_container,
 )
 from docksurf_py.widgets import (
     ConfirmDialog,
@@ -74,73 +66,15 @@ def _status_markup(status: str) -> str:
     return markup_yellow(status)
 
 
-class DockSurfApp(App):
-    snapshot: DockerSnapshot | None = None
-    _refresh_in_progress = False
-    BINDINGS = [
-        ("?", "help", "Help"),
-        ("r", "refresh", "Refresh"),
-        ("/", "open_search", "Search"),
-        ("q", "quit", "Quit"),
-        ("s", "stop_container", "Stop"),
-        ("S", "start_container", "Start"),
-        ("x", "restart_container", "Restart"),
-        ("e", "exec_container", "Exec"),
-        ("d", "delete", "Delete"),
-        ("l", "view_logs", "Logs"),
-        ("L", "close_logs", "Close Logs"),
-        ("f", "follow_logs", "Follow"),
-        ("z", "toggle_log_expand", "Expand Logs"),
-    ]
-    CSS_PATH = "app.tcss"
+class TableRenderer:
+    """Knows how to initialise columns and populate rows for every resource table."""
+
     TABLE_COLUMNS: dict[TableID, tuple[str, ...]] = {
         TableID.CONTAINERS: ("Name", "Image", "Status"),
         TableID.IMAGES: ("Repository", "Tag", "Size"),
         TableID.VOLUMES: ("Name", "Status"),
         TableID.NETWORKS: ("Name", "Driver", "Scope"),
     }
-    _TAB_RESOURCES: dict[TabID, Callable[[DockerSnapshot], list]] = {
-        TabID.CONTAINERS: lambda s: s.containers,
-        TabID.IMAGES: lambda s: s.images,
-        TabID.VOLUMES: lambda s: s.volumes,
-        TabID.NETWORKS: lambda s: s.networks,
-    }
-    _CONTAINER_TAB_HINT = "Switch to the Containers tab and select a container"
-
-    # Lifecycle - Compose
-    def compose(self) -> ComposeResult:
-        yield Header()
-        with Horizontal(id=MAIN_CONTAINER_ID):
-            with TabbedContent():
-                with TabPane("Containers", id=TabID.CONTAINERS):
-                    yield ContainerTable(id=TableID.CONTAINERS)
-                with TabPane("Images", id=TabID.IMAGES):
-                    yield DataTable(id=TableID.IMAGES)
-                with TabPane("Volumes", id=TabID.VOLUMES):
-                    yield DataTable(id=TableID.VOLUMES)
-                with TabPane("Networks", id=TabID.NETWORKS):
-                    yield DataTable(id=TableID.NETWORKS)
-            yield DetailPane(
-                id=DETAIL_PANE_ID,
-            )
-            yield LogPane(id=LOG_PANE_ID)
-        yield LoadingIndicator(id=REFRESH_LOADING_ID)
-        yield SearchBar(placeholder="🔍 Filter...", id=SEARCH_BAR_ID)
-        yield StatusBar(id=STATUS_BAR_ID)
-        yield Footer()
-
-    # Lifecycle - Mount & Refresh
-    def on_mount(self) -> None:
-        self.setup_tables()
-        self.start_refresh()
-
-    # Refresh & table setup
-    def start_refresh(self) -> None:
-        if self._refresh_in_progress:
-            return
-        self._refresh_in_progress = True
-        self.query_one(f"#{REFRESH_LOADING_ID}", LoadingIndicator).display = True
-        self.populate_tables()
 
     def setup_tables(self) -> None:
         for table_id, columns in self.TABLE_COLUMNS.items():
@@ -148,43 +82,6 @@ class DockSurfApp(App):
             table.add_columns(*columns)
             table.cursor_type = "row"
 
-    @work(thread=True)
-    def populate_tables(self) -> None:
-        try:
-            snapshot = fetch_snapshot()
-        except Exception as exc:
-            self.call_from_thread(self._finish_refresh, None, str(exc))
-        else:
-            self.call_from_thread(self._finish_refresh, snapshot, None)
-
-    def _apply_snapshot(self, snapshot: DockerSnapshot) -> None:
-        self.snapshot = snapshot
-        for table_id in self.TABLE_COLUMNS:
-            self.query_one(f"#{table_id}", DataTable).clear(columns=False)
-
-        self._populate_container_table(
-            self.query_one(f"#{TableID.CONTAINERS}", DataTable)
-        )
-        self._populate_image_table(self.query_one(f"#{TableID.IMAGES}", DataTable))
-        self._populate_volume_table(self.query_one(f"#{TableID.VOLUMES}", DataTable))
-        self._populate_network_table(self.query_one(f"#{TableID.NETWORKS}", DataTable))
-
-        status_bar = self.query_one(f"#{STATUS_BAR_ID}", StatusBar)
-        status_bar.update_stats(snapshot.containers, snapshot.images, snapshot.volumes)
-
-    def _finish_refresh(
-        self, snapshot: DockerSnapshot | None, error: str | None
-    ) -> None:
-        try:
-            if snapshot is not None:
-                self._apply_snapshot(snapshot)
-            elif error:
-                self.notify(f"Refresh failed: {error}", severity="error")
-        finally:
-            self._refresh_in_progress = False
-            self.query_one(f"#{REFRESH_LOADING_ID}", LoadingIndicator).display = False
-
-    # populate_tables Helpers
     def _populate_container_table(
         self,
         table: DataTable,
@@ -219,7 +116,102 @@ class DockSurfApp(App):
         for n in items if items is not None else self.snapshot.networks:
             table.add_row(n.name, n.driver, n.scope)
 
-    # Detail Pane
+
+class SnapshotManager:
+    """Fetches Docker state in a background thread and commits it to the UI."""
+
+    _refresh_in_progress = False
+
+    def start_refresh(self) -> None:
+        if self._refresh_in_progress:
+            return
+        self._refresh_in_progress = True
+        self.query_one(f"#{REFRESH_LOADING_ID}", LoadingIndicator).display = True
+        self.populate_tables()
+
+    @work(thread=True)
+    def populate_tables(self) -> None:
+        try:
+            snapshot = self.docker.fetch_snapshot()
+        except Exception as exc:
+            self.call_from_thread(self._finish_refresh, None, str(exc))
+        else:
+            self.call_from_thread(self._finish_refresh, snapshot, None)
+
+    def _apply_snapshot(self, snapshot: DockerSnapshot) -> None:
+        self.snapshot = snapshot
+        for table_id in self.TABLE_COLUMNS:
+            self.query_one(f"#{table_id}", DataTable).clear(columns=False)
+
+        self._populate_container_table(
+            self.query_one(f"#{TableID.CONTAINERS}", DataTable)
+        )
+        self._populate_image_table(self.query_one(f"#{TableID.IMAGES}", DataTable))
+        self._populate_volume_table(self.query_one(f"#{TableID.VOLUMES}", DataTable))
+        self._populate_network_table(self.query_one(f"#{TableID.NETWORKS}", DataTable))
+
+        status_bar = self.query_one(f"#{STATUS_BAR_ID}", StatusBar)
+        status_bar.update_stats(snapshot.containers, snapshot.images, snapshot.volumes)
+
+    def _finish_refresh(
+        self, snapshot: DockerSnapshot | None, error: str | None
+    ) -> None:
+        try:
+            if snapshot is not None:
+                self._apply_snapshot(snapshot)
+            elif error:
+                self.notify(f"Refresh failed: {error}", severity="error")
+        finally:
+            self._refresh_in_progress = False
+            self.query_one(f"#{REFRESH_LOADING_ID}", LoadingIndicator).display = False
+
+
+class ResourceFocusResolver:
+    """Maps the active tab + cursor row to the concrete resource object."""
+
+    _TAB_RESOURCES: dict[TabID, Callable[[DockerSnapshot], list]] = {
+        TabID.CONTAINERS: lambda s: s.containers,
+        TabID.IMAGES: lambda s: s.images,
+        TabID.VOLUMES: lambda s: s.volumes,
+        TabID.NETWORKS: lambda s: s.networks,
+    }
+
+    def _get_focused_resource(self, tab_id: TabID, resources: list[T]) -> T | None:
+        if not self.snapshot:
+            return None
+        tabbed = self.query_one(TabbedContent)
+        if tabbed.active != tab_id:
+            return None
+        table_id = f"table-{tab_id.removeprefix('tab-')}"
+        table = self.query_one(f"#{table_id}", DataTable)
+        row = table.cursor_row
+        if not resources or row is None or row >= len(resources):
+            return None
+        return resources[row]
+
+    def _get_focused(self, tab_id: TabID):
+        if not self.snapshot:
+            return None
+        return self._get_focused_resource(
+            tab_id, self._TAB_RESOURCES[tab_id](self.snapshot)
+        )
+
+    def _get_focused_container(self) -> Container | None:
+        return self._get_focused(TabID.CONTAINERS)
+
+    def _get_focused_image(self) -> Image | None:
+        return self._get_focused(TabID.IMAGES)
+
+    def _get_focused_volume(self) -> Volume | None:
+        return self._get_focused(TabID.VOLUMES)
+
+    def _get_focused_network(self) -> Network | None:
+        return self._get_focused(TabID.NETWORKS)
+
+
+class DetailPaneRenderer:
+    """Formats and pushes resource details into the side pane on row highlight."""
+
     def _show_container_details(self, pane: DetailPane, row: int) -> None:
         c = self.snapshot.containers[row]
         status_color = (
@@ -239,7 +231,6 @@ class DockSurfApp(App):
 
     def _show_image_details(self, pane: DetailPane, row: int) -> None:
         image = self.snapshot.images[row]
-
         if image.used_by:
             status = markup_green("In Use")
         elif image.is_dangling:
@@ -305,40 +296,12 @@ class DockSurfApp(App):
     def clear_on_tab_switch(self) -> None:
         self.query_one(f"#{DETAIL_PANE_ID}", DetailPane).clear_details()
 
-    # Focused-resource helpers
-    def _get_focused_resource(self, tab_id: TabID, resources: list[T]) -> T | None:
-        if not self.snapshot:
-            return None
-        tabbed = self.query_one(TabbedContent)
-        if tabbed.active != tab_id:
-            return None
-        table_id = f"table-{tab_id.removeprefix('tab-')}"
-        table = self.query_one(f"#{table_id}", DataTable)
-        row = table.cursor_row
-        if not resources or row is None or row >= len(resources):
-            return None
-        return resources[row]
 
-    def _get_focused(self, tab_id: TabID):
-        if not self.snapshot:
-            return None
-        return self._get_focused_resource(
-            tab_id, self._TAB_RESOURCES[tab_id](self.snapshot)
-        )
+class ContainerActionHandler:
+    """Start, stop, restart, exec, and log actions scoped to containers."""
 
-    def _get_focused_container(self) -> Container | None:
-        return self._get_focused(TabID.CONTAINERS)
+    _CONTAINER_TAB_HINT = "Switch to the Containers tab and select a container"
 
-    def _get_focused_image(self) -> Image | None:
-        return self._get_focused(TabID.IMAGES)
-
-    def _get_focused_volume(self) -> Volume | None:
-        return self._get_focused(TabID.VOLUMES)
-
-    def _get_focused_network(self) -> Network | None:
-        return self._get_focused(TabID.NETWORKS)
-
-    # Container actions
     def _run_on_focused_container(
         self,
         command: Callable[[str], tuple[bool, str]],
@@ -361,7 +324,7 @@ class DockSurfApp(App):
 
     def action_stop_container(self) -> None:
         self._run_on_focused_container(
-            command=stop_container,
+            command=self.docker.stop_container,
             success_msg=lambda c: f"Stopped {c.name}",
             guard=lambda c: (
                 f"{c.name} is not running" if "Up" not in c.status else None
@@ -370,7 +333,7 @@ class DockSurfApp(App):
 
     def action_start_container(self) -> None:
         self._run_on_focused_container(
-            command=start_container,
+            command=self.docker.start_container,
             success_msg=lambda c: f"Started {c.name}",
             guard=lambda c: (
                 f"{c.name} is already running" if "Up" in c.status else None
@@ -379,9 +342,20 @@ class DockSurfApp(App):
 
     def action_restart_container(self) -> None:
         self._run_on_focused_container(
-            command=restart_container,
+            command=self.docker.restart_container,
             success_msg=lambda c: f"Restarted {c.name}",
         )
+
+    def action_exec_container(self) -> None:
+        c = self._get_focused_container()
+        if c is None:
+            self.notify(self._CONTAINER_TAB_HINT, severity="warning")
+            return
+        if "Up" not in c.status:
+            self.notify(f"{c.name} is not running", severity="warning")
+            return
+        with self.suspend():
+            subprocess.run(["docker", "exec", "-it", c.id, "sh"])
 
     def action_view_logs(self) -> None:
         c = self._get_focused_container()
@@ -389,7 +363,7 @@ class DockSurfApp(App):
             self.notify(self._CONTAINER_TAB_HINT, severity="warning")
             return
         log_pane = self.query_one(f"#{LOG_PANE_ID}", LogPane)
-        log_pane.load(c.id, c.name, fetch_logs(c.id))
+        log_pane.load(c.id, c.name, self.docker.fetch_logs(c.id))
         self.query_one(f"#{DETAIL_PANE_ID}", DetailPane).display = False
         log_pane.display = True
 
@@ -423,36 +397,10 @@ class DockSurfApp(App):
         self.query_one(TabbedContent).display = not expanded
         log_pane.set_expanded(expanded)
 
-    def action_exec_container(self) -> None:
-        c = self._get_focused_container()
-        if c is None:
-            self.notify(self._CONTAINER_TAB_HINT, severity="warning")
-            return
-        if "Up" not in c.status:
-            self.notify(f"{c.name} is not running", severity="warning")
-            return
-        with self.suspend():
-            subprocess.run(["docker", "exec", "-it", c.id, "sh"])
 
-    def action_help(self) -> None:
-        help_data = [
-            ("q", "quit", "Quit"),
-            ("r", "refresh", "Refresh"),
-            ("/", "open_search", "Search"),
-            ("?", "help", "Help"),
-            ("d", "delete", "Delete selected resource"),
-            ("s", "stop_container", "Stop container"),
-            ("S", "start_container", "Start container"),
-            ("x", "restart_container", "Restart container"),
-            ("e", "exec_container", "Exec shell in container"),
-            ("l", "view_logs", "Open log viewer"),
-            ("L", "close_logs", "Close log viewer"),
-            ("f", "follow_logs", "Toggle live log streaming"),
-            ("z", "toggle_log_expand", "Expand / collapse log pane"),
-        ]
-        self.push_screen(HelpScreen(help_data))
+class ResourceDeletionHandler:
+    """Confirmation dialogs and dispatched remove calls for all resource types."""
 
-    # Delete (context-sensitive)
     def _apply_if_confirmed(
         self, confirmed: bool, command_fn, success_msg: str
     ) -> None:
@@ -484,7 +432,7 @@ class DockSurfApp(App):
             confirmed = await self.push_screen_wait(ConfirmDialog(msg))
             self._apply_if_confirmed(
                 confirmed,
-                lambda: remove_container(c.id, force=is_running),
+                lambda: self.docker.remove_container(c.id, force=is_running),
                 f"Removed container: {c.name}",
             )
 
@@ -502,7 +450,7 @@ class DockSurfApp(App):
             confirmed = await self.push_screen_wait(ConfirmDialog(msg))
             self._apply_if_confirmed(
                 confirmed,
-                lambda: remove_image(img.id, force=in_use),
+                lambda: self.docker.remove_image(img.id, force=in_use),
                 f"Remove image {img.repository}:{img.tag}",
             )
 
@@ -522,7 +470,7 @@ class DockSurfApp(App):
             )
             self._apply_if_confirmed(
                 confirmed,
-                lambda: remove_volume(vol.name),
+                lambda: self.docker.remove_volume(vol.name),
                 f"Removed volume {vol.name}",
             )
 
@@ -542,11 +490,14 @@ class DockSurfApp(App):
             )
             self._apply_if_confirmed(
                 confirmed,
-                lambda: remove_network(net.name),
+                lambda: self.docker.remove_network(net.name),
                 f"Removed network {net.name}",
             )
 
-    # Search
+
+class ResourceSearchController:
+    """Opens, closes, and applies the live filter bar across all resource tabs."""
+
     def action_open_search(self) -> None:
         search_bar = self.query_one(f"#{SEARCH_BAR_ID}", Input)
         search_bar.display = True
@@ -614,6 +565,115 @@ class DockSurfApp(App):
             table = self.query_one(f"#{TableID.NETWORKS}", DataTable)
             table.clear(columns=False)
             self._populate_network_table(table, filtered)
+
+
+class DockSurfApp(
+    TableRenderer,
+    SnapshotManager,
+    ResourceFocusResolver,
+    DetailPaneRenderer,
+    ContainerActionHandler,
+    ResourceDeletionHandler,
+    ResourceSearchController,
+    App,
+):
+    snapshot: DockerSnapshot | None = None
+
+    docker: DockerClient
+
+    BINDINGS = [
+        ("?", "help", "Help"),
+        ("r", "refresh", "Refresh"),
+        ("/", "open_search", "Search"),
+        ("q", "quit", "Quit"),
+        ("s", "stop_container", "Stop"),
+        ("S", "start_container", "Start"),
+        ("x", "restart_container", "Restart"),
+        ("e", "exec_container", "Exec"),
+        ("d", "delete", "Delete"),
+        ("l", "view_logs", "Logs"),
+        ("L", "close_logs", "Close Logs"),
+        ("f", "follow_logs", "Follow"),
+        ("z", "toggle_log_expand", "Expand Logs"),
+    ]
+    CSS_PATH = "app.tcss"
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        with Horizontal(id=MAIN_CONTAINER_ID):
+            with TabbedContent():
+                with TabPane("Containers", id=TabID.CONTAINERS):
+                    yield ContainerTable(id=TableID.CONTAINERS)
+                with TabPane("Images", id=TabID.IMAGES):
+                    yield DataTable(id=TableID.IMAGES)
+                with TabPane("Volumes", id=TabID.VOLUMES):
+                    yield DataTable(id=TableID.VOLUMES)
+                with TabPane("Networks", id=TabID.NETWORKS):
+                    yield DataTable(id=TableID.NETWORKS)
+            yield DetailPane(id=DETAIL_PANE_ID)
+            yield LogPane(id=LOG_PANE_ID)
+        yield LoadingIndicator(id=REFRESH_LOADING_ID)
+        yield SearchBar(placeholder="🔍 Filter...", id=SEARCH_BAR_ID)
+        yield StatusBar(id=STATUS_BAR_ID)
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self.docker = DockerClient()
+        if not self.docker.is_connected:
+            self.notify("Could not connect to docker daemon", severity="error")
+        self.setup_tables()
+        self.start_refresh()
+
+    def action_refresh(self) -> None:
+        self.start_refresh()
+
+    @on(DataTable.RowHighlighted)
+    def update_details(self, event: DataTable.RowHighlighted) -> None:
+        if not self.snapshot:
+            return
+        pane = self.query_one(f"#{DETAIL_PANE_ID}", DetailPane)
+        table_id = event.control.id
+        try:
+            if table_id == TableID.CONTAINERS:
+                self._show_container_details(pane, event.cursor_row)
+            elif table_id == TableID.IMAGES:
+                self._show_image_details(pane, event.cursor_row)
+            elif table_id == TableID.VOLUMES:
+                self._show_volume_details(pane, event.cursor_row)
+            elif table_id == TableID.NETWORKS:
+                self._show_network_details(pane, event.cursor_row)
+        except IndexError:
+            pane.clear_details()
+
+    @on(TabbedContent.TabActivated)
+    def clear_on_tab_switch(self) -> None:
+        self.query_one(f"#{DETAIL_PANE_ID}", DetailPane).clear_details()
+
+    @on(Input.Changed, f"#{SEARCH_BAR_ID}")
+    def on_search_changed(self, event: Input.Changed) -> None:
+        self._apply_filter(event.value)
+
+    @on(Input.Submitted, f"#{SEARCH_BAR_ID}")
+    def on_search_escape(self, event: Input.Submitted) -> None:
+        self._close_search()
+
+    def action_help(self) -> None:
+        help_data = [
+            ("q", "quit", "Quit"),
+            ("r", "refresh", "Refresh"),
+            ("/", "open_search", "Search"),
+            ("?", "help", "Help"),
+            ("d", "delete", "Delete selected resource"),
+            ("s", "stop_container", "Stop container"),
+            ("S", "start_container", "Start container"),
+            ("x", "restart_container", "Restart container"),
+            ("e", "exec_container", "Exec shell in container"),
+            ("l", "view_logs", "Open log viewer"),
+            ("L", "close_logs", "Close log viewer"),
+            ("f", "follow_logs", "Toggle live log streaming"),
+            ("z", "toggle_log_expand", "Expand / collapse log pane"),
+        ]
+        self.push_screen(HelpScreen(help_data))
 
 
 def main():
