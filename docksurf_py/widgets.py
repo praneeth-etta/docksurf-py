@@ -8,6 +8,7 @@ All components here are intentionally "dumb":
 """
 
 import threading
+from typing import Callable
 
 from rich.panel import Panel
 from rich.table import Table
@@ -47,7 +48,7 @@ class ContainerTable(DataTable):
         Binding("S", "start_container", "Start"),
         Binding("x", "restart_container", "Restart"),
         Binding("e", "exec_container", "Exec"),
-        Binding("l", "view_logs", "Logs"),
+        Binding("l", "view_logs", "Logs (toggle)"),
         Binding("f", "follow_logs", "Follow"),
         Binding("z", "toggle_log_expand", "Expand Logs", show=False),
         Binding("d", "delete", "Delete"),
@@ -132,6 +133,7 @@ class LogPane(Widget):
         self._following = False
         self._log_stream: LogStream | None = None
         self._expanded = False
+        self._stream_factory: Callable[[str], LogStream] | None = None
 
     def compose(self) -> ComposeResult:
         with Horizontal(id=LOG_PANE_TOOLBAR_ID):
@@ -153,19 +155,20 @@ class LogPane(Widget):
             self.remove_class("expanded")
             btn.label = "⛶ Expand"
 
-    def load(self, container_id: str, container_name: str, logs: str) -> None:
+    def load(
+        self,
+        container_id: str,
+        container_name: str,
+        stream_factory: Callable[[str], LogStream],
+    ) -> None:
         self.stop_follow()
         self._container_id = container_id
         self._container_name = container_name
-        self._update_header()
+        self._stream_factory = stream_factory
         log_view = self.query_one(f"#{LOG_PANE_VIEW_ID}", RichLog)
         log_view.clear()
-        lines = logs.splitlines()
-        if lines:
-            for line in lines:
-                log_view.write(line)
-        else:
-            log_view.write("(no logs — press f to stream live output)")
+        self._start_follow()
+        self._update_header()
 
     def _update_header(self) -> None:
         state = " [bold green][FOLLOWING][/]" if self._following else "  |  L to close"
@@ -181,7 +184,10 @@ class LogPane(Widget):
         self._update_header()
 
     def _start_follow(self) -> None:
-        self._log_stream = LogStream(self._container_id)
+        if not self._stream_factory:
+            return
+
+        self._log_stream = self._stream_factory(self._container_id)
         self._following = True
         threading.Thread(target=self._stream_logs, daemon=True).start()
 
@@ -190,7 +196,7 @@ class LogPane(Widget):
         for line in self._log_stream:
             if not self._following:
                 break
-            self.call_from_thread(log_view.write, line)
+            self.app.call_from_thread(log_view.write, line)
 
     def stop_follow(self) -> None:
         self._following = False
