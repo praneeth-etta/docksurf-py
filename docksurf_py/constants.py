@@ -39,13 +39,21 @@ STATUS_RED = "red"
 STATUS_YELLOW = "yellow"
 
 
-def markup_green(text: str) -> str:
-    return f"[{STATUS_GREEN}]{text}[/]"
+class SafeMarkup(str):
+    """A str subclass that marks text as already-constructed Rich markup.
+
+    Render helpers (DetailPane, _safe_row) will pass SafeMarkup through
+    unchanged and escape every plain str they receive.
+    """
 
 
-def markup_red(text: str) -> str:
-    return f"[{STATUS_RED}]{text}[/]"
+def markup_green(text: str) -> SafeMarkup:
+    return SafeMarkup(f"[{STATUS_GREEN}]{text}[/]")
 
 
-def markup_yellow(text: str) -> str:
-    return f"[{STATUS_YELLOW}]{text}[/]"
+def markup_red(text: str) -> SafeMarkup:
+    return SafeMarkup(f"[{STATUS_RED}]{text}[/]")
+
+
+def markup_yellow(text: str) -> SafeMarkup:
+    return SafeMarkup(f"[{STATUS_YELLOW}]{text}[/]")

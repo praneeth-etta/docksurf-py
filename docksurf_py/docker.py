@@ -3,10 +3,12 @@ docker.py — All system-level Docker execution lives here.
 """
 
 import logging
+import os
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from enum import Enum
 from typing import Iterator, TypeAlias
 
 import docker
@@ -17,6 +19,70 @@ logger = logging.getLogger(__name__)
 CommandResult: TypeAlias = tuple[bool, str]
 
 
+class ConnectionStatus(Enum):
+    CONNECTED = "connected"
+    DAEMON_UNAVAILABLE = "daemon_unavailable"
+    PERMISSION_DENIED = "permission_denied"
+    API_ERROR = "api_error"
+    NOT_INSTALLED = "not_installed"
+
+
+@dataclass(slots=True)
+class ConnectionState:
+    status: ConnectionStatus
+    message: str
+    hint: str
+    context: str
+    host: str
+
+
+def _get_docker_context() -> str:
+    if ctx := os.environ.get("DOCKER_CONTEXT"):
+        return ctx
+    try:
+        import docker.context as ctx_mod
+
+        return ctx_mod.ContextAPI.get_current_context().name
+    except Exception:
+        return "default"
+
+
+def _get_docker_host() -> str:
+    return os.environ.get("DOCKER_HOST", "unix:///var/run/docker.sock")
+
+
+def _classify_docker_error(exc: Exception) -> ConnectionState:
+    """Map a DockerException to a structured ConnectionState."""
+    err = str(exc).lower()
+    context = _get_docker_context()
+    host = _get_docker_host()
+
+    if "permission denied" in err:
+        return ConnectionState(
+            status=ConnectionStatus.PERMISSION_DENIED,
+            message="Permission denied — cannot access Docker socket",
+            hint="Run: sudo usermod -aG docker $USER  (then log out and back in)",
+            context=context,
+            host=host,
+        )
+    unavailable_keywords = ("connection refused", "no such file", "cannot connect")
+    if any(kw in err for kw in unavailable_keywords):
+        return ConnectionState(
+            status=ConnectionStatus.DAEMON_UNAVAILABLE,
+            message="Docker daemon is not running",
+            hint="Start Docker Desktop, or run: sudo systemctl start docker",
+            context=context,
+            host=host,
+        )
+    return ConnectionState(
+        status=ConnectionStatus.API_ERROR,
+        message=f"Docker API error: {exc}",
+        hint="Check daemon logs: journalctl -u docker  or  docker info",
+        context=context,
+        host=host,
+    )
+
+
 @dataclass(slots=True)
 class Container:
     id: str
@@ -24,6 +90,10 @@ class Container:
     image_id: str
     image_name: str
     status: str
+    state: str
+    running: bool
+    exit_code: int
+    health: str
     ports: str
     mounts: list[str]
     networks: list[str]
@@ -85,6 +155,7 @@ class LogStream:
             return
 
         self._active = True
+        logger.info("Log stream started for container %s", self._container_id)
         try:
             container = self._client.containers.get(self._container_id)
             self._generator = container.logs(stream=True, follow=True, tail=500)
@@ -94,13 +165,17 @@ class LogStream:
                     break
                 yield raw_line.decode("utf-8", errors="replace").rstrip()
         except NotFound:
+            logger.warning("Log stream: container %s not found", self._container_id)
             yield f"Container {self._container_id} not found"
         except Exception as e:
+            logger.exception("Log stream error for %s: %s", self._container_id, e)
             yield f"Log stream error: {e}"
         finally:
             self.stop()
 
     def stop(self) -> None:
+        if self._active:
+            logger.info("Log stream stopped for container %s", self._container_id)
         self._active = False
         if self._generator and hasattr(self._generator, "close"):
             self._generator.close()
@@ -175,9 +250,9 @@ class DockerResourceFetcher:
                     ports_list.append(port)
 
             mounts = [
-                m.get("Name") or m.get("Source", "")
+                m["Name"]
                 for m in attrs.get("Mounts", [])
-                if m.get("Name") or m.get("Source")
+                if m.get("Type") == "volume" and m.get("Name")
             ]
 
             networks = list(attrs.get("NetworkSettings", {}).get("Networks", {}).keys())
@@ -186,6 +261,9 @@ class DockerResourceFetcher:
                 c.image.tags if c.image and c.image.tags else [attrs.get("Image", "")]
             )
 
+            sdk_state = attrs.get("State", {})
+            health_info = sdk_state.get("Health") or {}
+
             containers.append(
                 Container(
                     id=c.short_id,
@@ -193,6 +271,10 @@ class DockerResourceFetcher:
                     image_id=c.image.id if c.image else "",
                     image_name=image_tags[0],
                     status=c.status,
+                    state=sdk_state.get("Status", c.status),
+                    running=sdk_state.get("Running", False),
+                    exit_code=sdk_state.get("ExitCode", 0),
+                    health=health_info.get("Status", ""),
                     ports=", ".join(ports_list),
                     mounts=mounts,
                     networks=networks,
@@ -212,7 +294,7 @@ class DockerResourceFetcher:
                     tag = "latest"
                 images.append(
                     Image(
-                        id=i.short_id,
+                        id=i.id,  # full SHA256 — must match container.image_id format
                         repository=repo,
                         tag=tag,
                         size=format_size(i.attrs.get("Size")),
@@ -264,6 +346,7 @@ class DockerResourceFetcher:
         return networks
 
     def fetch_snapshot(self) -> DockerSnapshot:
+        logger.debug("Fetching Docker snapshot")
         with ThreadPoolExecutor(max_workers=4) as pool:
             f_containers = pool.submit(self.get_containers)
             f_images = pool.submit(self.get_images)
@@ -307,16 +390,40 @@ class DockerClient:
     def __init__(self) -> None:
         self._sdk: docker.DockerClient | None = None
         self._fetcher: DockerResourceFetcher | None = None
+        self.connection: ConnectionState = self._connect()
+
+    def _connect(self) -> ConnectionState:
+        context = _get_docker_context()
+        host = _get_docker_host()
         try:
-            self._sdk = docker.from_env()
-            self._fetcher = DockerResourceFetcher(self._sdk)
-            logger.info("Connected to Docker daemon")
+            sdk = docker.from_env()
+            sdk.ping()  # real round-trip — surfaces connection errors at init time
+            self._sdk = sdk
+            self._fetcher = DockerResourceFetcher(sdk)
+            logger.info("Connected to Docker — context=%s host=%s", context, host)
+            return ConnectionState(
+                status=ConnectionStatus.CONNECTED,
+                message="Connected",
+                hint="",
+                context=context,
+                host=host,
+            )
         except DockerException as e:
-            logger.exception("Failed to connect to Docker daemon: %s", e)
+            logger.exception("Docker connection failed: %s", e)
+            return _classify_docker_error(e)
+        except Exception as e:
+            logger.exception("Unexpected error connecting to Docker: %s", e)
+            return ConnectionState(
+                status=ConnectionStatus.NOT_INSTALLED,
+                message="Docker is not installed or not on PATH",
+                hint="Install Docker: https://docs.docker.com/get-docker/",
+                context=context,
+                host=host,
+            )
 
     @property
     def is_connected(self) -> bool:
-        return self._sdk is not None
+        return self.connection.status == ConnectionStatus.CONNECTED
 
     # --- Reads ---
 
@@ -381,11 +488,14 @@ class DockerClient:
         self, action_callable, success_msg: str
     ) -> CommandResult:
         if not self._sdk:
+            logger.error("Management command skipped — Docker client not initialized")
             return False, "Docker client not initialized"
         try:
             action_callable()
+            logger.debug("Management command succeeded")
             return True, success_msg
         except APIError as e:
+            logger.warning("Docker API error: %s", e)
             return False, str(e)
 
 

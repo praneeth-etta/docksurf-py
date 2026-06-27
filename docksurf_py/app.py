@@ -6,9 +6,11 @@ Responsibilities:
   - Push results into widgets.py (view).
 """
 
+import logging
 import subprocess
 from typing import Any, Callable, TypeVar
 
+from rich.markup import escape
 from textual import on, work
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal
@@ -29,6 +31,7 @@ from docksurf_py.constants import (
     REFRESH_LOADING_ID,
     SEARCH_BAR_ID,
     STATUS_BAR_ID,
+    SafeMarkup,
     TabID,
     TableID,
     markup_green,
@@ -54,16 +57,32 @@ from docksurf_py.widgets import (
     StatusBar,
 )
 
+logger = logging.getLogger(__name__)
+
 T = TypeVar("T")
 
 
-def _status_markup(status: str) -> str:
-    lower = status.lower()
-    if "up" in lower or "running" in lower:
-        return markup_green(status)
-    if "exited" in lower or "dead" in lower:
-        return markup_red(status)
-    return markup_yellow(status)
+def _status_markup(c: "Container") -> SafeMarkup:
+    if c.running:
+        label = escape(c.status)
+        if c.health == "healthy":
+            label += " ✓"
+        elif c.health == "unhealthy":
+            label += " ✗"
+        elif c.health == "starting":
+            label += " …"
+        return markup_green(label)
+    if c.state in ("exited", "dead"):
+        suffix = f" ({c.exit_code})" if c.exit_code != 0 else ""
+        return markup_red(escape(c.status) + suffix)
+    return markup_yellow(escape(c.status))  # paused, restarting, created
+
+
+def _safe_row(table: DataTable, *values) -> None:
+    """Add a row, escaping plain strings and passing SafeMarkup through unchanged."""
+    table.add_row(*(
+        v if isinstance(v, SafeMarkup) else escape(str(v)) for v in values
+    ))
 
 
 class TableRenderer:
@@ -94,14 +113,14 @@ class TableRenderer:
             items if items is not None else self.snapshot.containers
         )
         for c in self._current_containers:
-            table.add_row(c.name, c.image_name, _status_markup(c.status))
+            _safe_row(table, c.name, c.image_name, _status_markup(c))
 
     def _populate_image_table(
         self, table: DataTable, items: list[Image] | None = None
     ) -> None:
         self._current_images = items if items is not None else self.snapshot.images
         for i in self._current_images:
-            table.add_row(i.repository, i.tag, i.size)
+            _safe_row(table, i.repository, i.tag, i.size)
 
     def _populate_volume_table(
         self, table: DataTable, items: list[Volume] | None = None
@@ -109,15 +128,15 @@ class TableRenderer:
         self._current_volumes = items if items is not None else self.snapshot.volumes
         for v in self._current_volumes:
             status = markup_green("In Use") if v.used_by else markup_yellow("Orphaned")
-            name = v.name[:50] + "..." if len(v.name) > 50 else v.name
-            table.add_row(name, status)
+            raw = v.name[:50] + "..." if len(v.name) > 50 else v.name
+            _safe_row(table, raw, status)
 
     def _populate_network_table(
         self, table: DataTable, items: list[Network] | None = None
     ) -> None:
         self._current_networks = items if items is not None else self.snapshot.networks
         for n in self._current_networks:
-            table.add_row(n.name, n.driver, n.scope)
+            _safe_row(table, n.name, n.driver, n.scope)
 
 
 class SnapshotManager:
@@ -127,8 +146,10 @@ class SnapshotManager:
 
     def start_refresh(self) -> None:
         if self._refresh_in_progress:
+            logger.debug("Refresh skipped — already in progress")
             return
         self._refresh_in_progress = True
+        logger.info("Refresh started")
         self.query_one(f"#{REFRESH_LOADING_ID}", LoadingIndicator).display = True
         self.populate_tables()
 
@@ -137,8 +158,16 @@ class SnapshotManager:
         try:
             snapshot = self.docker.fetch_snapshot()
         except Exception as exc:
+            logger.exception("Snapshot fetch failed")
             self.call_from_thread(self._finish_refresh, None, str(exc))
         else:
+            logger.info(
+                "Snapshot fetched — containers=%d images=%d volumes=%d networks=%d",
+                len(snapshot.containers),
+                len(snapshot.images),
+                len(snapshot.volumes),
+                len(snapshot.networks),
+            )
             self.call_from_thread(self._finish_refresh, snapshot, None)
 
     def _apply_snapshot(self, snapshot: DockerSnapshot) -> None:
@@ -154,7 +183,12 @@ class SnapshotManager:
         self._populate_network_table(self.query_one(f"#{TableID.NETWORKS}", DataTable))
 
         status_bar = self.query_one(f"#{STATUS_BAR_ID}", StatusBar)
-        status_bar.update_stats(snapshot.containers, snapshot.images, snapshot.volumes)
+        status_bar.update_stats(
+            snapshot.containers,
+            snapshot.images,
+            snapshot.volumes,
+            context=self.docker.connection.context,
+        )
         self._auto_select_first()
 
     def _finish_refresh(
@@ -163,7 +197,9 @@ class SnapshotManager:
         try:
             if snapshot is not None:
                 self._apply_snapshot(snapshot)
+                logger.info("Refresh complete")
             elif error:
+                logger.warning("Refresh failed: %s", error)
                 self.notify(f"Refresh failed: {error}", severity="error")
         finally:
             self._refresh_in_progress = False
@@ -216,18 +252,16 @@ class DetailPaneRenderer:
             return
         c = containers[row]
 
-        status_color = (
-            markup_green if ("Up" in c.status or "running" in c.status) else markup_red
-        )
         details = {
             "ID": c.id,
             "Image": c.image_name,
             "Image SHA": c.image_id,
-            "Status": status_color(c.status),
+            "Status": _status_markup(c),
+            "Exit Code": "—" if c.running else str(c.exit_code),
+            "Health": c.health if c.health else "—",
             "Created": format_relative_time(c.created),
             "Ports": c.ports if c.ports else "None",
             "Networks": "\n".join(c.networks) if c.networks else "None",
-            "Mounts": "\n".join(c.mounts) if c.mounts else "None",
         }
         pane.update_details(f"Container: {c.name}", details, env_vars=c.env)
 
@@ -245,9 +279,7 @@ class DetailPaneRenderer:
             status = markup_yellow("Unused (not referenced by any container)")
 
         details = {
-            "ID": (image.id[:24] + "...")
-            if image.id and len(image.id) > 24
-            else (image.id or "N/A"),
+            "ID": image.id.removeprefix("sha256:")[:12] if image.id else "N/A",
             "Size": image.size or "N/A",
             "Created": format_relative_time(image.created),
             "Architecture": image.architecture or "N/A",
@@ -331,33 +363,36 @@ class ContainerActionHandler:
             return
         ok, err = command(c.id)
         if ok:
-            self.notify(success_msg(c))
+            msg = success_msg(c)
+            logger.info("%s", msg)
+            self.notify(msg)
             self.populate_tables()
         else:
+            logger.warning("Container action failed on %s: %s", c.name, err)
             self.notify(f"Error: {err}", severity="error")
 
     def action_stop_container(self) -> None:
         self._run_on_focused_container(
             command=self.docker.stop_container,
-            success_msg=lambda c: f"Stopped {c.name}",
+            success_msg=lambda c: f"Stopped {escape(c.name)}",
             guard=lambda c: (
-                f"{c.name} is not running" if "Up" not in c.status else None
+                f"{escape(c.name)} is not running" if not c.running else None
             ),
         )
 
     def action_start_container(self) -> None:
         self._run_on_focused_container(
             command=self.docker.start_container,
-            success_msg=lambda c: f"Started {c.name}",
+            success_msg=lambda c: f"Started {escape(c.name)}",
             guard=lambda c: (
-                f"{c.name} is already running" if "Up" in c.status else None
+                f"{escape(c.name)} is already running" if c.running else None
             ),
         )
 
     def action_restart_container(self) -> None:
         self._run_on_focused_container(
             command=self.docker.restart_container,
-            success_msg=lambda c: f"Restarted {c.name}",
+            success_msg=lambda c: f"Restarted {escape(c.name)}",
         )
 
     def action_exec_container(self) -> None:
@@ -365,9 +400,10 @@ class ContainerActionHandler:
         if c is None:
             self.notify(self._CONTAINER_TAB_HINT, severity="warning")
             return
-        if "Up" not in c.status:
-            self.notify(f"{c.name} is not running", severity="warning")
+        if not c.running:
+            self.notify(f"{escape(c.name)} is not running", severity="warning")
             return
+        logger.info("Exec shell in container %s (%s)", c.name, c.id)
         with self.suspend():
             subprocess.run(["docker", "exec", "-it", c.id, "sh"])
 
@@ -380,6 +416,7 @@ class ContainerActionHandler:
         if c is None:
             self.notify(self._CONTAINER_TAB_HINT, severity="warning")
             return
+        logger.info("Opening log pane for container %s (%s)", c.name, c.id)
         log_pane.load(c.id, c.name, self.docker.stream_logs)
         self.query_one(f"#{DETAIL_PANE_ID}", DetailPane).display = False
         log_pane.display = True
@@ -422,14 +459,18 @@ class ResourceDeletionHandler:
         self, confirmed: bool, command_fn, success_msg: str
     ) -> None:
         if not confirmed:
+            logger.debug("Deletion cancelled by user")
             return
         ok, err = command_fn()
         if ok:
+            logger.info("%s", success_msg)
             self.notify(success_msg)
             self.populate_tables()
         else:
+            logger.warning("Delete failed: %s", err)
             self.notify(f"Error: {err}", severity="error")
 
+    @work
     async def action_delete(self) -> None:
         if not self.snapshot:
             return
@@ -440,17 +481,17 @@ class ResourceDeletionHandler:
             if c is None:
                 self.notify("No container selected", severity="warning")
                 return
-            is_running = "Up" in c.status
+            is_running = c.running
             msg = (
-                f"Force-remove RUNNING container '{c.name}'?"
+                f"Force-remove RUNNING container '{escape(c.name)}'?"
                 if is_running
-                else f"Remove container '{c.name}'?"
+                else f"Remove container '{escape(c.name)}'?"
             )
             confirmed = await self.push_screen_wait(ConfirmDialog(msg))
             self._apply_if_confirmed(
                 confirmed,
                 lambda: self.docker.remove_container(c.id, force=is_running),
-                f"Removed container: {c.name}",
+                f"Removed container: {escape(c.name)}",
             )
 
         elif active == TabID.IMAGES:
@@ -459,16 +500,17 @@ class ResourceDeletionHandler:
                 self.notify("No image selected", severity="warning")
                 return
             in_use = bool(img.used_by)
+            img_label = f"{escape(img.repository)}:{escape(img.tag)}"
             msg = (
-                f"Force-remove IN-USE image '{img.repository}:{img.tag}'?"
+                f"Force-remove IN-USE image '{img_label}'?"
                 if in_use
-                else f"Remove image '{img.repository}:{img.tag}'?"
+                else f"Remove image '{img_label}'?"
             )
             confirmed = await self.push_screen_wait(ConfirmDialog(msg))
             self._apply_if_confirmed(
                 confirmed,
                 lambda: self.docker.remove_image(img.id, force=in_use),
-                f"Remove image {img.repository}:{img.tag}",
+                f"Removed image {img_label}",
             )
 
         elif active == TabID.VOLUMES:
@@ -478,17 +520,17 @@ class ResourceDeletionHandler:
                 return
             if vol.used_by:
                 self.notify(
-                    f"Volume '{vol.name}' is in use — stop containers first",
+                    f"Volume '{escape(vol.name)}' is in use — stop containers first",
                     severity="warning",
                 )
                 return
             confirmed = await self.push_screen_wait(
-                ConfirmDialog(f"Remove volume '{vol.name}'?")
+                ConfirmDialog(f"Remove volume '{escape(vol.name)}'?")
             )
             self._apply_if_confirmed(
                 confirmed,
                 lambda: self.docker.remove_volume(vol.name),
-                f"Removed volume {vol.name}",
+                f"Removed volume {escape(vol.name)}",
             )
 
         elif active == TabID.NETWORKS:
@@ -498,17 +540,17 @@ class ResourceDeletionHandler:
                 return
             if net.name in ("bridge", "host", "none"):
                 self.notify(
-                    f"Cannot remove built-in network '{net.name}'",
+                    f"Cannot remove built-in network '{escape(net.name)}'",
                     severity="warning",
                 )
                 return
             confirmed = await self.push_screen_wait(
-                ConfirmDialog(f"Remove network '{net.name}'?")
+                ConfirmDialog(f"Remove network '{escape(net.name)}'?")
             )
             self._apply_if_confirmed(
                 confirmed,
                 lambda: self.docker.remove_network(net.name),
-                f"Removed network {net.name}",
+                f"Removed network {escape(net.name)}",
             )
 
 
@@ -635,8 +677,19 @@ class DockSurfApp(
 
     def on_mount(self) -> None:
         self.docker = DockerClient()
+        state = self.docker.connection
         if not self.docker.is_connected:
-            self.notify("Could not connect to docker daemon", severity="error")
+            logger.error(
+                "Docker unavailable — status=%s context=%s host=%s",
+                state.status.value,
+                state.context,
+                state.host,
+            )
+            self.notify(
+                f"{state.message}\n{state.hint}",
+                severity="error",
+                timeout=12,
+            )
         self.setup_tables()
         self.start_refresh()
 
@@ -649,10 +702,22 @@ class DockSurfApp(
         pane = self.query_one(f"#{DETAIL_PANE_ID}", DetailPane)
         active = self.query_one(TabbedContent).active
         dispatch = {
-            TabID.CONTAINERS: (TableID.CONTAINERS, self._show_container_details, "_current_containers"),
+            TabID.CONTAINERS: (
+                TableID.CONTAINERS,
+                self._show_container_details,
+                "_current_containers",
+            ),
             TabID.IMAGES: (TableID.IMAGES, self._show_image_details, "_current_images"),
-            TabID.VOLUMES: (TableID.VOLUMES, self._show_volume_details, "_current_volumes"),
-            TabID.NETWORKS: (TableID.NETWORKS, self._show_network_details, "_current_networks"),
+            TabID.VOLUMES: (
+                TableID.VOLUMES,
+                self._show_volume_details,
+                "_current_volumes",
+            ),
+            TabID.NETWORKS: (
+                TableID.NETWORKS,
+                self._show_network_details,
+                "_current_networks",
+            ),
         }
         if active not in dispatch:
             pane.clear_details()
@@ -720,10 +785,20 @@ class DockSurfApp(
 
 
 def main():
-    import logging
+    import os
 
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+    log_dir = os.path.expanduser("~/.local/share/docksurf-py")
+    os.makedirs(log_dir, exist_ok=True)
+    log_file = os.path.join(log_dir, "docksurf.log")
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s  %(name)-30s  %(levelname)-8s  %(message)s",
+        handlers=[logging.FileHandler(log_file)],
+    )
+    logger.info("DockSurf starting — log file: %s", log_file)
     DockSurfApp().run()
+    logger.info("DockSurf exiting")
 
 
 if __name__ == "__main__":

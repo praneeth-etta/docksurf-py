@@ -10,6 +10,7 @@ All components here are intentionally "dumb":
 import threading
 from typing import Callable
 
+from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 from textual import on
@@ -36,6 +37,7 @@ from docksurf_py.constants import (
     LOG_PANE_HEADER_ID,
     LOG_PANE_TOOLBAR_ID,
     LOG_PANE_VIEW_ID,
+    SafeMarkup,
 )
 from docksurf_py.docker import LogStream
 
@@ -70,20 +72,27 @@ class DetailPane(VerticalScroll):
     def update_details(
         self, title: str, data: dict, env_vars: list[str] | None = None
     ) -> None:
+        safe_title = title if isinstance(title, SafeMarkup) else escape(title)
+
         table = Table(show_header=False, expand=True, box=None)
         table.add_column("Property", style="cyan", justify="right", width=15)
         table.add_column("Value")
         for key, value in data.items():
-            table.add_row(f"[b]{key}[/b]", str(value))
+            safe_value = (
+                str(value) if isinstance(value, SafeMarkup) else escape(str(value))
+            )
+            table.add_row(f"[b]{key}[/b]", safe_value)
 
-        self._panel.update(Panel(table, title=f"[b]{title}[/b]", border_style="blue"))
+        self._panel.update(
+            Panel(table, title=f"[b]{safe_title}[/b]", border_style="blue")
+        )
 
         if self._env_collapsible is not None:
             self._env_collapsible.remove()
             self._env_collapsible = None
 
         if env_vars:
-            env_static = Static("\n".join(env_vars))
+            env_static = Static(escape("\n".join(env_vars)))
             env_static.styles.padding = (1, 2)
             self._env_collapsible = Collapsible(
                 env_static, title="Environment Variables", collapsed=True
@@ -173,7 +182,7 @@ class LogPane(Widget):
     def _update_header(self) -> None:
         state = " [bold green][FOLLOWING][/]" if self._following else "  |  L to close"
         self.query_one(f"#{LOG_PANE_HEADER_ID}", Label).update(
-            f"Logs: {self._container_name}{state}"
+            f"Logs: {escape(self._container_name)}{state}"
         )
 
     def toggle_follow(self) -> None:
@@ -282,19 +291,25 @@ class StatusBar(Static):
     def on_mount(self) -> None:
         self.update_stats([], [], [])
 
-    def update_stats(self, containers: list, images: list, volumes: list) -> None:
-        running = sum(
-            1
-            for c in containers
-            if "up" in c.status.lower() or "running" in c.status.lower()
-        )
+    def update_stats(
+        self,
+        containers: list,
+        images: list,
+        volumes: list,
+        context: str = "",
+    ) -> None:
+        running = sum(1 for c in containers if c.running)
         stopped = len(containers) - running
-
         orphaned_volumes = sum(1 for v in volumes if not v.used_by)
 
+        context_part = (
+            f"  |  [bold cyan]Context:[/bold cyan] {context}" if context else ""
+        )
         text = (
-            f"[bold cyan]Containers:[/bold cyan] {running} running / {stopped} stopped  |  "
+            f"[bold cyan]Containers:[/bold cyan]"
+            f" {running} running / {stopped} stopped  |  "
             f"[bold cyan]Images:[/bold cyan] {len(images)} total  |  "
             f"[bold cyan]Volumes:[/bold cyan] {orphaned_volumes} orphaned"
+            f"{context_part}"
         )
         self.update(text)
