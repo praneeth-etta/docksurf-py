@@ -3,142 +3,31 @@ docker.py — All system-level Docker execution lives here.
 """
 
 import logging
-import os
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
 from datetime import datetime, timezone
-from enum import Enum
-from typing import Iterator, TypeAlias
+from typing import Iterator
 
 import docker
 from docker.errors import APIError, DockerException, NotFound
 
+from docksurf_py.connection import (
+    ConnectionState,
+    ConnectionStatus,
+    _classify_docker_error,
+    _get_docker_context,
+    _get_docker_host,
+)
+from docksurf_py.models import (
+    CommandResult,
+    Container,
+    DockerSnapshot,
+    Image,
+    Network,
+    Volume,
+)
+
 logger = logging.getLogger(__name__)
-
-CommandResult: TypeAlias = tuple[bool, str]
-
-
-class ConnectionStatus(Enum):
-    CONNECTED = "connected"
-    DAEMON_UNAVAILABLE = "daemon_unavailable"
-    PERMISSION_DENIED = "permission_denied"
-    API_ERROR = "api_error"
-    NOT_INSTALLED = "not_installed"
-
-
-@dataclass(slots=True)
-class ConnectionState:
-    status: ConnectionStatus
-    message: str
-    hint: str
-    context: str
-    host: str
-
-
-def _get_docker_context() -> str:
-    if ctx := os.environ.get("DOCKER_CONTEXT"):
-        return ctx
-    try:
-        import docker.context as ctx_mod
-
-        return ctx_mod.ContextAPI.get_current_context().name
-    except Exception:
-        return "default"
-
-
-def _get_docker_host() -> str:
-    return os.environ.get("DOCKER_HOST", "unix:///var/run/docker.sock")
-
-
-def _classify_docker_error(exc: Exception) -> ConnectionState:
-    """Map a DockerException to a structured ConnectionState."""
-    err = str(exc).lower()
-    context = _get_docker_context()
-    host = _get_docker_host()
-
-    if "permission denied" in err:
-        return ConnectionState(
-            status=ConnectionStatus.PERMISSION_DENIED,
-            message="Permission denied — cannot access Docker socket",
-            hint="Run: sudo usermod -aG docker $USER  (then log out and back in)",
-            context=context,
-            host=host,
-        )
-    unavailable_keywords = ("connection refused", "no such file", "cannot connect")
-    if any(kw in err for kw in unavailable_keywords):
-        return ConnectionState(
-            status=ConnectionStatus.DAEMON_UNAVAILABLE,
-            message="Docker daemon is not running",
-            hint="Start Docker Desktop, or run: sudo systemctl start docker",
-            context=context,
-            host=host,
-        )
-    return ConnectionState(
-        status=ConnectionStatus.API_ERROR,
-        message=f"Docker API error: {exc}",
-        hint="Check daemon logs: journalctl -u docker  or  docker info",
-        context=context,
-        host=host,
-    )
-
-
-@dataclass(slots=True)
-class Container:
-    id: str
-    name: str
-    image_id: str
-    image_name: str
-    status: str
-    state: str
-    running: bool
-    exit_code: int
-    health: str
-    ports: str
-    mounts: list[str]
-    networks: list[str]
-    created: str
-    env: list[str]
-
-
-@dataclass(slots=True)
-class Image:
-    id: str
-    repository: str
-    tag: str
-    size: str
-    is_dangling: bool
-    used_by: list[str]
-    created: str
-    architecture: str
-
-
-@dataclass(slots=True)
-class Volume:
-    name: str
-    driver: str
-    mountpoint: str
-    used_by: list[str]
-    labels: str
-
-
-@dataclass(slots=True)
-class Network:
-    id: str
-    name: str
-    driver: str
-    subnet: str
-    gateway: str
-    scope: str
-    used_by: list[str]
-
-
-@dataclass(slots=True)
-class DockerSnapshot:
-    containers: list[Container]
-    images: list[Image]
-    volumes: list[Volume]
-    networks: list[Network]
 
 
 class LogStream:
