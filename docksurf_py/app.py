@@ -31,7 +31,6 @@ from docksurf_py.constants import (
     TabID,
     TableID,
 )
-from docksurf_py.docker import DockerClient
 from docksurf_py.models import DockerSnapshot
 from docksurf_py.renderer import (
     DetailPaneRenderer,
@@ -40,6 +39,7 @@ from docksurf_py.renderer import (
     TableRenderer,
 )
 from docksurf_py.search import ResourceSearchController
+from docksurf_py.service import DockerService
 from docksurf_py.widgets import (
     ContainerTable,
     DetailPane,
@@ -64,7 +64,7 @@ class DockSurfApp(
 ):
     snapshot: DockerSnapshot | None = None
 
-    docker: DockerClient
+    docker: DockerService
 
     BINDINGS = [
         ("?", "help", "Help"),
@@ -81,6 +81,10 @@ class DockSurfApp(
         ("z", "toggle_log_expand", "Expand Logs"),
     ]
     CSS_PATH = "app.tcss"
+
+    def __init__(self, docker: DockerService, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._injected_docker = docker
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -102,7 +106,7 @@ class DockSurfApp(
         yield Footer()
 
     def on_mount(self) -> None:
-        self.docker = DockerClient()
+        self.docker = self._injected_docker
         state = self.docker.connection
         if not self.docker.is_connected:
             logger.error(
@@ -203,6 +207,8 @@ class DockSurfApp(
 
 
 def main():
+    from docksurf_py.docker import DockerClient
+
     log_dir = os.path.expanduser("~/.local/share/docksurf-py")
     os.makedirs(log_dir, exist_ok=True)
     log_file = os.path.join(log_dir, "docksurf.log")
@@ -213,7 +219,7 @@ def main():
         handlers=[logging.FileHandler(log_file)],
     )
     logger.info("DockSurf starting — log file: %s", log_file)
-    DockSurfApp().run()
+    DockSurfApp(docker=DockerClient()).run()
     logger.info("DockSurf exiting")
 
 

@@ -10,6 +10,7 @@ dependencies = [
 ]
 
 [project.scripts]
+docksurf = "docksurf_py.app:main"
 docksurf-py = "docksurf_py.app:main"
 
 [dependency-groups]
