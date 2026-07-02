@@ -35,15 +35,42 @@ class ContainerActionHandler:
         if c is None:
             self.notify(self._CONTAINER_TAB_HINT, severity="warning")
             return
+
         if reason := guard(c):
             self.notify(reason, severity="information")
             return
+
+        self._execute_container_action(c, command, success_msg)
+
+    @work(thread=True)
+    def _execute_container_action(
+        self,
+        c: Container,
+        command: Callable[[str], tuple[bool, str]],
+        success_msg: Callable[[Container], str],
+    ) -> None:
         ok, err = command(c.id)
+
+        self.call_from_thread(
+            self._handle_container_action_result,
+            c,
+            ok,
+            err,
+            success_msg,
+        )
+
+    def _handle_container_action_result(
+        self,
+        c: Container,
+        ok: bool,
+        err: str,
+        success_msg: Callable[[Container], str],
+    ) -> None:
         if ok:
             msg = success_msg(c)
             logger.info("%s", msg)
             self.notify(msg)
-            self.populate_tables()
+            self.start_refresh()
         else:
             logger.warning("Container action failed on %s: %s", c.name, err)
             self.notify(f"Error: {err}", severity="error")
@@ -154,7 +181,7 @@ class ResourceDeletionHandler:
         if ok:
             logger.info("%s", success_msg)
             self.notify(success_msg)
-            self.populate_tables()
+            self.start_refresh()
         else:
             logger.warning("Delete failed: %s", err)
             self.notify(f"Error: {err}", severity="error")

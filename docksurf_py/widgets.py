@@ -221,7 +221,10 @@ class LogPane(Widget):
 
     def toggle_follow(self) -> None:
         if self._following:
+            was_paused = self._paused
             self._paused = not self._paused
+            if was_paused and not self._paused:
+                self._render_to_view()
         else:
             self._start_follow()
         self._update_header()
@@ -275,8 +278,10 @@ class LogPane(Widget):
                 log_view.write(_highlight_match(line, term))
         self._update_header()
 
-    def _append_line(self, line: str) -> None:
-        self._line_buffer.append(line)
+    def _store_line(self, line: str) -> None:
+        return self._line_buffer.append(line)
+
+    def _render_line(self, line: str) -> None:
         if not self._filter or self._filter.lower() in line.lower():
             log_view = self.query_one(f"#{LOG_PANE_VIEW_ID}", RichLog)
             log_view.write(_highlight_match(line, self._filter))
@@ -297,10 +302,11 @@ class LogPane(Widget):
         for line in self._log_stream:
             if not self._following or self._generation != generation:
                 break
-            if self._paused:
-                continue
+
             try:
-                self.app.call_from_thread(self._append_line, line)
+                self.app.call_from_thread(self._store_line, line)
+                if not self._paused:
+                    self.app.call_from_thread(self._render_line, line)
             except Exception:
                 break
         if self._generation == generation:
@@ -329,7 +335,6 @@ class SearchBar(Input):
     def action_close(self) -> None:
         self.display = False
         self.value = ""
-        self.app.query_one(type(self)).post_message(Input.Changed(self, ""))
 
 
 class HelpScreen(ModalScreen):

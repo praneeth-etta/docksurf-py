@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from typing import Iterator
 
 import docker
+import requests.exceptions
 from docker.errors import APIError, DockerException, NotFound
 
 from docksurf_py.connection import (
@@ -71,13 +72,42 @@ class LogStream:
             self._generator.close()
 
 
+_AGE_UNITS = (
+    (60, 1, "s"),
+    (3600, 60, "m"),
+    (86400, 3600, "h"),
+    (86400 * 30, 86400, "d"),
+    (86400 * 365, 86400 * 30, "mo"),
+)
+
+
+def _format_age(diff: int) -> str:
+    """Format a second delta as a short relative-age string."""
+    if diff < 0:
+        return "just now"
+    for threshold, unit, suffix in _AGE_UNITS:
+        if diff < threshold:
+            return f"{diff // unit}{suffix} ago"
+    return f"{diff // (86400 * 365)}y ago"
+
+
 def format_relative_time(ts: str) -> str:
     """Convert a Docker timestamp string to a human-readable relative age."""
     if not ts:
         return "Unknown"
 
-    ts_clean = ts.split(".")[0] if "." in ts else ts
-    ts_clean = ts_clean.replace("Z", "")
+    ts_clean = ts
+    dot = ts_clean.find(".")
+    if dot != -1:
+        end = dot + 1
+        while end < len(ts_clean) and ts_clean[end].isdigit():
+            end += 1
+        fraction = ts_clean[dot + 1 : end]
+        if len(fraction) > 6:
+            ts_clean = ts_clean[: dot + 1] + fraction[:6] + ts_clean[end:]
+
+    if ts_clean.endswith("Z"):
+        ts_clean = ts_clean[:-1] + "+00:00"
 
     try:
         dt = datetime.fromisoformat(ts_clean)
@@ -88,19 +118,7 @@ def format_relative_time(ts: str) -> str:
         dt = dt.replace(tzinfo=timezone.utc)
 
     diff = int((datetime.now(timezone.utc) - dt).total_seconds())
-    if diff < 0:
-        return "just now"
-    if diff < 60:
-        return f"{diff}s ago"
-    if diff < 3600:
-        return f"{diff // 60}m ago"
-    if diff < 86400:
-        return f"{diff // 3600}h ago"
-    if diff < 86400 * 30:
-        return f"{diff // 86400}d ago"
-    if diff < 86400 * 365:
-        return f"{diff // (86400 * 30)}mo ago"
-    return f"{diff // (86400 * 365)}y ago"
+    return _format_age(diff)
 
 
 def format_size(size_in_bytes: int | None) -> str:
@@ -301,11 +319,20 @@ class DockerClient:
         except DockerException as e:
             logger.exception("Docker connection failed: %s", e)
             return _classify_docker_error(e)
+        except FileNotFoundError as e:
+            logger.exception("Docker executable not found: %s", e)
+            return ConnectionState(
+                status=ConnectionStatus.NOT_INSTALLED,
+                message="Docker is not installed on PATH",
+                hint="Install docker: https://docs.docker.com/get-docker/",
+                context=context,
+                host=host,
+            )
         except Exception as e:
             logger.exception("Unexpected error connecting to Docker: %s", e)
             return ConnectionState(
-                status=ConnectionStatus.NOT_INSTALLED,
-                message="Docker is not installed or not on PATH",
+                status=ConnectionStatus.API_ERROR,
+                message="Unexpected error connecting to Docker",
                 hint="Install Docker: https://docs.docker.com/get-docker/",
                 context=context,
                 host=host,
@@ -386,6 +413,9 @@ class DockerClient:
             return True, success_msg
         except APIError as e:
             logger.warning("Docker API error: %s", e)
+            return False, str(e)
+        except (DockerException, requests.exceptions.RequestException) as e:
+            logger.warning("Docker daemon unreachable: %s", e)
             return False, str(e)
 
 

@@ -9,12 +9,12 @@ import logging
 from typing import Any
 
 from rich.markup import escape
-from textual import on, work
-from textual.widgets import DataTable, LoadingIndicator, TabbedContent
+from textual import work
+from textual.widgets import DataTable, Input, LoadingIndicator, TabbedContent
 
 from docksurf_py.constants import (
-    DETAIL_PANE_ID,
     REFRESH_LOADING_ID,
+    SEARCH_BAR_ID,
     STATUS_BAR_ID,
     SafeMarkup,
     TabID,
@@ -157,6 +157,10 @@ class SnapshotManager:
         )
         self._auto_select_first()
 
+        search_bar = self.query_one(f"#{SEARCH_BAR_ID}", Input)
+        if search_bar.display and search_bar.value:
+            self._apply_filter(search_bar.value)
+
     def _finish_refresh(
         self, snapshot: DockerSnapshot | None, error: str | None
     ) -> None:
@@ -285,25 +289,3 @@ class DetailPaneRenderer:
             "Used By": "\n".join(network.used_by) if network.used_by else "None",
         }
         pane.update_details(f"Network: {network.name}", details)
-
-    @on(DataTable.RowHighlighted)
-    def update_details(self, event: DataTable.RowHighlighted) -> None:
-        if not self.snapshot:
-            return
-        pane = self.query_one(f"#{DETAIL_PANE_ID}", DetailPane)
-        table_id = event.control.id
-        try:
-            if table_id == TableID.CONTAINERS:
-                self._show_container_details(pane, event.cursor_row)
-            elif table_id == TableID.IMAGES:
-                self._show_image_details(pane, event.cursor_row)
-            elif table_id == TableID.VOLUMES:
-                self._show_volume_details(pane, event.cursor_row)
-            elif table_id == TableID.NETWORKS:
-                self._show_network_details(pane, event.cursor_row)
-        except IndexError:
-            pane.clear_details()
-
-    @on(TabbedContent.TabActivated)
-    def clear_on_tab_switch(self) -> None:
-        self.query_one(f"#{DETAIL_PANE_ID}", DetailPane).clear_details()
