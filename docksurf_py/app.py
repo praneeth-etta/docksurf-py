@@ -77,7 +77,8 @@ class DockSurfApp(
         ("e", "exec_container", "Exec"),
         ("d", "delete", "Delete"),
         ("l", "view_logs", "Logs"),
-        ("f", "follow_logs", "Follow"),
+        ("f", "follow_logs", "Pause/Resume"),
+        ("c", "clear_logs", "Clear"),
         ("z", "toggle_log_expand", "Expand Logs"),
     ]
     CSS_PATH = "app.tcss"
@@ -200,7 +201,9 @@ class DockSurfApp(
             ("x", "restart_container", "Restart container"),
             ("e", "exec_container", "Exec shell in container"),
             ("l", "view_logs", "Toggle log viewer"),
-            ("f", "follow_logs", "Toggle live log streaming"),
+            ("f", "follow_logs", "Pause / resume log stream"),
+            ("c", "clear_logs", "Clear log output"),
+            ("/", "open_search (log pane: filter logs)", "Search / filter"),
             ("z", "toggle_log_expand", "Expand / collapse log pane"),
         ]
         self.push_screen(HelpScreen(help_data))

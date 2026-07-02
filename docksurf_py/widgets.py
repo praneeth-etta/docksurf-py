@@ -7,6 +7,7 @@ All components here are intentionally "dumb":
   - All string IDs come from constants.py.
 """
 
+import re
 import threading
 from typing import Callable
 
@@ -35,6 +36,7 @@ from docksurf_py.constants import (
     BTN_CONFIRM_ID,
     BTN_EXPAND_ID,
     LOG_PANE_HEADER_ID,
+    LOG_PANE_SEARCH_ID,
     LOG_PANE_TOOLBAR_ID,
     LOG_PANE_VIEW_ID,
     SafeMarkup,
@@ -129,6 +131,17 @@ class ConfirmDialog(ModalScreen):
         self.dismiss(False)
 
 
+def _highlight_match(line: str, term: str) -> str:
+    """Return a Rich markup string with every occurrence of term highlighted."""
+    if not term:
+        return escape(line)
+    parts = re.split(f"({re.escape(term)})", line, flags=re.IGNORECASE)
+    return "".join(
+        f"[bold yellow]{escape(p)}[/]" if p.lower() == term.lower() else escape(p)
+        for p in parts
+    )
+
+
 class LogPane(Widget):
     """Inline log viewer that lives in the right panel, expandable to full width."""
 
@@ -140,15 +153,24 @@ class LogPane(Widget):
         self._container_id: str = ""
         self._container_name: str = ""
         self._following = False
+        self._paused = False
+        self._generation: int = 0
         self._log_stream: LogStream | None = None
         self._expanded = False
         self._stream_factory: Callable[[str], LogStream] | None = None
+        self._line_buffer: list[str] = []
+        self._filter: str = ""
+        self._filter_timer = None
 
     def compose(self) -> ComposeResult:
         with Horizontal(id=LOG_PANE_TOOLBAR_ID):
             yield Label("", id=LOG_PANE_HEADER_ID)
             yield Button("⛶ Expand", id=BTN_EXPAND_ID)
-        yield RichLog(id=LOG_PANE_VIEW_ID, markup=False, highlight=False)
+        yield Input(placeholder="Filter logs... (Esc to clear)", id=LOG_PANE_SEARCH_ID)
+        yield RichLog(id=LOG_PANE_VIEW_ID, markup=True, highlight=False)
+
+    def on_mount(self) -> None:
+        self.query_one(f"#{LOG_PANE_SEARCH_ID}", Input).display = False
 
     @on(Button.Pressed, f"#{BTN_EXPAND_ID}")
     def _on_expand_pressed(self) -> None:
@@ -174,41 +196,123 @@ class LogPane(Widget):
         self._container_id = container_id
         self._container_name = container_name
         self._stream_factory = stream_factory
-        log_view = self.query_one(f"#{LOG_PANE_VIEW_ID}", RichLog)
-        log_view.clear()
+        self._line_buffer = []
+        self._filter = ""
+        search_bar = self.query_one(f"#{LOG_PANE_SEARCH_ID}", Input)
+        search_bar.value = ""
+        search_bar.display = False
+        self.query_one(f"#{LOG_PANE_VIEW_ID}", RichLog).clear()
         self._start_follow()
         self._update_header()
 
     def _update_header(self) -> None:
-        state = " [bold green][FOLLOWING][/]" if self._following else "  |  L to close"
+        filter_hint = (
+            f"  |  filter: [bold]{escape(self._filter)}[/]" if self._filter else ""
+        )
+        if self._following and self._paused:
+            state = "  |  [bold yellow][PAUSED][/]"
+        elif self._following:
+            state = "  |  [bold green][FOLLOWING][/]"
+        else:
+            state = "  |  [dim]stream ended[/]  |  L to close"
         self.query_one(f"#{LOG_PANE_HEADER_ID}", Label).update(
-            f"Logs: {escape(self._container_name)}{state}"
+            f"Logs: {escape(self._container_name)}{state}{filter_hint}"
         )
 
     def toggle_follow(self) -> None:
         if self._following:
-            self.stop_follow()
+            self._paused = not self._paused
         else:
             self._start_follow()
         self._update_header()
 
+    def clear_log(self) -> None:
+        self._line_buffer = []
+        self.query_one(f"#{LOG_PANE_VIEW_ID}", RichLog).clear()
+
+    def toggle_search(self) -> None:
+        search_bar = self.query_one(f"#{LOG_PANE_SEARCH_ID}", Input)
+        if search_bar.display:
+            self._close_search()
+        else:
+            search_bar.display = True
+            search_bar.focus()
+
+    def _close_search(self) -> None:
+        search_bar = self.query_one(f"#{LOG_PANE_SEARCH_ID}", Input)
+        search_bar.display = False
+        search_bar.value = ""
+        self._filter = ""
+        self._render_to_view()
+        self._update_header()
+
+    @on(Input.Changed, f"#{LOG_PANE_SEARCH_ID}")
+    def _on_filter_changed(self, event: Input.Changed) -> None:
+        self._filter = event.value
+        if self._filter_timer is not None:
+            self._filter_timer.stop()
+        self._filter_timer = self.set_timer(0.2, self._render_to_view)
+
+    @on(Input.Submitted, f"#{LOG_PANE_SEARCH_ID}")
+    def _on_filter_submitted(self, event: Input.Submitted) -> None:
+        self.query_one(f"#{LOG_PANE_VIEW_ID}", RichLog).focus()
+
+    def on_key(self, event) -> None:
+        search_bar = self.query_one(f"#{LOG_PANE_SEARCH_ID}", Input)
+        if event.key == "slash" and not search_bar.display:
+            event.stop()
+            self.toggle_search()
+        elif event.key == "escape" and search_bar.display:
+            event.stop()
+            self._close_search()
+
+    def _render_to_view(self) -> None:
+        log_view = self.query_one(f"#{LOG_PANE_VIEW_ID}", RichLog)
+        log_view.clear()
+        term = self._filter
+        for line in self._line_buffer:
+            if not term or term.lower() in line.lower():
+                log_view.write(_highlight_match(line, term))
+        self._update_header()
+
+    def _append_line(self, line: str) -> None:
+        self._line_buffer.append(line)
+        if not self._filter or self._filter.lower() in line.lower():
+            log_view = self.query_one(f"#{LOG_PANE_VIEW_ID}", RichLog)
+            log_view.write(_highlight_match(line, self._filter))
+
     def _start_follow(self) -> None:
         if not self._stream_factory:
             return
-
+        self._generation += 1
+        generation = self._generation
         self._log_stream = self._stream_factory(self._container_id)
         self._following = True
-        threading.Thread(target=self._stream_logs, daemon=True).start()
+        self._paused = False
+        threading.Thread(
+            target=self._stream_logs, args=(generation,), daemon=True
+        ).start()
 
-    def _stream_logs(self) -> None:
-        log_view = self.query_one(f"#{LOG_PANE_VIEW_ID}", RichLog)
+    def _stream_logs(self, generation: int) -> None:
         for line in self._log_stream:
-            if not self._following:
+            if not self._following or self._generation != generation:
                 break
-            self.app.call_from_thread(log_view.write, line)
+            if self._paused:
+                continue
+            try:
+                self.app.call_from_thread(self._append_line, line)
+            except Exception:
+                break
+        if self._generation == generation:
+            self._following = False
+            try:
+                self.app.call_from_thread(self._update_header)
+            except Exception:
+                pass
 
     def stop_follow(self) -> None:
         self._following = False
+        self._paused = False
         if self._log_stream is not None:
             self._log_stream.stop()
             self._log_stream = None
@@ -236,6 +340,8 @@ class HelpScreen(ModalScreen):
             "view_logs",
             "close_logs",
             "follow_logs",
+            "clear_logs",
+            "toggle_log_search",
             "toggle_log_expand",
             "exec_container",
             "stop_container",

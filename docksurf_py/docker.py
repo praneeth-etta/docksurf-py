@@ -47,7 +47,8 @@ class LogStream:
         logger.info("Log stream started for container %s", self._container_id)
         try:
             container = self._client.containers.get(self._container_id)
-            self._generator = container.logs(stream=True, follow=True, tail=500)
+            follow = container.status == "running"
+            self._generator = container.logs(stream=True, follow=follow, tail=500)
 
             for raw_line in self._generator:
                 if not self._active:

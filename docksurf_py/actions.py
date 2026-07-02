@@ -120,6 +120,18 @@ class ContainerActionHandler:
             return
         self._set_log_expanded(log_pane, not log_pane.has_class("expanded"))
 
+    def action_clear_logs(self) -> None:
+        log_pane = self.query_one(f"#{LOG_PANE_ID}", LogPane)
+        if not log_pane.display:
+            return
+        log_pane.clear_log()
+
+    def action_toggle_log_search(self) -> None:
+        log_pane = self.query_one(f"#{LOG_PANE_ID}", LogPane)
+        if not log_pane.display:
+            return
+        log_pane.toggle_search()
+
     @on(LogPane.ToggleExpand)
     def on_log_pane_toggle_expand(self) -> None:
         self.action_toggle_log_expand()
