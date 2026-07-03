@@ -8,7 +8,7 @@ implementations.
 from typing import Protocol
 
 from docksurf_py.connection import ConnectionState
-from docksurf_py.docker import LogStream
+from docksurf_py.docker import LogStream, MergedLogStream
 from docksurf_py.models import CommandResult, DockerSnapshot
 
 
@@ -22,6 +22,16 @@ class DockerService(Protocol):
     def fetch_snapshot(self) -> DockerSnapshot: ...
 
     def stream_logs(self, container_id: str) -> LogStream: ...
+
+    def stream_project_logs(self, specs: list[tuple[str, str]]) -> MergedLogStream: ...
+
+    def compose_action(
+        self,
+        project: str,
+        verb: str,
+        config_files: str = "",
+        working_dir: str = "",
+    ) -> CommandResult: ...
 
     def stop_container(self, container_id: str) -> CommandResult: ...
 

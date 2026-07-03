@@ -56,6 +56,9 @@ class ContainerTable(DataTable):
         Binding("f", "follow_logs", "Follow"),
         Binding("z", "toggle_log_expand", "Expand Logs", show=False),
         Binding("d", "delete", "Delete"),
+        Binding("u", "compose_up", "Compose Up"),
+        Binding("k", "compose_down", "Compose Down"),
+        Binding("space", "toggle_group", "Collapse/Expand", show=False),
     ]
 
 
@@ -133,6 +136,8 @@ class ConfirmDialog(ModalScreen):
 
 def _highlight_match(line: str, term: str) -> str:
     """Return a Rich markup string with every occurrence of term highlighted."""
+    if isinstance(line, SafeMarkup):
+        return line
     if not term:
         return escape(line)
     parts = re.split(f"({re.escape(term)})", line, flags=re.IGNORECASE)
@@ -364,10 +369,16 @@ class HelpScreen(ModalScreen):
         ("/", "Filter logs (Esc to clear)", "Log pane open"),
     )
 
-    def __init__(self, app_bindings: list, container_actions: frozenset[str]) -> None:
+    def __init__(
+        self,
+        app_bindings: list,
+        container_actions: frozenset[str],
+        project_actions: frozenset[str] = frozenset(),
+    ) -> None:
         super().__init__()
         self._app_bindings = app_bindings
         self._container_actions = container_actions
+        self._project_actions = project_actions
 
     def on_key(self, event) -> None:
         if event.key in ("escape", "question_mark"):
@@ -388,7 +399,12 @@ class HelpScreen(ModalScreen):
             if not description:
                 continue
 
-            scope = "Container only" if action in self._container_actions else "Global"
+            if action in self._project_actions:
+                scope = "Compose project"
+            elif action in self._container_actions:
+                scope = "Container only"
+            else:
+                scope = "Global"
             table.add_row(f"[bold]{key}[/bold]", description, scope)
 
         table.add_section()

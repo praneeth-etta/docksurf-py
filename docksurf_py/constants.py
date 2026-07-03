@@ -39,6 +39,19 @@ STATUS_GREEN = "green"
 STATUS_RED = "red"
 STATUS_YELLOW = "yellow"
 
+# Palette cycled per service in the aggregated (merged) project log view, so
+# each service's lines are colour-coded like `docker compose logs -f`.
+LOG_SERVICE_COLORS = (
+    "cyan",
+    "magenta",
+    "green",
+    "yellow",
+    "blue",
+    "bright_red",
+    "bright_cyan",
+    "bright_magenta",
+)
+
 
 class SafeMarkup(str):
     """A str subclass that marks text as already-constructed Rich markup.

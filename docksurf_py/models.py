@@ -44,6 +44,13 @@ class PortBinding:
     host_port: str = ""
 
 
+# Docker Compose writes these labels onto every container it manages.
+COMPOSE_PROJECT_LABEL = "com.docker.compose.project"
+COMPOSE_SERVICE_LABEL = "com.docker.compose.service"
+COMPOSE_CONFIG_FILES_LABEL = "com.docker.compose.project.config_files"
+COMPOSE_WORKING_DIR_LABEL = "com.docker.compose.project.working_dir"
+
+
 @dataclass(slots=True)
 class Container:
     id: str
@@ -60,6 +67,27 @@ class Container:
     networks: list[str]
     created: str
     env: list[str]
+    labels: dict[str, str]
+
+    @property
+    def compose_project(self) -> str:
+        return self.labels.get(COMPOSE_PROJECT_LABEL, "")
+
+    @property
+    def compose_service(self) -> str:
+        return self.labels.get(COMPOSE_SERVICE_LABEL, "")
+
+    @property
+    def compose_config_files(self) -> str:
+        return self.labels.get(COMPOSE_CONFIG_FILES_LABEL, "")
+
+    @property
+    def compose_working_dir(self) -> str:
+        return self.labels.get(COMPOSE_WORKING_DIR_LABEL, "")
+
+    @property
+    def is_compose(self) -> bool:
+        return bool(self.compose_project)
 
 
 @dataclass(slots=True)
@@ -100,3 +128,30 @@ class DockerSnapshot:
     images: list[Image]
     volumes: list[Volume]
     networks: list[Network]
+
+
+@dataclass(slots=True)
+class ComposeProject:
+    """A group of containers sharing a `com.docker.compose.project` label.
+
+    Acts as a header object in the Containers table's row-backing list — it
+    occupies a real row index alongside the `Container`s it groups, so the
+    focus/detail resolvers can tell a project header from a service row.
+    """
+
+    name: str
+    containers: list[Container]
+    config_files: str
+    working_dir: str
+
+    @property
+    def total_count(self) -> int:
+        return len(self.containers)
+
+    @property
+    def running_count(self) -> int:
+        return sum(1 for c in self.containers if c.running)
+
+    @property
+    def all_running(self) -> bool:
+        return bool(self.containers) and self.running_count == self.total_count

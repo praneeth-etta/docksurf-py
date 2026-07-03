@@ -3,6 +3,10 @@ docker.py — All system-level Docker execution lives here.
 """
 
 import logging
+import queue
+import shutil
+import subprocess
+import threading
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -11,6 +15,7 @@ from typing import Callable, Iterator
 import docker
 import requests.exceptions
 from docker.errors import APIError, DockerException, NotFound
+from rich.markup import escape
 
 from docksurf_py.connection import (
     ConnectionState,
@@ -19,6 +24,7 @@ from docksurf_py.connection import (
     _get_docker_context,
     _get_docker_host,
 )
+from docksurf_py.constants import LOG_SERVICE_COLORS, SafeMarkup
 from docksurf_py.models import (
     CommandErrorKind,
     CommandResult,
@@ -72,6 +78,74 @@ class LogStream:
         self._active = False
         if self._generator and hasattr(self._generator, "close"):
             self._generator.close()
+
+
+def _assign_service_colors(services: list[str]) -> dict[str, str]:
+    """Map each distinct service name to a colour, cycling the palette."""
+    colors: dict[str, str] = {}
+    for service in services:
+        if service not in colors:
+            colors[service] = LOG_SERVICE_COLORS[len(colors) % len(LOG_SERVICE_COLORS)]
+    return colors
+
+
+class MergedLogStream:
+    """Interleaves several containers' logs into one line iterator.
+
+    Each source line is prefixed with a colour-coded service label (emitted as
+    `SafeMarkup` so `LogPane` renders the colour instead of escaping it), giving
+    the combined stream a `docker compose logs -f` feel. Satisfies the
+    `LogSource` structural protocol (`__iter__` + `stop()`) the same way
+    `LogStream` does.
+    """
+
+    def __init__(self, specs: list[tuple[str, str]], sdk_client) -> None:
+        # specs: list of (service_name, container_id)
+        self._specs = specs
+        self._client = sdk_client
+        self._streams = [LogStream(cid, sdk_client) for _, cid in specs]
+        self._active = False
+        self._queue: queue.Queue = queue.Queue()
+
+    def __iter__(self) -> Iterator[str]:
+        if not self._client or not self._specs:
+            return
+
+        self._active = True
+        logger.info("Merged log stream started for %d containers", len(self._specs))
+        colors = _assign_service_colors([service for service, _ in self._specs])
+        sentinel = object()
+
+        def pump(service: str, stream: LogStream) -> None:
+            color = colors[service]
+            try:
+                for line in stream:
+                    if not self._active:
+                        break
+                    self._queue.put(
+                        SafeMarkup(f"[{color}]{service:>14}[/] │ {escape(line)}")
+                    )
+            finally:
+                self._queue.put(sentinel)
+
+        for (service, _cid), stream in zip(self._specs, self._streams):
+            threading.Thread(target=pump, args=(service, stream), daemon=True).start()
+
+        remaining = len(self._specs)
+        while remaining > 0:
+            item = self._queue.get()
+            if item is sentinel:
+                remaining -= 1
+                continue
+            if not self._active:
+                break
+            yield item
+        self.stop()
+
+    def stop(self) -> None:
+        self._active = False
+        for stream in self._streams:
+            stream.stop()
 
 
 _AGE_UNITS = (
@@ -185,7 +259,9 @@ class DockerResourceFetcher:
             ]
 
             networks = list(attrs.get("NetworkSettings", {}).get("Networks", {}).keys())
-            env_vars = attrs.get("Config", {}).get("Env", [])
+            config = attrs.get("Config", {})
+            env_vars = config.get("Env", [])
+            labels = config.get("Labels") or {}
             image_tags = (
                 c.image.tags if c.image and c.image.tags else [attrs.get("Image", "")]
             )
@@ -209,6 +285,7 @@ class DockerResourceFetcher:
                     networks=networks,
                     created=attrs.get("Created", ""),
                     env=env_vars,
+                    labels=labels,
                 )
             )
         return containers
@@ -399,6 +476,10 @@ class DockerClient:
     def stream_logs(self, container_id: str) -> LogStream:
         return LogStream(container_id, self._sdk)
 
+    def stream_project_logs(self, specs: list[tuple[str, str]]) -> MergedLogStream:
+        """Build a merged log stream over a project's (service, id) pairs."""
+        return MergedLogStream(specs, self._sdk)
+
     # --- Writes ---
 
     def stop_container(self, container_id: str) -> CommandResult:
@@ -435,6 +516,56 @@ class DockerClient:
         return self._run_management_command(
             lambda sdk: sdk.networks.get(network_name).remove(), "OK"
         )
+
+    def compose_action(
+        self,
+        project: str,
+        verb: str,
+        config_files: str = "",
+        working_dir: str = "",
+    ) -> CommandResult:
+        """Run `docker compose <verb>` for a whole project.
+
+        Sanctioned subprocess exception (like exec-shell): docker-py has no
+        Compose support, and `up` in particular is impossible via the SDK since
+        it must recreate containers from the compose file. `up` therefore passes
+        the project's `-f` config files (from labels) and runs from its
+        working dir; `down`/`stop`/`start`/`restart` operate on the live project
+        by `-p` name alone.
+        """
+        if shutil.which("docker") is None:
+            logger.error("Compose %s aborted — docker CLI not found on PATH", verb)
+            return CommandResult.failure(
+                "docker CLI not found on PATH — cannot manage Compose projects",
+                kind=CommandErrorKind.DAEMON_UNREACHABLE,
+            )
+
+        cwd: str | None = None
+        if verb == "up":
+            cmd = ["docker", "compose"]
+            for config_file in filter(None, config_files.split(",")):
+                cmd += ["-f", config_file.strip()]
+            cmd += ["-p", project, "up", "-d"]
+            cwd = working_dir or None
+        else:
+            cmd = ["docker", "compose", "-p", project, verb]
+
+        logger.info("Running: %s (cwd=%s)", " ".join(cmd), cwd)
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, cwd=cwd)
+        except Exception as e:
+            logger.exception("Compose %s failed for %s", verb, project)
+            return CommandResult.failure(
+                str(e), kind=CommandErrorKind.DAEMON_UNREACHABLE
+            )
+
+        if result.returncode != 0:
+            msg = (result.stderr or result.stdout or "").strip()
+            msg = msg or f"docker compose {verb} exited {result.returncode}"
+            logger.warning("Compose %s failed for %s: %s", verb, project, msg)
+            return CommandResult.failure(msg, kind=CommandErrorKind.UNKNOWN)
+
+        return CommandResult.success(f"Compose {verb} succeeded for {project}")
 
     # --- Internal ---
 

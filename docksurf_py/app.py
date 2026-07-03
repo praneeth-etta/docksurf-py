@@ -23,6 +23,7 @@ from textual.widgets import (
 )
 
 from docksurf_py.actions import (
+    ComposeActionHandler,
     ContainerActionHandler,
     DeletePlan,
     ResourceDeletionHandler,
@@ -77,6 +78,19 @@ def _container_only_actions() -> frozenset[str]:
     )
 
 
+def _compose_actions() -> frozenset[str]:
+    """Action names implemented by ComposeActionHandler.
+
+    Lets the help screen tag project-wide actions with their own scope instead
+    of mislabeling them Global — derived from the mixin so it can't drift.
+    """
+    return frozenset(
+        name.removeprefix("action_")
+        for name, member in vars(ComposeActionHandler).items()
+        if name.startswith("action_") and callable(member)
+    )
+
+
 @dataclass(frozen=True)
 class ResourceEntry:
     """Everything the app needs to treat one resource type generically.
@@ -114,12 +128,19 @@ class AppContext(Protocol):
     docker: DockerService
     _current: dict[TabID, list]
     _resource_registry: dict[TabID, ResourceEntry]
+    _collapsed_projects: set[str]
 
     def start_refresh(self) -> None: ...
     def _auto_select_first(self) -> None: ...
     def _apply_filter(self, query: str) -> None: ...
+    def _rerender_containers(self) -> None: ...
     def _get_focused_container(self) -> Container | None: ...
     def _get_focused_resource(self, tab_id: TabID) -> Any: ...
+    def _get_focused_project(self) -> Any: ...
+    def _focused_is_project_header(self) -> bool: ...
+    def action_compose_stop(self) -> None: ...
+    def action_compose_start(self) -> None: ...
+    def action_compose_restart(self) -> None: ...
 
     # These five are really `textual.app.App` methods. DockSurfApp's real
     # MRO includes both `App` and (fictitiously, TYPE_CHECKING-only) this
@@ -138,6 +159,7 @@ class DockSurfApp(
     ResourceFocusResolver,
     DetailPaneRenderer,
     ContainerActionHandler,
+    ComposeActionHandler,
     ResourceDeletionHandler,
     ResourceSearchController,
     App,
@@ -162,6 +184,9 @@ class DockSurfApp(
         ("f", "follow_logs", "Pause/Resume"),
         ("c", "clear_logs", "Clear"),
         ("z", "toggle_log_expand", "Expand Logs"),
+        ("u", "compose_up", "Compose Up"),
+        ("k", "compose_down", "Compose Down"),
+        ("space", "toggle_group", "Collapse/Expand"),
     ]
     CSS_PATH = "app.tcss"
 
@@ -281,7 +306,9 @@ class DockSurfApp(
         self._auto_select_first()
 
     def action_help(self) -> None:
-        self.push_screen(HelpScreen(self.BINDINGS, _container_only_actions()))
+        self.push_screen(
+            HelpScreen(self.BINDINGS, _container_only_actions(), _compose_actions())
+        )
 
 
 def main():

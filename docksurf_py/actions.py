@@ -15,10 +15,11 @@ from rich.markup import escape
 from textual import on, work
 from textual.widgets import TabbedContent
 
-from docksurf_py.constants import DETAIL_PANE_ID, LOG_PANE_ID
+from docksurf_py.constants import DETAIL_PANE_ID, LOG_PANE_ID, TabID
 from docksurf_py.models import (
     CommandErrorKind,
     CommandResult,
+    ComposeProject,
     Container,
     Image,
     Network,
@@ -38,6 +39,8 @@ else:
 logger = logging.getLogger(__name__)
 
 EXEC_SHELL_CANDIDATES = ("bash", "sh")
+
+_PROJECT_HINT = "Select a Compose project (or one of its containers) first"
 
 
 def select_exec_shell(
@@ -107,6 +110,11 @@ class ContainerActionHandler(_Base):
                 self.start_refresh()
 
     def action_stop_container(self) -> None:
+        # On compose project header -> action on the whole project;
+        # on standalone container -> action on the single container.
+        if self._focused_is_project_header():
+            self.action_compose_stop()
+            return
         self._run_on_focused_container(
             command=self.docker.stop_container,
             success_msg=lambda c: f"Stopped {escape(c.name)}",
@@ -116,6 +124,9 @@ class ContainerActionHandler(_Base):
         )
 
     def action_start_container(self) -> None:
+        if self._focused_is_project_header():
+            self.action_compose_start()
+            return
         self._run_on_focused_container(
             command=self.docker.start_container,
             success_msg=lambda c: f"Started {escape(c.name)}",
@@ -125,6 +136,9 @@ class ContainerActionHandler(_Base):
         )
 
     def action_restart_container(self) -> None:
+        if self._focused_is_project_header():
+            self.action_compose_restart()
+            return
         self._run_on_focused_container(
             command=self.docker.restart_container,
             success_msg=lambda c: f"Restarted {escape(c.name)}",
@@ -188,12 +202,35 @@ class ContainerActionHandler(_Base):
         if log_pane.display:
             self.action_close_logs()
             return
+        # On a project header, open interleaved logs across the whole project.
+        if self._focused_is_project_header():
+            self._open_project_logs(log_pane)
+            return
         c = self._get_focused_container()
         if c is None:
             self.notify(self._CONTAINER_TAB_HINT, severity="warning")
             return
         logger.info("Opening log pane for container %s (%s)", c.name, c.id)
         log_pane.load(c.id, c.name, self.docker.stream_logs)
+        self.query_one(f"#{DETAIL_PANE_ID}", DetailPane).display = False
+        log_pane.display = True
+
+    def _open_project_logs(self, log_pane: LogPane) -> None:
+        project = self._get_focused_project()
+        if project is None:
+            self.notify(_PROJECT_HINT, severity="warning")
+            return
+        specs = [(c.compose_service or c.name, c.id) for c in project.containers]
+        logger.info(
+            "Opening aggregated logs for project %s (%d containers)",
+            project.name,
+            len(specs),
+        )
+        log_pane.load(
+            project.name,
+            f"project: {project.name}",
+            lambda _key: self.docker.stream_project_logs(specs),
+        )
         self.query_one(f"#{DETAIL_PANE_ID}", DetailPane).display = False
         log_pane.display = True
 
@@ -238,6 +275,88 @@ class ContainerActionHandler(_Base):
     def _set_log_expanded(self, log_pane: LogPane, expanded: bool) -> None:
         self.query_one(TabbedContent).display = not expanded
         log_pane.set_expanded(expanded)
+
+
+class ComposeActionHandler(_Base):
+    """Project-wide lifecycle actions for Docker Compose stacks.
+
+    Wraps `DockerClient.compose_action` (a sanctioned `docker compose`
+    subprocess exception) in the same threaded-worker pattern container actions
+    use, so the UI stays responsive and refreshes when the command finishes.
+    The project is resolved from whatever is focused — a project header or one
+    of its service rows — via `_get_focused_project`.
+    """
+
+    def _run_compose(self, verb: str, gerund: str) -> None:
+        project = self._get_focused_project()
+        if project is None:
+            self.notify(_PROJECT_HINT, severity="warning")
+            return
+        self.notify(f"{gerund} project {escape(project.name)}…")
+        self._execute_compose_action(project, verb)
+
+    @work(thread=True)
+    def _execute_compose_action(self, project: ComposeProject, verb: str) -> None:
+        result = self.docker.compose_action(
+            project.name,
+            verb,
+            config_files=project.config_files,
+            working_dir=project.working_dir,
+        )
+        self.call_from_thread(self._handle_compose_result, project, result)
+
+    def _handle_compose_result(
+        self, project: ComposeProject, result: CommandResult
+    ) -> None:
+        if result.ok:
+            logger.info("%s", result.message)
+            self.notify(result.message)
+            self.start_refresh()
+        else:
+            logger.warning(
+                "Compose action failed on %s: %s", project.name, result.message
+            )
+            self.notify(f"Error: {result.message}", severity="error")
+
+    def action_compose_up(self) -> None:
+        self._run_compose("up", "Bringing up")
+
+    def action_compose_stop(self) -> None:
+        self._run_compose("stop", "Stopping")
+
+    def action_compose_start(self) -> None:
+        self._run_compose("start", "Starting")
+
+    def action_compose_restart(self) -> None:
+        self._run_compose("restart", "Restarting")
+
+    @work
+    async def action_compose_down(self) -> None:
+        project = self._get_focused_project()
+        if project is None:
+            self.notify(_PROJECT_HINT, severity="warning")
+            return
+        confirmed = await self.push_screen_wait(
+            ConfirmDialog(
+                f"Compose down '{escape(project.name)}'? This stops and removes "
+                f"all {project.total_count} container(s) in the project."
+            )
+        )
+        if not confirmed:
+            logger.debug("Compose down cancelled by user")
+            return
+        self.notify(f"Bringing down project {escape(project.name)}…")
+        self._execute_compose_action(project, "down")
+
+    def action_toggle_group(self) -> None:
+        item = self._get_focused_resource(TabID.CONTAINERS)
+        if not isinstance(item, ComposeProject):
+            return
+        if item.name in self._collapsed_projects:
+            self._collapsed_projects.discard(item.name)
+        else:
+            self._collapsed_projects.add(item.name)
+        self._rerender_containers()
 
 
 @dataclass(frozen=True)

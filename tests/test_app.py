@@ -4,14 +4,25 @@ import unittest
 from typing import Callable
 
 from rich.table import Table as RichTable
-from textual.widgets import LoadingIndicator, Static
+from textual.widgets import DataTable, LoadingIndicator, Static
 
 from docksurf_py.actions import ContainerActionHandler
-from docksurf_py.app import DockSurfApp, _container_only_actions
+from docksurf_py.app import (
+    DockSurfApp,
+    _compose_actions,
+    _container_only_actions,
+)
 from docksurf_py.connection import ConnectionState, ConnectionStatus
+from docksurf_py.constants import TabID, TableID
 from docksurf_py.docker import LogStream
-from docksurf_py.models import CommandResult, DockerSnapshot
+from docksurf_py.models import (
+    CommandResult,
+    ComposeProject,
+    Container,
+    DockerSnapshot,
+)
 from docksurf_py.widgets import HelpScreen
+from tests.test_compose import make_container
 
 EMPTY_SNAPSHOT = DockerSnapshot([], [], [], [])
 
@@ -38,6 +49,14 @@ class MockDockerService:
 
     def stream_logs(self, container_id: str) -> LogStream:
         return LogStream(container_id, None)
+
+    def stream_project_logs(self, specs):
+        return LogStream("", None)
+
+    def compose_action(
+        self, project, verb, config_files="", working_dir=""
+    ) -> CommandResult:
+        return CommandResult.success()
 
     def stop_container(self, container_id: str) -> CommandResult:
         return CommandResult.success()
@@ -167,17 +186,88 @@ class HelpScreenTests(unittest.IsolatedAsyncioTestCase):
                 if not description:
                     continue
                 match = next(r for r in rows if r[1] == description)
-                expected_scope = (
-                    "Container only"
-                    if action in _container_only_actions()
-                    else "Global"
-                )
+                if action in _compose_actions():
+                    expected_scope = "Compose project"
+                elif action in _container_only_actions():
+                    expected_scope = "Container only"
+                else:
+                    expected_scope = "Global"
                 self.assertEqual(match[2], expected_scope, f"key={key} action={action}")
 
             # Regression: the old hand-maintained frozenset mislabeled
             # "delete" as container-only even though it applies to every tab.
             delete_row = next(r for r in rows if r[1] == "Delete")
             self.assertEqual(delete_row[2], "Global")
+
+
+def _compose_snapshot() -> DockerSnapshot:
+    return DockerSnapshot(
+        containers=[
+            make_container("standalone"),
+            make_container("myapp-web", project="myapp", service="web"),
+            make_container("myapp-db", project="myapp", service="db", running=False),
+        ],
+        images=[],
+        volumes=[],
+        networks=[],
+    )
+
+
+class ComposeGroupingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_current_list_interleaves_header_and_service_rows(self) -> None:
+        app = DockSurfApp(docker=MockDockerService(_compose_snapshot))
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await wait_until(lambda: bool(app._current.get(TabID.CONTAINERS)))
+
+            rows = app._current[TabID.CONTAINERS]
+            table = app.query_one(f"#{TableID.CONTAINERS}", DataTable)
+
+            # Row-index invariant: _current length matches the DataTable rows.
+            self.assertEqual(len(rows), table.row_count)
+
+            # myapp (sorted) group header, then its two services, then standalone.
+            self.assertIsInstance(rows[0], ComposeProject)
+            self.assertEqual(rows[0].name, "myapp")
+            self.assertIsInstance(rows[1], Container)
+            self.assertIsInstance(rows[2], Container)
+            self.assertIsInstance(rows[3], Container)
+            self.assertEqual(rows[3].name, "standalone")
+
+    async def test_focused_project_resolves_from_header_and_service_row(self) -> None:
+        app = DockSurfApp(docker=MockDockerService(_compose_snapshot))
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await wait_until(lambda: bool(app._current.get(TabID.CONTAINERS)))
+            table = app.query_one(f"#{TableID.CONTAINERS}", DataTable)
+
+            # Header row -> project.
+            table.move_cursor(row=0)
+            self.assertTrue(app._focused_is_project_header())
+            self.assertEqual(app._get_focused_project().name, "myapp")
+
+            # A service row -> its parent project; not a header.
+            table.move_cursor(row=1)
+            self.assertFalse(app._focused_is_project_header())
+            self.assertEqual(app._get_focused_project().name, "myapp")
+            self.assertIsNotNone(app._get_focused_container())
+
+    async def test_collapse_hides_service_rows(self) -> None:
+        app = DockSurfApp(docker=MockDockerService(_compose_snapshot))
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await wait_until(lambda: bool(app._current.get(TabID.CONTAINERS)))
+            table = app.query_one(f"#{TableID.CONTAINERS}", DataTable)
+
+            full_rows = len(app._current[TabID.CONTAINERS])
+            table.move_cursor(row=0)
+            app.action_toggle_group()
+            await pilot.pause()
+
+            collapsed_rows = app._current[TabID.CONTAINERS]
+            # Header + standalone remain; the two services are hidden.
+            self.assertEqual(len(collapsed_rows), full_rows - 2)
+            self.assertIn("myapp", app._collapsed_projects)
 
 
 if __name__ == "__main__":
