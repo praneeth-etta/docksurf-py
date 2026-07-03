@@ -9,7 +9,7 @@ All components here are intentionally "dumb":
 
 import re
 import threading
-from typing import Callable
+from typing import Callable, Iterator, Protocol
 
 from rich.markup import escape
 from rich.panel import Panel
@@ -20,6 +20,7 @@ from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.message import Message
 from textual.screen import ModalScreen
+from textual.timer import Timer
 from textual.widget import Widget
 from textual.widgets import (
     Button,
@@ -41,7 +42,6 @@ from docksurf_py.constants import (
     LOG_PANE_VIEW_ID,
     SafeMarkup,
 )
-from docksurf_py.docker import LogStream
 
 
 class ContainerTable(DataTable):
@@ -142,6 +142,17 @@ def _highlight_match(line: str, term: str) -> str:
     )
 
 
+class LogSource(Protocol):
+    """Structural contract for whatever a log stream factory returns.
+
+    Matches `docker.LogStream` without importing it, so the view layer stays
+    a leaf module.
+    """
+
+    def __iter__(self) -> Iterator[str]: ...
+    def stop(self) -> None: ...
+
+
 class LogPane(Widget):
     """Inline log viewer that lives in the right panel, expandable to full width."""
 
@@ -155,12 +166,12 @@ class LogPane(Widget):
         self._following = False
         self._paused = False
         self._generation: int = 0
-        self._log_stream: LogStream | None = None
+        self._log_stream: LogSource | None = None
         self._expanded = False
-        self._stream_factory: Callable[[str], LogStream] | None = None
+        self._stream_factory: Callable[[str], LogSource] | None = None
         self._line_buffer: list[str] = []
         self._filter: str = ""
-        self._filter_timer = None
+        self._filter_timer: Timer | None = None
 
     def compose(self) -> ComposeResult:
         with Horizontal(id=LOG_PANE_TOOLBAR_ID):
@@ -190,7 +201,7 @@ class LogPane(Widget):
         self,
         container_id: str,
         container_name: str,
-        stream_factory: Callable[[str], LogStream],
+        stream_factory: Callable[[str], LogSource],
     ) -> None:
         self.stop_follow()
         self._container_id = container_id
@@ -291,15 +302,16 @@ class LogPane(Widget):
             return
         self._generation += 1
         generation = self._generation
-        self._log_stream = self._stream_factory(self._container_id)
+        log_stream = self._stream_factory(self._container_id)
+        self._log_stream = log_stream
         self._following = True
         self._paused = False
         threading.Thread(
-            target=self._stream_logs, args=(generation,), daemon=True
+            target=self._stream_logs, args=(generation, log_stream), daemon=True
         ).start()
 
-    def _stream_logs(self, generation: int) -> None:
-        for line in self._log_stream:
+    def _stream_logs(self, generation: int, log_stream: LogSource) -> None:
+        for line in log_stream:
             if not self._following or self._generation != generation:
                 break
 
@@ -338,27 +350,24 @@ class SearchBar(Input):
 
 
 class HelpScreen(ModalScreen):
-    """Keybindings cheat sheet"""
+    """Keybindings cheat sheet — built from the live BINDINGS list, not a
+    hand-copied one, so it can't drift from what's actually bound.
+    """
 
-    _CONTAINER_ONLY = frozenset(
-        {
-            "view_logs",
-            "close_logs",
-            "follow_logs",
-            "clear_logs",
-            "toggle_log_search",
-            "toggle_log_expand",
-            "exec_container",
-            "stop_container",
-            "start_container",
-            "restart_container",
-            "delete",
-        }
+    # Genuine keyboard shortcuts that never go through the action/BINDINGS
+    # system (LogPane intercepts them directly in on_key), so they can't be
+    # derived — listed here explicitly instead of mislabeled as a BINDINGS
+    # entry.
+    _EXTRA_ROWS = (
+        ("Tab", "Switch between tab panels", "Global"),
+        ("↑ / ↓", "Navigate rows in a table", "Global"),
+        ("/", "Filter logs (Esc to clear)", "Log pane open"),
     )
 
-    def __init__(self, app_bindings: list) -> None:
+    def __init__(self, app_bindings: list, container_actions: frozenset[str]) -> None:
         super().__init__()
         self._app_bindings = app_bindings
+        self._container_actions = container_actions
 
     def on_key(self, event) -> None:
         if event.key in ("escape", "question_mark"):
@@ -379,12 +388,12 @@ class HelpScreen(ModalScreen):
             if not description:
                 continue
 
-            scope = "Container only" if action in self._CONTAINER_ONLY else "Global"
+            scope = "Container only" if action in self._container_actions else "Global"
             table.add_row(f"[bold]{key}[/bold]", description, scope)
 
         table.add_section()
-        table.add_row("[bold]Tab[/bold]", "Switch between tab panels", "Global")
-        table.add_row("[bold]↑ / ↓[/bold]", "Navigate rows in a table", "Global")
+        for key, description, scope in self._EXTRA_ROWS:
+            table.add_row(f"[bold]{key}[/bold]", description, scope)
 
         with Vertical():
             yield Label("[b]Help[/b]", id="help-title")

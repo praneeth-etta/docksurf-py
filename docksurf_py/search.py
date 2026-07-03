@@ -4,13 +4,41 @@ search.py — Live filter bar mixin.
 ResourceSearchController is a mixin class that composes into DockSurfApp.
 """
 
+from typing import TYPE_CHECKING
+
 from textual import on
 from textual.widgets import DataTable, Input, TabbedContent
 
-from docksurf_py.constants import SEARCH_BAR_ID, TabID, TableID
+from docksurf_py.constants import SEARCH_BAR_ID
+from docksurf_py.models import Container, Image, Network, Volume
+
+if TYPE_CHECKING:
+    from docksurf_py.app import AppContext
+
+    _Base = AppContext
+else:
+    # Real runtime base is `object` — `AppContext` only exists for mypy to
+    # check these mixins' bodies against; see app.py's `AppContext` docstring.
+    _Base = object
 
 
-class ResourceSearchController:
+def _matches_container(c: Container, q: str) -> bool:
+    return q in c.name.lower() or q in c.image_name.lower() or q in c.status.lower()
+
+
+def _matches_image(i: Image, q: str) -> bool:
+    return q in (i.repository or "").lower() or q in (i.tag or "").lower()
+
+
+def _matches_volume(v: Volume, q: str) -> bool:
+    return q in v.name.lower() or q in v.driver.lower()
+
+
+def _matches_network(n: Network, q: str) -> bool:
+    return q in n.name.lower() or q in n.driver.lower()
+
+
+class ResourceSearchController(_Base):
     """Opens, closes, and applies the live filter bar across all resource tabs."""
 
     def action_open_search(self) -> None:
@@ -38,45 +66,12 @@ class ResourceSearchController:
 
         q = query.lower()
         active = self.query_one(TabbedContent).active
+        entry = self._resource_registry.get(active)
+        if entry is None:
+            return
 
-        if active == TabID.CONTAINERS:
-            filtered = [
-                c
-                for c in self.snapshot.containers
-                if q in c.name.lower()
-                or q in c.image_name.lower()
-                or q in c.status.lower()
-            ]
-            table = self.query_one(f"#{TableID.CONTAINERS}", DataTable)
-            table.clear(columns=False)
-            self._populate_container_table(table, filtered)
-
-        elif active == TabID.IMAGES:
-            filtered = [
-                i
-                for i in self.snapshot.images
-                if q in (i.repository or "").lower() or q in (i.tag or "").lower()
-            ]
-            table = self.query_one(f"#{TableID.IMAGES}", DataTable)
-            table.clear(columns=False)
-            self._populate_image_table(table, filtered)
-
-        elif active == TabID.VOLUMES:
-            filtered = [
-                v
-                for v in self.snapshot.volumes
-                if q in v.name.lower() or q in v.driver.lower()
-            ]
-            table = self.query_one(f"#{TableID.VOLUMES}", DataTable)
-            table.clear(columns=False)
-            self._populate_volume_table(table, filtered)
-
-        elif active == TabID.NETWORKS:
-            filtered = [
-                n
-                for n in self.snapshot.networks
-                if q in n.name.lower() or q in n.driver.lower()
-            ]
-            table = self.query_one(f"#{TableID.NETWORKS}", DataTable)
-            table.clear(columns=False)
-            self._populate_network_table(table, filtered)
+        items = entry.snapshot_items(self.snapshot)
+        filtered = [item for item in items if entry.matches(item, q)]
+        table = self.query_one(f"#{entry.table_id}", DataTable)
+        table.clear(columns=False)
+        entry.populate(table, filtered)

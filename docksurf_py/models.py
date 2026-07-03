@@ -1,7 +1,47 @@
 from dataclasses import dataclass
-from typing import TypeAlias
+from enum import Enum
 
-CommandResult: TypeAlias = tuple[bool, str]
+
+class CommandErrorKind(Enum):
+    """Categorises why a management command failed, so callers can react
+    differently (e.g. re-fetch on a stale not-found) instead of pattern
+    matching on an error string.
+    """
+
+    NOT_FOUND = "not_found"
+    IN_USE = "in_use"
+    DAEMON_UNREACHABLE = "daemon_unreachable"
+    UNKNOWN = "unknown"
+
+
+@dataclass(slots=True, frozen=True)
+class CommandResult:
+    ok: bool
+    message: str
+    kind: CommandErrorKind | None = None
+
+    @classmethod
+    def success(cls, message: str = "OK") -> "CommandResult":
+        return cls(ok=True, message=message)
+
+    @classmethod
+    def failure(
+        cls, message: str, kind: CommandErrorKind = CommandErrorKind.UNKNOWN
+    ) -> "CommandResult":
+        return cls(ok=False, message=message, kind=kind)
+
+
+@dataclass(slots=True, frozen=True)
+class PortBinding:
+    """One container-port entry from `NetworkSettings.Ports`.
+
+    `host_ip`/`host_port` are empty when the port isn't published to the
+    host.
+    """
+
+    container_port: str  # Docker's raw "80/tcp" form
+    host_ip: str = ""
+    host_port: str = ""
 
 
 @dataclass(slots=True)
@@ -15,7 +55,7 @@ class Container:
     running: bool
     exit_code: int
     health: str
-    ports: str
+    ports: list[PortBinding]
     mounts: list[str]
     networks: list[str]
     created: str
@@ -27,7 +67,7 @@ class Image:
     id: str
     repository: str
     tag: str
-    size: str
+    size_bytes: int
     is_dangling: bool
     used_by: list[str]
     created: str
@@ -40,7 +80,7 @@ class Volume:
     driver: str
     mountpoint: str
     used_by: list[str]
-    labels: str
+    labels: dict[str, str]
 
 
 @dataclass(slots=True)

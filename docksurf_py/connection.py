@@ -4,6 +4,7 @@ from enum import Enum
 
 
 class ConnectionStatus(Enum):
+    NOT_CONNECTED = "not_connected"
     CONNECTED = "connected"
     DAEMON_UNAVAILABLE = "daemon_unavailable"
     PERMISSION_DENIED = "permission_denied"

@@ -6,7 +6,7 @@ import logging
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
-from typing import Iterator
+from typing import Callable, Iterator
 
 import docker
 import requests.exceptions
@@ -20,11 +20,13 @@ from docksurf_py.connection import (
     _get_docker_host,
 )
 from docksurf_py.models import (
+    CommandErrorKind,
     CommandResult,
     Container,
     DockerSnapshot,
     Image,
     Network,
+    PortBinding,
     Volume,
 )
 
@@ -38,7 +40,7 @@ class LogStream:
         self._container_id = container_id
         self._client = sdk_client
         self._active = False
-        self._generator = None
+        self._generator: Iterator[bytes] | None = None
 
     def __iter__(self) -> Iterator[str]:
         if not self._client:
@@ -124,11 +126,27 @@ def format_relative_time(ts: str) -> str:
 def format_size(size_in_bytes: int | None) -> str:
     if not size_in_bytes:
         return "0B"
+    size: float = size_in_bytes
     for unit in ["B", "KB", "MB", "GB", "TB"]:
-        if size_in_bytes < 1024.0:
-            return f"{size_in_bytes:.2f}{unit}"
-        size_in_bytes /= 1024.0
-    return f"{size_in_bytes:.2f}PB"
+        if size < 1024.0:
+            return f"{size:.2f}{unit}"
+        size /= 1024.0
+    return f"{size:.2f}PB"
+
+
+def format_ports(ports: list[PortBinding]) -> str:
+    parts = []
+    for p in ports:
+        if p.host_port:
+            prefix = f"{p.host_ip}:" if p.host_ip else ""
+            parts.append(f"{prefix}{p.host_port}->{p.container_port}")
+        else:
+            parts.append(p.container_port)
+    return ", ".join(parts)
+
+
+def format_labels(labels: dict[str, str]) -> str:
+    return ", ".join(f"{k}={v}" for k, v in labels.items())
 
 
 class DockerResourceFetcher:
@@ -145,17 +163,20 @@ class DockerResourceFetcher:
         for c in self._client.containers.list(all=True):
             attrs = c.attrs
 
-            ports_list = []
+            ports: list[PortBinding] = []
             port_bindings = attrs.get("NetworkSettings", {}).get("Ports", {}) or {}
             for port, bindings in port_bindings.items():
                 if bindings:
                     for binding in bindings:
-                        host_ip = binding.get("HostIp", "")
-                        host_port = binding.get("HostPort", "")
-                        prefix = f"{host_ip}:" if host_ip else ""
-                        ports_list.append(f"{prefix}{host_port}->{port}")
+                        ports.append(
+                            PortBinding(
+                                container_port=port,
+                                host_ip=binding.get("HostIp", ""),
+                                host_port=binding.get("HostPort", ""),
+                            )
+                        )
                 else:
-                    ports_list.append(port)
+                    ports.append(PortBinding(container_port=port))
 
             mounts = [
                 m["Name"]
@@ -183,7 +204,7 @@ class DockerResourceFetcher:
                     running=sdk_state.get("Running", False),
                     exit_code=sdk_state.get("ExitCode", 0),
                     health=health_info.get("Status", ""),
-                    ports=", ".join(ports_list),
+                    ports=ports,
                     mounts=mounts,
                     networks=networks,
                     created=attrs.get("Created", ""),
@@ -205,7 +226,7 @@ class DockerResourceFetcher:
                         id=i.id,  # full SHA256 — must match container.image_id format
                         repository=repo,
                         tag=tag,
-                        size=format_size(i.attrs.get("Size")),
+                        size_bytes=i.attrs.get("Size") or 0,
                         is_dangling=(repo == "<none>" and tag == "<none>"),
                         used_by=[],
                         created=i.attrs.get("Created", ""),
@@ -217,17 +238,13 @@ class DockerResourceFetcher:
     def get_volumes(self) -> list[Volume]:
         volumes = []
         for v in self._client.volumes.list():
-            labels = v.attrs.get("Labels", {})
-            label_str = (
-                ", ".join(f"{k}={val}" for k, val in labels.items()) if labels else ""
-            )
             volumes.append(
                 Volume(
                     name=v.name,
                     driver=v.attrs.get("Driver", ""),
                     mountpoint=v.attrs.get("Mountpoint", ""),
                     used_by=[],
-                    labels=label_str,
+                    labels=v.attrs.get("Labels") or {},
                 )
             )
         return volumes
@@ -274,8 +291,8 @@ class DockerResourceFetcher:
             image_usage[c.image_id].append(c.name)
             for mount in c.mounts:
                 volume_usage[mount].append(c.name)
-            for network in c.networks:
-                network_usage[network].append(c.name)
+            for network_name in c.networks:
+                network_usage[network_name].append(c.name)
 
         for image in images:
             image.used_by.extend(image_usage.get(image.id, []))
@@ -298,7 +315,26 @@ class DockerClient:
     def __init__(self) -> None:
         self._sdk: docker.DockerClient | None = None
         self._fetcher: DockerResourceFetcher | None = None
-        self.connection: ConnectionState = self._connect()
+        self.connection: ConnectionState = ConnectionState(
+            status=ConnectionStatus.NOT_CONNECTED,
+            message="Not yet connected",
+            hint="",
+            context=_get_docker_context(),
+            host=_get_docker_host(),
+        )
+
+    def ensure_connected(self) -> ConnectionState:
+        """(Re)attempt to connect if not already connected.
+
+        Called lazily from the read/write methods below instead of blocking
+        the constructor on the daemon round-trip. Safe to call on every
+        operation — once connected it's a no-op, and while disconnected it
+        naturally retries on the next call, which is what makes reconnecting
+        after the daemon comes back up "just work".
+        """
+        if not self.is_connected:
+            self.connection = self._connect()
+        return self.connection
 
     def _connect(self) -> ConnectionState:
         context = _get_docker_context()
@@ -345,6 +381,7 @@ class DockerClient:
     # --- Reads ---
 
     def fetch_snapshot(self) -> DockerSnapshot:
+        self.ensure_connected()
         if not self._fetcher:
             return DockerSnapshot([], [], [], [])
         return self._fetcher.fetch_snapshot()
@@ -366,62 +403,79 @@ class DockerClient:
 
     def stop_container(self, container_id: str) -> CommandResult:
         return self._run_management_command(
-            lambda: self._sdk.containers.get(container_id).stop(), "OK"
+            lambda sdk: sdk.containers.get(container_id).stop(), "OK"
         )
 
     def start_container(self, container_id: str) -> CommandResult:
         return self._run_management_command(
-            lambda: self._sdk.containers.get(container_id).start(), "OK"
+            lambda sdk: sdk.containers.get(container_id).start(), "OK"
         )
 
     def restart_container(self, container_id: str) -> CommandResult:
         return self._run_management_command(
-            lambda: self._sdk.containers.get(container_id).restart(), "OK"
+            lambda sdk: sdk.containers.get(container_id).restart(), "OK"
         )
 
     def remove_container(self, container_id: str, force: bool = False) -> CommandResult:
         return self._run_management_command(
-            lambda: self._sdk.containers.get(container_id).remove(force=force), "OK"
+            lambda sdk: sdk.containers.get(container_id).remove(force=force), "OK"
         )
 
     def remove_image(self, image_id: str, force: bool = False) -> CommandResult:
         return self._run_management_command(
-            lambda: self._sdk.images.remove(image=image_id, force=force), "OK"
+            lambda sdk: sdk.images.remove(image=image_id, force=force), "OK"
         )
 
     def remove_volume(self, volume_name: str) -> CommandResult:
         return self._run_management_command(
-            lambda: self._sdk.volumes.get(volume_name).remove(), "OK"
+            lambda sdk: sdk.volumes.get(volume_name).remove(), "OK"
         )
 
     def remove_network(self, network_name: str) -> CommandResult:
         return self._run_management_command(
-            lambda: self._sdk.networks.get(network_name).remove(), "OK"
+            lambda sdk: sdk.networks.get(network_name).remove(), "OK"
         )
 
     # --- Internal ---
 
     def _run_management_command(
-        self, action_callable, success_msg: str
+        self,
+        action_callable: Callable[["docker.DockerClient"], None],
+        success_msg: str,
     ) -> CommandResult:
-        if not self._sdk:
+        sdk = self._sdk
+        if not sdk:
             logger.error("Management command skipped — Docker client not initialized")
-            return False, "Docker client not initialized"
+            return CommandResult.failure(
+                "Docker client not initialized",
+                kind=CommandErrorKind.DAEMON_UNREACHABLE,
+            )
         try:
-            action_callable()
+            action_callable(sdk)
             logger.debug("Management command succeeded")
-            return True, success_msg
+            return CommandResult.success(success_msg)
+        except NotFound as e:
+            logger.warning("Docker resource not found: %s", e)
+            return CommandResult.failure(str(e), kind=CommandErrorKind.NOT_FOUND)
         except APIError as e:
+            kind = (
+                CommandErrorKind.IN_USE
+                if e.status_code == 409
+                else CommandErrorKind.UNKNOWN
+            )
             logger.warning("Docker API error: %s", e)
-            return False, str(e)
+            return CommandResult.failure(str(e), kind=kind)
         except (DockerException, requests.exceptions.RequestException) as e:
             logger.warning("Docker daemon unreachable: %s", e)
-            return False, str(e)
+            return CommandResult.failure(
+                str(e), kind=CommandErrorKind.DAEMON_UNREACHABLE
+            )
 
 
 if __name__ == "__main__":
     dc = DockerClient()
+    snapshot = dc.fetch_snapshot()  # triggers the lazy connect
     if dc.is_connected:
-        print(dc.fetch_snapshot())
+        print(snapshot)
     else:
         print("Could not connect to Docker daemon")

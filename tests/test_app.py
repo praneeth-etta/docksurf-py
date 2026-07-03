@@ -3,12 +3,15 @@ import threading
 import unittest
 from typing import Callable
 
-from textual.widgets import LoadingIndicator
+from rich.table import Table as RichTable
+from textual.widgets import LoadingIndicator, Static
 
-from docksurf_py.app import DockSurfApp
+from docksurf_py.actions import ContainerActionHandler
+from docksurf_py.app import DockSurfApp, _container_only_actions
 from docksurf_py.connection import ConnectionState, ConnectionStatus
 from docksurf_py.docker import LogStream
 from docksurf_py.models import CommandResult, DockerSnapshot
+from docksurf_py.widgets import HelpScreen
 
 EMPTY_SNAPSHOT = DockerSnapshot([], [], [], [])
 
@@ -37,25 +40,25 @@ class MockDockerService:
         return LogStream(container_id, None)
 
     def stop_container(self, container_id: str) -> CommandResult:
-        return True, "OK"
+        return CommandResult.success()
 
     def start_container(self, container_id: str) -> CommandResult:
-        return True, "OK"
+        return CommandResult.success()
 
     def restart_container(self, container_id: str) -> CommandResult:
-        return True, "OK"
+        return CommandResult.success()
 
     def remove_container(self, container_id: str, force: bool = False) -> CommandResult:
-        return True, "OK"
+        return CommandResult.success()
 
     def remove_image(self, image_id: str, force: bool = False) -> CommandResult:
-        return True, "OK"
+        return CommandResult.success()
 
     def remove_volume(self, volume_name: str) -> CommandResult:
-        return True, "OK"
+        return CommandResult.success()
 
     def remove_network(self, network_name: str) -> CommandResult:
-        return True, "OK"
+        return CommandResult.success()
 
 
 async def wait_until(predicate, timeout: float = 1.0) -> None:
@@ -130,6 +133,51 @@ class RefreshLoadingIndicatorTests(unittest.IsolatedAsyncioTestCase):
 
             release.set()
             await wait_until(lambda: not indicator.display)
+
+
+class HelpScreenTests(unittest.IsolatedAsyncioTestCase):
+    def test_container_only_actions_matches_container_action_handler(self) -> None:
+        expected = {
+            name.removeprefix("action_")
+            for name in vars(ContainerActionHandler)
+            if name.startswith("action_")
+        }
+        self.assertEqual(_container_only_actions(), expected)
+        # "delete" belongs to ResourceDeletionHandler and applies to every
+        # resource tab -- it must never be classified as container-scoped.
+        self.assertNotIn("delete", _container_only_actions())
+
+    async def test_help_screen_rows_match_bindings_with_correct_scope(self) -> None:
+        app = DockSurfApp(docker=MockDockerService(lambda: EMPTY_SNAPSHOT))
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.action_help()
+            await pilot.pause()
+
+            screen = app.screen_stack[-1]
+            self.assertIsInstance(screen, HelpScreen)
+            table = next(
+                w.content
+                for w in screen.query(Static)
+                if isinstance(getattr(w, "content", None), RichTable)
+            )
+            rows = list(zip(*(list(c.cells) for c in table.columns)))
+
+            for key, action, description in app.BINDINGS:
+                if not description:
+                    continue
+                match = next(r for r in rows if r[1] == description)
+                expected_scope = (
+                    "Container only"
+                    if action in _container_only_actions()
+                    else "Global"
+                )
+                self.assertEqual(match[2], expected_scope, f"key={key} action={action}")
+
+            # Regression: the old hand-maintained frozenset mislabeled
+            # "delete" as container-only even though it applies to every tab.
+            delete_row = next(r for r in rows if r[1] == "Delete")
+            self.assertEqual(delete_row[2], "Global")
 
 
 if __name__ == "__main__":
