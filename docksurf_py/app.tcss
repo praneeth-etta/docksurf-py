@@ -175,6 +175,100 @@ SystemDfScreen Button {
     width: 100%;
 }
 
+InspectScreen {
+    align: center middle;
+    background: $background 60%;
+}
+
+InspectScreen > Vertical {
+    width: 90%;
+    height: 85%;
+    border: double $accent;
+    background: $surface;
+    padding: 1 3;
+}
+
+InspectScreen #inspect-title {
+    text-align: center;
+    width: 100%;
+    margin-bottom: 0;
+    color: $accent;
+    text-style: bold;
+}
+
+InspectScreen #inspect-search {
+    margin: 1 0;
+}
+
+InspectScreen #inspect-view {
+    height: 1fr;
+    border: solid $primary-background-lighten-2;
+}
+
+InspectScreen Button {
+    margin-top: 1;
+    width: 100%;
+}
+
+PruneScreen {
+    align: center middle;
+    background: $background 60%;
+}
+
+PruneScreen > Vertical {
+    width: 50;
+    height: auto;
+    border: double $accent;
+    background: $surface;
+    padding: 1 3;
+}
+
+PruneScreen #prune-title {
+    text-align: center;
+    width: 100%;
+    margin-bottom: 1;
+    color: $accent;
+    text-style: bold;
+}
+
+PruneScreen Button {
+    width: 100%;
+    margin-bottom: 1;
+}
+
+PromptScreen {
+    align: center middle;
+    background: $background 60%;
+}
+
+PromptScreen > Vertical {
+    width: 70;
+    height: auto;
+    border: thick $primary;
+    background: $surface;
+    padding: 1 3;
+}
+
+PromptScreen #prompt-title {
+    text-align: center;
+    width: 100%;
+    margin-bottom: 1;
+}
+
+PromptScreen Label {
+    margin-top: 1;
+}
+
+PromptScreen Horizontal {
+    align: center middle;
+    height: auto;
+    margin-top: 1;
+}
+
+PromptScreen Button {
+    margin: 0 2;
+}
+
 #status-bar {
     dock: bottom;
     margin-bottom: 1; /* Leaves room for the built-in Footer */

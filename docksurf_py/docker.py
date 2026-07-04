@@ -31,6 +31,7 @@ from docksurf_py.models import (
     CommandResult,
     Container,
     ContainerStats,
+    ContainerTop,
     DiskUsageEntry,
     DockerSnapshot,
     HealthProbe,
@@ -829,6 +830,180 @@ class DockerClient:
             lambda sdk: sdk.networks.get(network_name).remove(), "OK"
         )
 
+    def pause_container(self, container_id: str) -> CommandResult:
+        return self._run_management_command(
+            lambda sdk: sdk.containers.get(container_id).pause(), "OK"
+        )
+
+    def unpause_container(self, container_id: str) -> CommandResult:
+        return self._run_management_command(
+            lambda sdk: sdk.containers.get(container_id).unpause(), "OK"
+        )
+
+    def kill_container(self, container_id: str) -> CommandResult:
+        return self._run_management_command(
+            lambda sdk: sdk.containers.get(container_id).kill(), "OK"
+        )
+
+    def prune_containers(self) -> CommandResult:
+        def op(sdk: "docker.DockerClient") -> CommandResult:
+            report = sdk.containers.prune()
+            deleted = report.get("ContainersDeleted") or []
+            reclaimed = report.get("SpaceReclaimed", 0) or 0
+            return CommandResult.success(
+                f"Pruned {len(deleted)} container(s) — "
+                f"reclaimed {format_size(reclaimed)}"
+            )
+
+        return self._run_management_op(op)
+
+    def prune_images(self) -> CommandResult:
+        def op(sdk: "docker.DockerClient") -> CommandResult:
+            report = sdk.images.prune(filters={"dangling": True})
+            deleted = report.get("ImagesDeleted") or []
+            reclaimed = report.get("SpaceReclaimed", 0) or 0
+            return CommandResult.success(
+                f"Pruned {len(deleted)} image(s) — reclaimed {format_size(reclaimed)}"
+            )
+
+        return self._run_management_op(op)
+
+    def prune_volumes(self) -> CommandResult:
+        def op(sdk: "docker.DockerClient") -> CommandResult:
+            report = sdk.volumes.prune()
+            deleted = report.get("VolumesDeleted") or []
+            reclaimed = report.get("SpaceReclaimed", 0) or 0
+            return CommandResult.success(
+                f"Pruned {len(deleted)} volume(s) — reclaimed {format_size(reclaimed)}"
+            )
+
+        return self._run_management_op(op)
+
+    def prune_networks(self) -> CommandResult:
+        def op(sdk: "docker.DockerClient") -> CommandResult:
+            report = sdk.networks.prune()
+            deleted = report.get("NetworksDeleted") or []
+            return CommandResult.success(f"Pruned {len(deleted)} network(s)")
+
+        return self._run_management_op(op)
+
+    def prune_system(self) -> CommandResult:
+        """Sequential system-wide prune: containers, networks, dangling images,
+        then build cache (best-effort — older docker-py/daemons may lack the
+        build-cache prune endpoint).
+
+        Matches `docker system prune` without `--volumes` (the CLI's default):
+        volumes are left untouched since they can hold data the user wants to
+        keep.
+        """
+
+        def op(sdk: "docker.DockerClient") -> CommandResult:
+            total_deleted = 0
+            total_reclaimed = 0
+
+            containers_report = sdk.containers.prune()
+            total_deleted += len(containers_report.get("ContainersDeleted") or [])
+            total_reclaimed += containers_report.get("SpaceReclaimed", 0) or 0
+
+            networks_report = sdk.networks.prune()
+            total_deleted += len(networks_report.get("NetworksDeleted") or [])
+
+            images_report = sdk.images.prune(filters={"dangling": True})
+            total_deleted += len(images_report.get("ImagesDeleted") or [])
+            total_reclaimed += images_report.get("SpaceReclaimed", 0) or 0
+
+            try:
+                build_report = sdk.api.prune_builds()
+                total_reclaimed += build_report.get("SpaceReclaimed", 0) or 0
+            except Exception:
+                logger.debug("Build cache prune unavailable", exc_info=True)
+
+            return CommandResult.success(
+                f"System prune: {total_deleted} item(s) removed — "
+                f"reclaimed {format_size(total_reclaimed)}"
+            )
+
+        return self._run_management_op(op)
+
+    def inspect_resource(self, kind: str, ref: str) -> dict | None:
+        """Full raw attrs for one resource — the `docker inspect` escape hatch.
+
+        `kind` matches `_row_key()`'s first element (container/image/volume/
+        network) so callers can pass a row key straight through.
+        """
+        sdk = self._sdk
+        if not sdk:
+            return None
+        dispatch: dict[str, Callable[[], dict]] = {
+            "container": lambda: sdk.containers.get(ref).attrs,
+            "image": lambda: sdk.images.get(ref).attrs,
+            "volume": lambda: sdk.volumes.get(ref).attrs,
+            "network": lambda: sdk.networks.get(ref).attrs,
+        }
+        getter = dispatch.get(kind)
+        if getter is None:
+            return None
+        try:
+            return getter()
+        except NotFound:
+            logger.warning("Inspect: %s %s not found", kind, ref)
+            return None
+        except (DockerException, requests.exceptions.RequestException) as e:
+            logger.warning("Inspect failed for %s %s: %s", kind, ref, e)
+            return None
+
+    def container_top(self, container_id: str) -> ContainerTop | None:
+        """Running processes for one container (`docker top`) — `None` if the
+        container isn't running or the daemon rejects the request."""
+        if not self._sdk:
+            return None
+        try:
+            raw = self._sdk.containers.get(container_id).top()
+            return ContainerTop(
+                titles=raw.get("Titles", []),
+                processes=raw.get("Processes", []),
+            )
+        except NotFound:
+            logger.warning("Top: container %s not found", container_id)
+            return None
+        except (APIError, DockerException, requests.exceptions.RequestException) as e:
+            logger.warning("Top failed for %s: %s", container_id, e)
+            return None
+
+    def container_cp(self, src: str, dst: str) -> CommandResult:
+        """Copy files in/out of a container (`docker cp <src> <dst>`).
+
+        Third sanctioned subprocess exception (see CLAUDE.md): the SDK only
+        exposes raw tar archives (`get_archive`/`put_archive`) — reproducing
+        `docker cp`'s directory/trailing-slash semantics and safe tar
+        extraction by hand is a large correctness/security surface for a
+        convenience feature.
+        """
+        if shutil.which("docker") is None:
+            logger.error("docker cp aborted — docker CLI not found on PATH")
+            return CommandResult.failure(
+                "docker CLI not found on PATH — cannot copy files",
+                kind=CommandErrorKind.DAEMON_UNREACHABLE,
+            )
+
+        cmd = ["docker", "cp", src, dst]
+        logger.info("Running: %s", " ".join(cmd))
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True)
+        except Exception as e:
+            logger.exception("docker cp failed (%s -> %s)", src, dst)
+            return CommandResult.failure(
+                str(e), kind=CommandErrorKind.DAEMON_UNREACHABLE
+            )
+
+        if result.returncode != 0:
+            msg = (result.stderr or result.stdout or "").strip()
+            msg = msg or f"docker cp exited {result.returncode}"
+            logger.warning("docker cp failed (%s -> %s): %s", src, dst, msg)
+            return CommandResult.failure(msg, kind=CommandErrorKind.UNKNOWN)
+
+        return CommandResult.success(f"Copied {src} → {dst}")
+
     def compose_action(
         self,
         project: str,
@@ -881,11 +1056,14 @@ class DockerClient:
 
     # --- Internal ---
 
-    def _run_management_command(
-        self,
-        action_callable: Callable[["docker.DockerClient"], None],
-        success_msg: str,
+    def _run_management_op(
+        self, op: Callable[["docker.DockerClient"], CommandResult]
     ) -> CommandResult:
+        """Run `op` against the SDK client, classifying any raised exception
+        into a `CommandResult.failure`. `op` builds its own success result —
+        this is the primitive `_run_management_command` and the prune methods
+        (which need to report counts/space reclaimed) both sit on top of.
+        """
         sdk = self._sdk
         if not sdk:
             logger.error("Management command skipped — Docker client not initialized")
@@ -894,9 +1072,7 @@ class DockerClient:
                 kind=CommandErrorKind.DAEMON_UNREACHABLE,
             )
         try:
-            action_callable(sdk)
-            logger.debug("Management command succeeded")
-            return CommandResult.success(success_msg)
+            return op(sdk)
         except NotFound as e:
             logger.warning("Docker resource not found: %s", e)
             return CommandResult.failure(str(e), kind=CommandErrorKind.NOT_FOUND)
@@ -913,6 +1089,18 @@ class DockerClient:
             return CommandResult.failure(
                 str(e), kind=CommandErrorKind.DAEMON_UNREACHABLE
             )
+
+    def _run_management_command(
+        self,
+        action_callable: Callable[["docker.DockerClient"], None],
+        success_msg: str,
+    ) -> CommandResult:
+        def op(sdk: "docker.DockerClient") -> CommandResult:
+            action_callable(sdk)
+            logger.debug("Management command succeeded")
+            return CommandResult.success(success_msg)
+
+        return self._run_management_op(op)
 
 
 if __name__ == "__main__":

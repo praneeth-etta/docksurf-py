@@ -12,6 +12,7 @@ from typing import Any, Callable, Protocol
 
 from textual import on
 from textual.app import App, ComposeResult
+from textual.binding import Binding
 from textual.containers import Horizontal
 from textual.widgets import (
     DataTable,
@@ -26,7 +27,10 @@ from docksurf_py.actions import (
     ComposeActionHandler,
     ContainerActionHandler,
     DeletePlan,
+    InspectHandler,
+    PruneHandler,
     ResourceDeletionHandler,
+    SelectionHandler,
 )
 from docksurf_py.constants import (
     DETAIL_PANE_ID,
@@ -38,7 +42,7 @@ from docksurf_py.constants import (
     TabID,
     TableID,
 )
-from docksurf_py.models import Container, DockerSnapshot
+from docksurf_py.models import CommandResult, Container, DockerSnapshot
 from docksurf_py.observability import LiveStatsController
 from docksurf_py.renderer import (
     DetailPaneRenderer,
@@ -130,20 +134,32 @@ class AppContext(Protocol):
     _current: dict[TabID, list]
     _resource_registry: dict[TabID, ResourceEntry]
     _collapsed_projects: set[str]
+    _marked: dict[TabID, set[tuple[str, str]]]
     is_running: bool  # really a textual.app.App property
 
     def start_refresh(self) -> None: ...
     def _auto_select_first(self) -> None: ...
     def _apply_filter(self, query: str) -> None: ...
     def _rerender_containers(self) -> None: ...
+    def _rerender_active_table(self) -> None: ...
     def _sync_stats(self) -> None: ...
+    def _sync_top(self) -> None: ...
     def _get_focused_container(self) -> Container | None: ...
     def _get_focused_resource(self, tab_id: TabID) -> Any: ...
     def _get_focused_project(self) -> Any: ...
     def _focused_is_project_header(self) -> bool: ...
+    def _row_key(self, item: Any) -> tuple[str, str] | None: ...
+    def _marked_items(self, tab_id: TabID) -> list[Any]: ...
+    def _run_bulk(
+        self,
+        tab_id: TabID,
+        verb: str,
+        jobs: list[tuple[tuple[str, str], str, Callable[[], CommandResult]]],
+    ) -> None: ...
     def action_compose_stop(self) -> None: ...
     def action_compose_start(self) -> None: ...
     def action_compose_restart(self) -> None: ...
+    def action_toggle_group(self) -> None: ...
 
     # These five are really `textual.app.App` methods. DockSurfApp's real
     # MRO includes both `App` and (fictitiously, TYPE_CHECKING-only) this
@@ -166,6 +182,9 @@ class DockSurfApp(
     ContainerActionHandler,
     ComposeActionHandler,
     ResourceDeletionHandler,
+    SelectionHandler,
+    InspectHandler,
+    PruneHandler,
     ResourceSearchController,
     LiveStatsController,
     App,
@@ -184,16 +203,24 @@ class DockSurfApp(
         ("s", "stop_container", "Stop"),
         ("S", "start_container", "Start"),
         ("x", "restart_container", "Restart"),
+        ("p", "pause_container", "Pause/Unpause"),
+        ("K", "kill_container", "Kill"),
         ("e", "exec_container", "Exec"),
+        Binding("E", "exec_custom", "Exec (custom)", show=False),
+        ("i", "inspect", "Inspect"),
         ("d", "delete", "Delete"),
         ("l", "view_logs", "Logs"),
         ("f", "follow_logs", "Pause/Resume"),
         ("c", "clear_logs", "Clear"),
+        Binding("C", "copy_files", "Copy files", show=False),
         ("z", "toggle_log_expand", "Expand Logs"),
         ("u", "compose_up", "Compose Up"),
         ("k", "compose_down", "Compose Down"),
-        ("space", "toggle_group", "Collapse/Expand"),
+        ("t", "container_top", "Top"),
+        ("space", "toggle_mark", "Mark / Collapse"),
         ("w", "system_df", "Disk usage"),
+        ("P", "prune", "Prune"),
+        Binding("escape", "clear_marks", "Clear marks", show=False),
     ]
     CSS_PATH = "app.tcss"
 
@@ -290,11 +317,13 @@ class DockSurfApp(
         if entry is None:
             pane.clear_details()
             self._sync_stats()
+            self._sync_top()
             return
         current = self._current.get(active, [])
         if not current:
             pane.clear_details()
             self._sync_stats()
+            self._sync_top()
             return
         self.query_one(f"#{entry.table_id}", DataTable).move_cursor(row=0)
         try:
@@ -302,6 +331,7 @@ class DockSurfApp(
         except IndexError:
             pane.clear_details()
         self._sync_stats()
+        self._sync_top()
 
     @on(DataTable.RowHighlighted)
     def update_details(self, event: DataTable.RowHighlighted) -> None:
@@ -317,6 +347,7 @@ class DockSurfApp(
         except IndexError:
             pane.clear_details()
         self._sync_stats()
+        self._sync_top()
 
     @on(TabbedContent.TabActivated)
     def clear_on_tab_switch(self) -> None:

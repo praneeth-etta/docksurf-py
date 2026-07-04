@@ -5,17 +5,21 @@ ContainerActionHandler and ResourceDeletionHandler are mixin classes
 that compose into DockSurfApp via Python MRO.
 """
 
+import asyncio
+import json
 import logging
+import shlex
 import shutil
 import subprocess
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 from rich.markup import escape
 from textual import on, work
-from textual.widgets import TabbedContent
+from textual.coordinate import Coordinate
+from textual.widgets import DataTable, TabbedContent
 
-from docksurf_py.constants import DETAIL_PANE_ID, LOG_PANE_ID, TabID
+from docksurf_py.constants import DETAIL_PANE_ID, LOG_PANE_ID, MARK_GLYPH, TabID
 from docksurf_py.models import (
     CommandErrorKind,
     CommandResult,
@@ -25,7 +29,15 @@ from docksurf_py.models import (
     Network,
     Volume,
 )
-from docksurf_py.widgets import ConfirmDialog, DetailPane, LogPane
+from docksurf_py.widgets import (
+    ConfirmDialog,
+    DetailPane,
+    InspectScreen,
+    LogPane,
+    PromptField,
+    PromptScreen,
+    PruneScreen,
+)
 
 if TYPE_CHECKING:
     from docksurf_py.app import AppContext
@@ -51,6 +63,58 @@ def select_exec_shell(
         if probe(shell):
             return shell
     return None
+
+
+def build_exec_argv(
+    container_id: str, command: str, user: str = ""
+) -> list[str] | None:
+    """Build the `docker exec` argv for a custom command/user.
+
+    Returns `None` (caller notifies) if `command` is blank or fails to parse
+    as shell tokens (e.g. unbalanced quotes).
+    """
+    command = command.strip()
+    if not command:
+        return None
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return None
+    if not tokens:
+        return None
+
+    argv = ["docker", "exec", "-it"]
+    if user.strip():
+        argv += ["-u", user.strip()]
+    argv += [container_id, *tokens]
+    return argv
+
+
+def build_cp_paths(c: Container, src: str, dst: str) -> tuple[str, str] | None:
+    """Resolve `PromptScreen` values into a `docker cp` src/dst pair.
+
+    `PromptScreen` is pre-filled with `<name>:` on one side (per the caller);
+    exactly one side must carry that prefix — the other is a plain host path.
+    The container-name prefix is rewritten to the container id, since that's
+    what `docker cp` (and `DockerClient.container_cp`) actually expects.
+    Returns `None` (caller notifies) on blank input or if both/neither side
+    is container-prefixed.
+    """
+    src, dst = src.strip(), dst.strip()
+    if not src or not dst:
+        return None
+
+    prefix = f"{c.name}:"
+    src_is_container = src.startswith(prefix)
+    dst_is_container = dst.startswith(prefix)
+    if src_is_container == dst_is_container:
+        return None
+
+    if src_is_container:
+        src = f"{c.id}:{src[len(prefix) :]}"
+    else:
+        dst = f"{c.id}:{dst[len(prefix) :]}"
+    return src, dst
 
 
 class ContainerActionHandler(_Base):
@@ -110,6 +174,14 @@ class ContainerActionHandler(_Base):
                 self.start_refresh()
 
     def action_stop_container(self) -> None:
+        # Marked containers win over the focused row — bulk stop the set.
+        if self._marked.get(TabID.CONTAINERS):
+            self._run_bulk_container_verb(
+                verb="Stop",
+                command=self.docker.stop_container,
+                include=lambda c: c.running,
+            )
+            return
         # On compose project header -> action on the whole project;
         # on standalone container -> action on the single container.
         if self._focused_is_project_header():
@@ -124,6 +196,13 @@ class ContainerActionHandler(_Base):
         )
 
     def action_start_container(self) -> None:
+        if self._marked.get(TabID.CONTAINERS):
+            self._run_bulk_container_verb(
+                verb="Start",
+                command=self.docker.start_container,
+                include=lambda c: not c.running,
+            )
+            return
         if self._focused_is_project_header():
             self.action_compose_start()
             return
@@ -135,6 +214,35 @@ class ContainerActionHandler(_Base):
             ),
         )
 
+    def _run_bulk_container_verb(
+        self,
+        verb: str,
+        command: Callable[[str], CommandResult],
+        include: Callable[[Container], bool],
+    ) -> None:
+        """Build one bulk job per marked container that passes `include`,
+        then hand off to `SelectionHandler._run_bulk`. Containers excluded
+        by `include` (e.g. already stopped) are silently dropped from the
+        batch — same tolerance as the single-container guard messages."""
+
+        def bound(container_id: str) -> Callable[[], CommandResult]:
+            return lambda: command(container_id)
+
+        jobs: list[tuple[tuple[str, str], str, Callable[[], CommandResult]]] = []
+        for c in self._marked_items(TabID.CONTAINERS):
+            key = self._row_key(c)
+            if include(c) and key is not None:
+                jobs.append((key, c.name, bound(c.id)))
+
+        if not jobs:
+            self.notify(
+                f"No marked containers eligible to {verb.lower()}", severity="warning"
+            )
+            self._marked[TabID.CONTAINERS] = set()
+            self._rerender_active_table()
+            return
+        self._run_bulk(TabID.CONTAINERS, verb, jobs)
+
     def action_restart_container(self) -> None:
         if self._focused_is_project_header():
             self.action_compose_restart()
@@ -144,20 +252,78 @@ class ContainerActionHandler(_Base):
             success_msg=lambda c: f"Restarted {escape(c.name)}",
         )
 
-    def action_exec_container(self) -> None:
+    def action_pause_container(self) -> None:
+        """Toggle pause: paused -> unpause, running -> pause.
+
+        Container-only (no project-header handling, like exec) — pausing a
+        whole Compose project isn't a `docker compose` verb.
+        """
         c = self._get_focused_container()
         if c is None:
             self.notify(self._CONTAINER_TAB_HINT, severity="warning")
             return
+        if c.state == "paused":
+            self._run_on_focused_container(
+                command=self.docker.unpause_container,
+                success_msg=lambda c: f"Resumed {escape(c.name)}",
+            )
+        elif c.running:
+            self._run_on_focused_container(
+                command=self.docker.pause_container,
+                success_msg=lambda c: f"Paused {escape(c.name)}",
+            )
+        else:
+            self.notify(f"{escape(c.name)} is not running", severity="information")
+
+    def action_kill_container(self) -> None:
+        """SIGKILL the focused container — the escape hatch when `stop` hangs
+        on its 10s timeout. No confirmation, matching `docker kill`."""
+        self._run_on_focused_container(
+            command=self.docker.kill_container,
+            success_msg=lambda c: f"Killed {escape(c.name)}",
+            guard=lambda c: (
+                f"{escape(c.name)} is not running" if not c.running else None
+            ),
+        )
+
+    def _exec_preflight(self) -> Container | None:
+        """Shared guards for `e`/`E`: a focused, running container and the
+        `docker` CLI on PATH. Notifies and returns `None` on any failure."""
+        c = self._get_focused_container()
+        if c is None:
+            self.notify(self._CONTAINER_TAB_HINT, severity="warning")
+            return None
         if not c.running:
             self.notify(f"{escape(c.name)} is not running", severity="warning")
-            return
+            return None
         if shutil.which("docker") is None:
             logger.error("Exec aborted — docker CLI not found on PATH")
             self.notify(
                 "docker CLI not found on PATH — cannot open exec shell",
                 severity="error",
             )
+            return None
+        return c
+
+    def _run_interactive_exec(self, c: Container, argv: list[str]) -> None:
+        """Suspend the TUI and run an interactive `docker exec` session."""
+        logger.info("Exec argv=%s in container %s (%s)", argv, c.name, c.id)
+        with self.suspend():
+            result = subprocess.run(argv)
+
+        if result.returncode != 0:
+            logger.warning(
+                "Exec session for %s exited with code %d", c.name, result.returncode
+            )
+            self.notify(
+                f"Exec session for {escape(c.name)} exited with code "
+                f"{result.returncode}",
+                severity="warning",
+            )
+
+    def action_exec_container(self) -> None:
+        c = self._exec_preflight()
+        if c is None:
             return
 
         shell = select_exec_shell(
@@ -172,22 +338,43 @@ class ContainerActionHandler(_Base):
             )
             return
 
-        logger.info("Exec shell (%s) in container %s (%s)", shell, c.name, c.id)
-        with self.suspend():
-            result = subprocess.run(["docker", "exec", "-it", c.id, shell])
+        self._run_interactive_exec(c, ["docker", "exec", "-it", c.id, shell])
 
-        if result.returncode != 0:
-            logger.warning(
-                "Exec session for %s (%s) exited with code %d",
-                c.name,
-                shell,
-                result.returncode,
+    @work
+    async def action_exec_custom(self) -> None:
+        """`E` — prompt for a custom command and optional user before exec'ing.
+
+        Pre-fills the command field with the same auto-detected shell `e`
+        would use, so Enter-Enter reproduces `e`'s behavior.
+        """
+        c = self._exec_preflight()
+        if c is None:
+            return
+
+        default_shell = await asyncio.to_thread(
+            select_exec_shell,
+            EXEC_SHELL_CANDIDATES,
+            lambda sh: self._container_has_shell(c.id, sh),
+        )
+        values = await self.push_screen_wait(
+            PromptScreen(
+                f"Exec in {escape(c.name)}",
+                [
+                    PromptField("Command", value=default_shell or "sh"),
+                    PromptField("User (uid or name, optional)"),
+                ],
             )
-            self.notify(
-                f"Exec session for {escape(c.name)} exited with code "
-                f"{result.returncode}",
-                severity="warning",
-            )
+        )
+        if values is None:
+            logger.debug("Custom exec cancelled by user")
+            return
+
+        command, user = values
+        argv = build_exec_argv(c.id, command, user)
+        if argv is None:
+            self.notify("Enter a command to run", severity="warning")
+            return
+        self._run_interactive_exec(c, argv)
 
     @staticmethod
     def _container_has_shell(container_id: str, shell: str) -> bool:
@@ -196,6 +383,63 @@ class ContainerActionHandler(_Base):
             capture_output=True,
         )
         return probe.returncode == 0
+
+    @work
+    async def action_copy_files(self) -> None:
+        """`C` — `docker cp` in/out of a container via a path prompt.
+
+        Unlike exec, `docker cp` works on a stopped container too, so there's
+        no running guard here — just a focused container.
+        """
+        c = self._get_focused_container()
+        if c is None:
+            self.notify(self._CONTAINER_TAB_HINT, severity="warning")
+            return
+
+        values = await self.push_screen_wait(
+            PromptScreen(
+                f"Copy files — {escape(c.name)}",
+                [
+                    PromptField(
+                        f"Source (prefix with '{c.name}:' for the container side)",
+                        value=f"{c.name}:",
+                    ),
+                    PromptField(
+                        f"Destination (prefix with '{c.name}:' for the container side)",
+                        value=".",
+                    ),
+                ],
+            )
+        )
+        if values is None:
+            logger.debug("Copy files cancelled by user")
+            return
+
+        resolved = build_cp_paths(c, values[0], values[1])
+        if resolved is None:
+            self.notify(
+                f"Prefix exactly one side with '{escape(c.name)}:' — the "
+                "other is a plain host path",
+                severity="warning",
+            )
+            return
+
+        src, dst = resolved
+        self.notify(f"Copying {escape(src)} → {escape(dst)}…")
+        self._execute_copy(src, dst)
+
+    @work(thread=True)
+    def _execute_copy(self, src: str, dst: str) -> None:
+        result = self.docker.container_cp(src, dst)
+        self.call_from_thread(self._handle_copy_result, result)
+
+    def _handle_copy_result(self, result: CommandResult) -> None:
+        if result.ok:
+            logger.info("%s", result.message)
+            self.notify(result.message)
+        else:
+            logger.warning("Copy failed: %s", result.message)
+            self.notify(f"Error: {result.message}", severity="error")
 
     def action_view_logs(self) -> None:
         log_pane = self.query_one(f"#{LOG_PANE_ID}", LogPane)
@@ -460,6 +704,10 @@ class ResourceDeletionHandler(_Base):
         if entry is None:
             return
 
+        if self._marked.get(active):
+            await self._bulk_delete(active)
+            return
+
         item = self._get_focused_resource(active)
         if item is None:
             self.notify(f"No {entry.label} selected", severity="warning")
@@ -471,3 +719,279 @@ class ResourceDeletionHandler(_Base):
 
         confirmed = await self.push_screen_wait(ConfirmDialog(plan.confirm_message))
         self._apply_if_confirmed(confirmed, plan.command, plan.success_message)
+
+    async def _bulk_delete(self, tab_id: TabID) -> None:
+        """Delete every marked resource on `tab_id` behind one confirm dialog.
+
+        Reuses each item's existing `plan_delete` for its confirm wording/
+        force-flag logic; items whose plan is `None` (in-use volume, built-in
+        network) keep their guard-notify from `plan_delete` and are silently
+        excluded from the batch.
+        """
+        entry = self._resource_registry[tab_id]
+        jobs: list[tuple[tuple[str, str], str, Callable[[], CommandResult]]] = []
+        names: list[str] = []
+        for item in self._marked_items(tab_id):
+            key = self._row_key(item)
+            plan = entry.plan_delete(item)
+            if key is None or plan is None:
+                continue
+            name = _display_name(item)
+            jobs.append((key, name, plan.command))
+            names.append(name)
+
+        if not jobs:
+            self.notify(
+                f"No marked {entry.label}s eligible to delete", severity="warning"
+            )
+            self._marked[tab_id] = set()
+            self._rerender_active_table()
+            return
+
+        preview = ", ".join(escape(n) for n in names[:8])
+        if len(names) > 8:
+            preview += f", and {len(names) - 8} more"
+        confirmed = await self.push_screen_wait(
+            ConfirmDialog(f"Delete {len(names)} {entry.label}(s)? {preview}")
+        )
+        if not confirmed:
+            logger.debug("Bulk delete cancelled by user")
+            return
+        self._run_bulk(tab_id, "Deleted", jobs)
+
+
+def _display_name(item: Any) -> str:
+    """Human-readable name for an inspect-modal title/notification."""
+    if isinstance(item, Image):
+        return f"{item.repository}:{item.tag}"
+    return getattr(item, "name", str(item))
+
+
+class InspectHandler(_Base):
+    """The `docker inspect` escape hatch — full raw JSON for any resource on
+    any tab, in a scrollable/searchable modal (see `InspectScreen`)."""
+
+    def action_inspect(self) -> None:
+        active = self.query_one(TabbedContent).active
+        item = self._get_focused_resource(active)
+        if item is None:
+            self.notify("Nothing selected to inspect", severity="warning")
+            return
+        if isinstance(item, ComposeProject):
+            self.notify(
+                "Select a container within the project to inspect",
+                severity="warning",
+            )
+            return
+        key = self._row_key(item)
+        if key is None:
+            self.notify("Nothing selected to inspect", severity="warning")
+            return
+        kind, ref = key
+        self._execute_inspect(kind, ref, _display_name(item))
+
+    @work(thread=True)
+    def _execute_inspect(self, kind: str, ref: str, name: str) -> None:
+        attrs = self.docker.inspect_resource(kind, ref)
+        if attrs is None:
+            self.call_from_thread(
+                self.notify,
+                f"Could not inspect {kind} {escape(name)}",
+                severity="error",
+            )
+            return
+        text = json.dumps(attrs, indent=2, default=str)
+        self.call_from_thread(
+            self.push_screen, InspectScreen(f"Inspect — {kind}: {name}", text)
+        )
+
+
+# target -> (confirm message, DockerClient method name)
+_PRUNE_SPECS: dict[str, tuple[str, str]] = {
+    "containers": ("Remove all STOPPED containers?", "prune_containers"),
+    "images": ("Remove all dangling (untagged) images?", "prune_images"),
+    "volumes": ("Remove all unused anonymous volumes?", "prune_volumes"),
+    "networks": ("Remove all unused networks?", "prune_networks"),
+    "system": (
+        "System prune: removes stopped containers, unused networks, "
+        "dangling images, and build cache where supported. Continue?",
+        "prune_system",
+    ),
+}
+
+
+class PruneHandler(_Base):
+    """`docker system prune`-family cleanup: a target picker, then a confirm
+    dialog, before anything is actually removed — see `PruneScreen`."""
+
+    @work
+    async def action_prune(self) -> None:
+        target = await self.push_screen_wait(PruneScreen())
+        if target is None:
+            logger.debug("Prune cancelled — no target chosen")
+            return
+
+        confirm_message, method_name = _PRUNE_SPECS[target]
+        confirmed = await self.push_screen_wait(ConfirmDialog(confirm_message))
+        if not confirmed:
+            logger.debug("Prune cancelled by user")
+            return
+
+        self.notify("Pruning…")
+        self._execute_prune(method_name)
+
+    @work(thread=True)
+    def _execute_prune(self, method_name: str) -> None:
+        method: Callable[[], CommandResult] = getattr(self.docker, method_name)
+        result = method()
+        self.call_from_thread(self._handle_prune_result, result)
+
+    def _handle_prune_result(self, result: CommandResult) -> None:
+        if result.ok:
+            logger.info("%s", result.message)
+            self.notify(result.message)
+            self.start_refresh()
+        else:
+            logger.warning("Prune failed: %s", result.message)
+            self.notify(f"Error: {result.message}", severity="error")
+
+
+class SelectionHandler(_Base):
+    """Multi-select marking and the shared bulk-execution machinery.
+
+    Marks are keyed by `_row_key` (kind, id) tuples in `self._marked[tab]`
+    (per-tab sets, initialized in `TableRenderer.setup_tables`) so they
+    survive refresh/filter/collapse — `SnapshotManager._apply_snapshot` prunes
+    vanished keys and every populate method re-renders the mark glyph on each
+    repaint. `ContainerActionHandler`/`ResourceDeletionHandler` build the
+    per-domain job lists (what to run, and its guard/plan logic); this mixin
+    only knows how to toggle a mark and run a batch of jobs sequentially.
+    """
+
+    def action_toggle_mark(self) -> None:
+        active = self.query_one(TabbedContent).active
+        if self._resource_registry.get(active) is None:
+            return
+        # A project header has no mark of its own — space still collapses it.
+        if self._focused_is_project_header():
+            self.action_toggle_group()
+            return
+        item = self._get_focused_resource(active)
+        if item is None:
+            return
+        key = self._row_key(item)
+        if key is None:
+            return
+
+        table_id = self._resource_registry[active].table_id
+        table = self.query_one(f"#{table_id}", DataTable)
+        row = table.cursor_row
+        if row is None:
+            return
+        marked = self._marked[active]
+        if key in marked:
+            marked.discard(key)
+        else:
+            marked.add(key)
+        table.update_cell_at(Coordinate(row, 0), MARK_GLYPH if key in marked else "")
+
+        # Advance the cursor — mark-and-move, k9s-style rapid selection.
+        if row + 1 < table.row_count:
+            table.move_cursor(row=row + 1)
+
+    def action_clear_marks(self) -> None:
+        active = self.query_one(TabbedContent).active
+        if not self._marked.get(active):
+            return
+        self._marked[active].clear()
+        self._rerender_active_table()
+
+    def _marked_items(self, tab_id: TabID) -> list[Any]:
+        """Resolve a tab's marked keys back to live objects from the snapshot."""
+        if not self.snapshot:
+            return []
+        entry = self._resource_registry.get(tab_id)
+        keys = self._marked.get(tab_id)
+        if entry is None or not keys:
+            return []
+        return [
+            item
+            for item in entry.snapshot_items(self.snapshot)
+            if self._row_key(item) in keys
+        ]
+
+    def _run_bulk(
+        self,
+        tab_id: TabID,
+        verb: str,
+        jobs: list[tuple[tuple[str, str], str, Callable[[], CommandResult]]],
+    ) -> None:
+        """Protocol-facing entry point for `ContainerActionHandler`/
+        `ResourceDeletionHandler` — dispatches to the threaded worker below.
+
+        Kept separate from `_execute_bulk` because `@work` gives a decorated
+        method a Textual-generated wrapper signature at runtime, which mypy
+        rejects as an incompatible override of the same name declared in
+        `AppContext`. This thin, undecorated method is what the Protocol
+        declares instead.
+        """
+        self._execute_bulk(tab_id, verb, jobs)
+
+    @work(thread=True)
+    def _execute_bulk(
+        self,
+        tab_id: TabID,
+        verb: str,
+        jobs: list[tuple[tuple[str, str], str, Callable[[], CommandResult]]],
+    ) -> None:
+        """Run each (key, name, command) job sequentially and summarize.
+
+        Sequential, not parallel — these are direct Docker API/CLI calls, and
+        running them one at a time keeps error attribution unambiguous (which
+        job failed) without adding a thread pool for what's normally a
+        handful of items.
+        """
+        ok_count = 0
+        failures: list[tuple[str, str]] = []
+        executed_keys: set[tuple[str, str]] = set()
+        for key, name, command in jobs:
+            result = command()
+            executed_keys.add(key)
+            if result.ok:
+                ok_count += 1
+            else:
+                failures.append((name, result.message))
+        self.call_from_thread(
+            self._handle_bulk_result,
+            tab_id,
+            executed_keys,
+            verb,
+            ok_count,
+            len(jobs),
+            failures,
+        )
+
+    def _handle_bulk_result(
+        self,
+        tab_id: TabID,
+        executed_keys: set[tuple[str, str]],
+        verb: str,
+        ok_count: int,
+        total: int,
+        failures: list[tuple[str, str]],
+    ) -> None:
+        if failures:
+            shown = ", ".join(f"{escape(n)} ({m})" for n, m in failures[:3])
+            more = f", +{len(failures) - 3} more" if len(failures) > 3 else ""
+            logger.warning(
+                "Bulk %s: %d/%d failed — %s%s", verb, len(failures), total, shown, more
+            )
+            self.notify(
+                f"{verb} {ok_count}/{total} — failed: {shown}{more}",
+                severity="error",
+            )
+        else:
+            logger.info("Bulk %s: %d/%d succeeded", verb, ok_count, total)
+            self.notify(f"{verb} {ok_count}/{total}")
+        self._marked[tab_id] -= executed_keys
+        self.start_refresh()

@@ -9,6 +9,7 @@ All components here are intentionally "dumb":
 
 import re
 import threading
+from dataclasses import dataclass
 from typing import Callable, Iterator, Protocol
 
 from rich.markup import escape
@@ -36,10 +37,17 @@ from docksurf_py.constants import (
     BTN_CANCEL_ID,
     BTN_CONFIRM_ID,
     BTN_EXPAND_ID,
+    BTN_INSPECT_CLOSE_ID,
+    BTN_PROMPT_CANCEL_ID,
+    BTN_PROMPT_OK_ID,
+    BTN_PRUNE_CANCEL_ID,
+    INSPECT_SEARCH_ID,
+    INSPECT_VIEW_ID,
     LOG_PANE_HEADER_ID,
     LOG_PANE_SEARCH_ID,
     LOG_PANE_TOOLBAR_ID,
     LOG_PANE_VIEW_ID,
+    PRUNE_TARGETS,
     SafeMarkup,
 )
 
@@ -51,29 +59,36 @@ class ContainerTable(DataTable):
         Binding("s", "stop_container", "Stop"),
         Binding("S", "start_container", "Start"),
         Binding("x", "restart_container", "Restart"),
+        Binding("p", "pause_container", "Pause/Unpause"),
+        Binding("K", "kill_container", "Kill"),
         Binding("e", "exec_container", "Exec"),
+        Binding("E", "exec_custom", "Exec (custom)", show=False),
+        Binding("C", "copy_files", "Copy files", show=False),
         Binding("l", "view_logs", "Logs (toggle)"),
         Binding("f", "follow_logs", "Follow"),
         Binding("z", "toggle_log_expand", "Expand Logs", show=False),
         Binding("d", "delete", "Delete"),
         Binding("u", "compose_up", "Compose Up"),
         Binding("k", "compose_down", "Compose Down"),
-        Binding("space", "toggle_group", "Collapse/Expand", show=False),
+        Binding("t", "container_top", "Top"),
+        Binding("space", "toggle_mark", "Mark / Collapse", show=False),
     ]
 
 
 class DetailPane(VerticalScroll):
     """A custom container that displays a key-value table and collapsible extras.
 
-    The `_stats_panel` region shows live resource usage for the selected running
-    container; it updates independently of `update_details` (which rebuilds the
-    main panel + collapsibles) so streaming stats don't reset the collapsibles.
-    The live-stats renderable is built by the controller, keeping this widget
-    display-only (no Docker/model imports).
+    The `_stats_panel` and `_top_panel` regions show live resource usage and
+    (on-demand) running processes for the selected container; both update
+    independently of `update_details` (which rebuilds the main panel +
+    collapsibles) so neither resets the other or the collapsibles. Both
+    renderables are built by the controller, keeping this widget display-only
+    (no Docker/model imports).
     """
 
     _panel: Static
     _stats_panel: Static
+    _top_panel: Static
     _env_collapsible: "Collapsible | None" = None
     _health_collapsible: "Collapsible | None" = None
 
@@ -84,12 +99,20 @@ class DetailPane(VerticalScroll):
         yield self._panel
         self._stats_panel = Static("")
         yield self._stats_panel
+        self._top_panel = Static("")
+        yield self._top_panel
 
     def update_live_stats(self, content) -> None:
         self._stats_panel.update(content)
 
     def clear_live_stats(self) -> None:
         self._stats_panel.update("")
+
+    def update_processes(self, content) -> None:
+        self._top_panel.update(content)
+
+    def clear_processes(self) -> None:
+        self._top_panel.update("")
 
     def update_details(
         self,
@@ -139,6 +162,7 @@ class DetailPane(VerticalScroll):
     def clear_details(self) -> None:
         self._panel.update(Panel("Select an item to view details.", border_style="dim"))
         self._stats_panel.update("")
+        self._top_panel.update("")
         if self._env_collapsible is not None:
             self._env_collapsible.remove()
             self._env_collapsible = None
@@ -418,6 +442,9 @@ class HelpScreen(ModalScreen):
 
     def on_key(self, event) -> None:
         if event.key in ("escape", "question_mark"):
+            # Stop the event — otherwise it bubbles to the app's global "?"
+            # binding after dismiss() and immediately reopens the screen.
+            event.stop()
             self.dismiss()
 
     def compose(self) -> ComposeResult:
@@ -471,17 +498,216 @@ class SystemDfScreen(ModalScreen):
 
     def on_key(self, event) -> None:
         if event.key in ("escape", "w"):
+            # Stop the event — otherwise it bubbles to the app's global "w"
+            # binding after dismiss() and immediately reopens the screen.
+            event.stop()
             self.dismiss()
 
     def compose(self) -> ComposeResult:
         with Vertical():
-            yield Label("[b]Disk usage — docker system df[/b]", id="df-title")
+            yield Label("[b]Disk usage[/b]", id="df-title")
             yield Static(self._content)
             yield Button("Close", variant="primary", id="df-close")
 
     @on(Button.Pressed, "#df-close")
     def _close(self) -> None:
         self.dismiss()
+
+
+class InspectScreen(ModalScreen):
+    """Scrollable, searchable `docker inspect`-style JSON viewer.
+
+    Display-only: the caller passes the already-formatted JSON text (built by
+    the controller from `DockerClient.inspect_resource`), keeping this widget
+    free of Docker/model imports — same convention as `SystemDfScreen`. The
+    filter reuses `LogPane`'s line-filter idea (only matching lines shown,
+    term highlighted via the shared `_highlight_match`) since JSON dumps can
+    be long. `/` opens the filter, Escape closes the filter then the screen,
+    and `i` — the key that opened this screen — closes it outright as long as
+    the filter isn't the focused widget (so typing "i" into the filter just
+    types "i").
+    """
+
+    def __init__(self, title: str, text: str) -> None:
+        super().__init__()
+        self._title = title
+        self._lines = text.splitlines()
+        self._filter = ""
+
+    def compose(self) -> ComposeResult:
+        with Vertical():
+            yield Label(f"[b]{escape(self._title)}[/b]", id="inspect-title")
+            yield Input(placeholder="Filter... (Esc to clear)", id=INSPECT_SEARCH_ID)
+            yield RichLog(id=INSPECT_VIEW_ID, markup=True, highlight=False)
+            yield Button("Close", variant="primary", id=BTN_INSPECT_CLOSE_ID)
+
+    def on_mount(self) -> None:
+        self.query_one(f"#{INSPECT_SEARCH_ID}", Input).display = False
+        self._render_lines()
+        # A freshly-pushed ModalScreen auto-focuses its first focusable
+        # descendant, which would otherwise be the (hidden) filter Input —
+        # swallowing the "/" keypress as text instead of opening the filter.
+        self.query_one(f"#{INSPECT_VIEW_ID}", RichLog).focus()
+
+    def _render_lines(self) -> None:
+        log_view = self.query_one(f"#{INSPECT_VIEW_ID}", RichLog)
+        log_view.clear()
+        term = self._filter
+        for line in self._lines:
+            if not term or term.lower() in line.lower():
+                log_view.write(_highlight_match(line, term))
+
+    @on(Input.Changed, f"#{INSPECT_SEARCH_ID}")
+    def _on_filter_changed(self, event: Input.Changed) -> None:
+        self._filter = event.value
+        self._render_lines()
+
+    @on(Input.Submitted, f"#{INSPECT_SEARCH_ID}")
+    def _on_filter_submitted(self, event: Input.Submitted) -> None:
+        self.query_one(f"#{INSPECT_VIEW_ID}", RichLog).focus()
+
+    def _close_search(self, search_bar: Input) -> None:
+        search_bar.display = False
+        search_bar.value = ""
+        self._filter = ""
+        self._render_lines()
+
+    def on_key(self, event) -> None:
+        search_bar = self.query_one(f"#{INSPECT_SEARCH_ID}", Input)
+        if event.key == "slash" and not search_bar.display:
+            event.stop()
+            search_bar.display = True
+            search_bar.focus()
+        elif event.key == "escape":
+            event.stop()
+            if search_bar.display:
+                self._close_search(search_bar)
+            else:
+                self.dismiss()
+        elif event.key == "i" and not search_bar.has_focus:
+            event.stop()
+            self.dismiss()
+
+    @on(Button.Pressed, f"#{BTN_INSPECT_CLOSE_ID}")
+    def _close(self) -> None:
+        self.dismiss()
+
+
+class PruneScreen(ModalScreen):
+    """Prune-target picker — dismisses with the chosen target key or `None`.
+
+    One button per target (stopped containers / dangling images / unused
+    volumes / unused networks / system-wide), plus Cancel. Digits 1-5 are
+    shortcuts matching button order; Escape cancels. This screen only picks
+    *what* to prune — the confirm dialog and the actual pruning happen
+    afterward, driven by the caller.
+    """
+
+    _LABELS = {
+        "containers": "1. Stopped containers",
+        "images": "2. Dangling images",
+        "volumes": "3. Unused volumes",
+        "networks": "4. Unused networks",
+        "system": "5. System-wide prune",
+    }
+
+    def compose(self) -> ComposeResult:
+        with Vertical():
+            yield Label("[b]Prune[/b]", id="prune-title")
+            for target in PRUNE_TARGETS:
+                yield Button(self._LABELS[target], id=f"prune-{target}")
+            yield Button("Cancel", variant="default", id=BTN_PRUNE_CANCEL_ID)
+
+    def on_key(self, event) -> None:
+        if event.key == "escape":
+            event.stop()
+            self.dismiss(None)
+            return
+        if event.key.isdigit():
+            index = int(event.key) - 1
+            if 0 <= index < len(PRUNE_TARGETS):
+                event.stop()
+                self.dismiss(PRUNE_TARGETS[index])
+
+    @on(Button.Pressed)
+    def _on_button(self, event: Button.Pressed) -> None:
+        button_id = event.button.id or ""
+        if button_id == BTN_PRUNE_CANCEL_ID:
+            self.dismiss(None)
+            return
+        target = button_id.removeprefix("prune-")
+        if target in PRUNE_TARGETS:
+            self.dismiss(target)
+
+
+@dataclass(frozen=True)
+class PromptField:
+    """One labeled text input in a `PromptScreen`."""
+
+    label: str
+    value: str = ""
+    placeholder: str = ""
+
+
+class PromptScreen(ModalScreen):
+    """A small multi-field text-input modal.
+
+    One `Label` + `Input` per field, pre-filled from `PromptField.value`.
+    Enter on any field but the last moves focus to the next one; Enter on the
+    last field (or the OK button) dismisses with `[input.value, ...]` in
+    field order. Escape or Cancel dismisses with `None`.
+    """
+
+    def __init__(self, title: str, fields: list[PromptField]) -> None:
+        super().__init__()
+        self._title = title
+        self._fields = fields
+        self._inputs: list[Input] = []
+
+    def compose(self) -> ComposeResult:
+        with Vertical():
+            yield Label(f"[b]{escape(self._title)}[/b]", id="prompt-title")
+            for i, field in enumerate(self._fields):
+                yield Label(field.label)
+                yield Input(
+                    value=field.value,
+                    placeholder=field.placeholder,
+                    id=f"prompt-input-{i}",
+                )
+            with Horizontal():
+                yield Button("OK", variant="primary", id=BTN_PROMPT_OK_ID)
+                yield Button("Cancel", variant="default", id=BTN_PROMPT_CANCEL_ID)
+
+    def on_mount(self) -> None:
+        self._inputs = list(self.query(Input))
+        if self._inputs:
+            self._inputs[0].focus()
+
+    def _submit(self) -> None:
+        self.dismiss([i.value for i in self._inputs])
+
+    @on(Input.Submitted)
+    def _on_input_submitted(self, event: Input.Submitted) -> None:
+        if not self._inputs:
+            return
+        if event.input is self._inputs[-1]:
+            self._submit()
+        else:
+            idx = self._inputs.index(event.input)
+            self._inputs[idx + 1].focus()
+
+    @on(Button.Pressed, f"#{BTN_PROMPT_OK_ID}")
+    def _on_ok(self) -> None:
+        self._submit()
+
+    @on(Button.Pressed, f"#{BTN_PROMPT_CANCEL_ID}")
+    def _on_cancel(self) -> None:
+        self.dismiss(None)
+
+    def on_key(self, event) -> None:
+        if event.key == "escape":
+            event.stop()
+            self.dismiss(None)
 
 
 class StatusBar(Static):

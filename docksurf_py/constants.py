@@ -24,6 +24,24 @@ LOG_PANE_TOOLBAR_ID = "log-pane-toolbar"
 LOG_PANE_SEARCH_ID = "log-pane-search"
 BTN_EXPAND_ID = "expand-btn"
 
+# InspectScreen widget IDs
+INSPECT_VIEW_ID = "inspect-view"
+INSPECT_SEARCH_ID = "inspect-search"
+BTN_INSPECT_CLOSE_ID = "inspect-close"
+
+# Prune target keys shared between PruneScreen (widgets.py) and PruneHandler
+# (actions.py) — dismissing PruneScreen with one of these selects the
+# matching `DockerClient.prune_*` method. Also doubles as each target
+# button's ID suffix ("prune-<target>").
+PRUNE_TARGETS: tuple[str, ...] = (
+    "containers",
+    "images",
+    "volumes",
+    "networks",
+    "system",
+)
+BTN_PRUNE_CANCEL_ID = "prune-cancel"
+
 DETAIL_PANE_ID = "detail-pane"
 SEARCH_BAR_ID = "search-bar"
 STATUS_BAR_ID = "status-bar"
@@ -33,6 +51,10 @@ REFRESH_LOADING_ID = "refresh-loading"
 # Confirm-dialog button IDs
 BTN_CONFIRM_ID = "confirm"
 BTN_CANCEL_ID = "cancel"
+
+# PromptScreen button IDs
+BTN_PROMPT_OK_ID = "prompt-ok"
+BTN_PROMPT_CANCEL_ID = "prompt-cancel"
 
 
 STATUS_GREEN = "green"
@@ -71,3 +93,9 @@ def markup_red(text: str) -> SafeMarkup:
 
 def markup_yellow(text: str) -> SafeMarkup:
     return SafeMarkup(f"[{STATUS_YELLOW}]{text}[/]")
+
+
+# Multi-select mark glyph — the leading-column cell for a marked row. Shared
+# between renderer.py (row population) and actions.py (single-cell update on
+# toggle) so both draw the same glyph without one importing the other.
+MARK_GLYPH = SafeMarkup("[bold cyan]●[/]")

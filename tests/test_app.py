@@ -2,9 +2,10 @@ import asyncio
 import threading
 import unittest
 from typing import Callable
+from unittest.mock import patch
 
 from rich.table import Table as RichTable
-from textual.widgets import DataTable, LoadingIndicator, Static
+from textual.widgets import DataTable, Input, LoadingIndicator, Static, TabbedContent
 
 from docksurf_py.actions import ContainerActionHandler
 from docksurf_py.app import (
@@ -19,10 +20,18 @@ from docksurf_py.models import (
     CommandResult,
     ComposeProject,
     Container,
+    ContainerTop,
     DockerSnapshot,
+    Image,
     SystemDf,
 )
-from docksurf_py.widgets import HelpScreen
+from docksurf_py.widgets import (
+    ConfirmDialog,
+    HelpScreen,
+    InspectScreen,
+    PromptScreen,
+    PruneScreen,
+)
 from tests.test_compose import make_container
 
 EMPTY_SNAPSHOT = DockerSnapshot([], [], [], [])
@@ -40,6 +49,9 @@ class MockDockerService:
     def __init__(self, fetch_fn: Callable[[], DockerSnapshot]) -> None:
         self._fetch_fn = fetch_fn
         self.connection = _CONNECTED_STATE
+        # Recorded (method_name, *args) tuples for every write call — lets
+        # bulk/prune tests assert who was actually invoked.
+        self.calls: list[tuple] = []
 
     @property
     def is_connected(self) -> bool:
@@ -66,28 +78,80 @@ class MockDockerService:
     def compose_action(
         self, project, verb, config_files="", working_dir=""
     ) -> CommandResult:
+        self.calls.append(("compose_action", project, verb))
         return CommandResult.success()
 
     def stop_container(self, container_id: str) -> CommandResult:
+        self.calls.append(("stop_container", container_id))
         return CommandResult.success()
 
     def start_container(self, container_id: str) -> CommandResult:
+        self.calls.append(("start_container", container_id))
         return CommandResult.success()
 
     def restart_container(self, container_id: str) -> CommandResult:
+        self.calls.append(("restart_container", container_id))
         return CommandResult.success()
 
     def remove_container(self, container_id: str, force: bool = False) -> CommandResult:
+        self.calls.append(("remove_container", container_id))
         return CommandResult.success()
 
     def remove_image(self, image_id: str, force: bool = False) -> CommandResult:
+        self.calls.append(("remove_image", image_id))
         return CommandResult.success()
 
     def remove_volume(self, volume_name: str) -> CommandResult:
+        self.calls.append(("remove_volume", volume_name))
         return CommandResult.success()
 
     def remove_network(self, network_name: str) -> CommandResult:
+        self.calls.append(("remove_network", network_name))
         return CommandResult.success()
+
+    def pause_container(self, container_id: str) -> CommandResult:
+        self.calls.append(("pause_container", container_id))
+        return CommandResult.success()
+
+    def unpause_container(self, container_id: str) -> CommandResult:
+        self.calls.append(("unpause_container", container_id))
+        return CommandResult.success()
+
+    def kill_container(self, container_id: str) -> CommandResult:
+        self.calls.append(("kill_container", container_id))
+        return CommandResult.success()
+
+    def prune_containers(self) -> CommandResult:
+        self.calls.append(("prune_containers",))
+        return CommandResult.success("Pruned 0 container(s) — reclaimed 0B")
+
+    def prune_images(self) -> CommandResult:
+        self.calls.append(("prune_images",))
+        return CommandResult.success("Pruned 0 image(s) — reclaimed 0B")
+
+    def prune_volumes(self) -> CommandResult:
+        self.calls.append(("prune_volumes",))
+        return CommandResult.success("Pruned 0 volume(s) — reclaimed 0B")
+
+    def prune_networks(self) -> CommandResult:
+        self.calls.append(("prune_networks",))
+        return CommandResult.success("Pruned 0 network(s)")
+
+    def prune_system(self) -> CommandResult:
+        self.calls.append(("prune_system",))
+        return CommandResult.success("System prune: 0 item(s) removed — reclaimed 0B")
+
+    def inspect_resource(self, kind: str, ref: str) -> dict | None:
+        self.calls.append(("inspect_resource", kind, ref))
+        return {}
+
+    def container_top(self, container_id: str) -> ContainerTop | None:
+        self.calls.append(("container_top", container_id))
+        return ContainerTop(titles=[], processes=[])
+
+    def container_cp(self, src: str, dst: str) -> CommandResult:
+        self.calls.append(("container_cp", src, dst))
+        return CommandResult.success(f"Copied {src} → {dst}")
 
 
 async def wait_until(predicate, timeout: float = 1.0) -> None:
@@ -164,6 +228,91 @@ class RefreshLoadingIndicatorTests(unittest.IsolatedAsyncioTestCase):
             await wait_until(lambda: not indicator.display)
 
 
+def _standalone_snapshot(running: bool, state: str | None = None) -> DockerSnapshot:
+    c = make_container("web", running=running)
+    if state is not None:
+        c.state = state
+    return DockerSnapshot(containers=[c], images=[], volumes=[], networks=[])
+
+
+class PauseKillActionTests(unittest.IsolatedAsyncioTestCase):
+    async def _select_first_row(self, app: DockSurfApp) -> None:
+        await wait_until(lambda: bool(app._current.get(TabID.CONTAINERS)))
+        table = app.query_one(f"#{TableID.CONTAINERS}", DataTable)
+        table.move_cursor(row=0)
+
+    async def test_pause_running_container(self) -> None:
+        snapshot = _standalone_snapshot(running=True)
+        app = DockSurfApp(docker=MockDockerService(lambda: snapshot))
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await self._select_first_row(app)
+
+            app.action_pause_container()
+            await wait_until(lambda: ("pause_container", "web") in app.docker.calls)
+            self.assertIn(("pause_container", "web"), app.docker.calls)
+
+    async def test_unpause_paused_container(self) -> None:
+        snapshot = _standalone_snapshot(running=False, state="paused")
+        app = DockSurfApp(docker=MockDockerService(lambda: snapshot))
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await self._select_first_row(app)
+
+            app.action_pause_container()
+            await wait_until(lambda: ("unpause_container", "web") in app.docker.calls)
+            self.assertIn(("unpause_container", "web"), app.docker.calls)
+
+    async def test_pause_stopped_container_is_noop(self) -> None:
+        snapshot = _standalone_snapshot(running=False)  # state="exited"
+        app = DockSurfApp(docker=MockDockerService(lambda: snapshot))
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await self._select_first_row(app)
+
+            app.action_pause_container()
+            await pilot.pause()
+            self.assertEqual(app.docker.calls, [])
+
+    async def test_kill_running_container(self) -> None:
+        snapshot = _standalone_snapshot(running=True)
+        app = DockSurfApp(docker=MockDockerService(lambda: snapshot))
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await self._select_first_row(app)
+
+            app.action_kill_container()
+            await wait_until(lambda: ("kill_container", "web") in app.docker.calls)
+            self.assertIn(("kill_container", "web"), app.docker.calls)
+
+    async def test_kill_stopped_container_is_guarded(self) -> None:
+        snapshot = _standalone_snapshot(running=False)
+        app = DockSurfApp(docker=MockDockerService(lambda: snapshot))
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await self._select_first_row(app)
+
+            app.action_kill_container()
+            await pilot.pause()
+            self.assertEqual(app.docker.calls, [])
+
+    async def test_pause_without_focused_container_does_not_call_docker(self) -> None:
+        app = DockSurfApp(docker=MockDockerService(lambda: EMPTY_SNAPSHOT))
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.action_pause_container()
+            await pilot.pause()
+            self.assertEqual(app.docker.calls, [])
+
+    async def test_kill_without_focused_container_does_not_call_docker(self) -> None:
+        app = DockSurfApp(docker=MockDockerService(lambda: EMPTY_SNAPSHOT))
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.action_kill_container()
+            await pilot.pause()
+            self.assertEqual(app.docker.calls, [])
+
+
 class HelpScreenTests(unittest.IsolatedAsyncioTestCase):
     def test_container_only_actions_matches_container_action_handler(self) -> None:
         expected = {
@@ -192,7 +341,11 @@ class HelpScreenTests(unittest.IsolatedAsyncioTestCase):
             )
             rows = list(zip(*(list(c.cells) for c in table.columns)))
 
-            for key, action, description in app.BINDINGS:
+            for item in app.BINDINGS:
+                if isinstance(item, tuple):
+                    key, action, description = item
+                else:
+                    key, action, description = item.key, item.action, item.description
                 if not description:
                     continue
                 match = next(r for r in rows if r[1] == description)
@@ -278,6 +431,388 @@ class ComposeGroupingTests(unittest.IsolatedAsyncioTestCase):
             # Header + standalone remain; the two services are hidden.
             self.assertEqual(len(collapsed_rows), full_rows - 2)
             self.assertIn("myapp", app._collapsed_projects)
+
+
+class InspectActionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_inspect_container_opens_screen_with_json(self) -> None:
+        snapshot = _standalone_snapshot(running=True)
+        svc = MockDockerService(lambda: snapshot)
+        svc.inspect_resource = lambda kind, ref: {  # type: ignore[method-assign]
+            "Id": ref,
+            "Kind": kind,
+        }
+        app = DockSurfApp(docker=svc)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await wait_until(lambda: bool(app._current.get(TabID.CONTAINERS)))
+            table = app.query_one(f"#{TableID.CONTAINERS}", DataTable)
+            table.move_cursor(row=0)
+
+            app.action_inspect()
+            await wait_until(
+                lambda: any(isinstance(s, InspectScreen) for s in app.screen_stack)
+            )
+            self.assertTrue(any(isinstance(s, InspectScreen) for s in app.screen_stack))
+
+    async def test_inspect_project_header_notifies_without_opening_screen(
+        self,
+    ) -> None:
+        app = DockSurfApp(docker=MockDockerService(_compose_snapshot))
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await wait_until(lambda: bool(app._current.get(TabID.CONTAINERS)))
+            table = app.query_one(f"#{TableID.CONTAINERS}", DataTable)
+            table.move_cursor(row=0)  # header row for "myapp"
+            self.assertTrue(app._focused_is_project_header())
+
+            app.action_inspect()
+            await pilot.pause()
+            self.assertFalse(
+                any(isinstance(s, InspectScreen) for s in app.screen_stack)
+            )
+
+    async def test_inspect_with_nothing_selected_does_not_open_screen(self) -> None:
+        app = DockSurfApp(docker=MockDockerService(lambda: EMPTY_SNAPSHOT))
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.action_inspect()
+            await pilot.pause()
+            self.assertFalse(
+                any(isinstance(s, InspectScreen) for s in app.screen_stack)
+            )
+
+    async def test_inspect_none_result_does_not_open_screen(self) -> None:
+        snapshot = _standalone_snapshot(running=True)
+        svc = MockDockerService(lambda: snapshot)
+
+        def _none_inspect(kind: str, ref: str) -> None:
+            svc.calls.append(("inspect_resource", kind, ref))
+            return None
+
+        svc.inspect_resource = _none_inspect  # type: ignore[method-assign]
+        app = DockSurfApp(docker=svc)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await wait_until(lambda: bool(app._current.get(TabID.CONTAINERS)))
+            table = app.query_one(f"#{TableID.CONTAINERS}", DataTable)
+            table.move_cursor(row=0)
+
+            app.action_inspect()
+            await wait_until(
+                lambda: ("inspect_resource", "container", "web") in svc.calls
+            )
+            await pilot.pause()
+            self.assertFalse(
+                any(isinstance(s, InspectScreen) for s in app.screen_stack)
+            )
+
+    async def test_inspect_on_images_tab_dispatches_image_kind(self) -> None:
+        img = Image(
+            id="sha256:abc",
+            repository="nginx",
+            tag="latest",
+            size_bytes=100,
+            is_dangling=False,
+            used_by=[],
+            created="",
+            architecture="amd64",
+        )
+        snapshot = DockerSnapshot(containers=[], images=[img], volumes=[], networks=[])
+        svc = MockDockerService(lambda: snapshot)
+        app = DockSurfApp(docker=svc)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.query_one(TabbedContent).active = TabID.IMAGES
+            await pilot.pause()
+            await wait_until(lambda: bool(app._current.get(TabID.IMAGES)))
+            table = app.query_one(f"#{TableID.IMAGES}", DataTable)
+            table.move_cursor(row=0)
+
+            app.action_inspect()
+            await wait_until(
+                lambda: ("inspect_resource", "image", "sha256:abc") in svc.calls
+            )
+            await wait_until(
+                lambda: any(isinstance(s, InspectScreen) for s in app.screen_stack)
+            )
+
+
+class PruneActionTests(unittest.IsolatedAsyncioTestCase):
+    async def _open_prune_screen(self, app: DockSurfApp) -> "PruneScreen":
+        app.action_prune()
+        await wait_until(
+            lambda: any(isinstance(s, PruneScreen) for s in app.screen_stack)
+        )
+        return app.screen_stack[-1]
+
+    async def _open_confirm_dialog(self, app: DockSurfApp) -> "ConfirmDialog":
+        await wait_until(
+            lambda: any(isinstance(s, ConfirmDialog) for s in app.screen_stack)
+        )
+        return app.screen_stack[-1]
+
+    async def test_prune_containers_end_to_end(self) -> None:
+        svc = MockDockerService(lambda: EMPTY_SNAPSHOT)
+        app = DockSurfApp(docker=svc)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            prune_screen = await self._open_prune_screen(app)
+            prune_screen.dismiss("containers")
+            await pilot.pause()
+
+            confirm = await self._open_confirm_dialog(app)
+            self.assertIn("STOPPED containers", confirm._message)
+            confirm.dismiss(True)
+            await pilot.pause()
+
+            await wait_until(lambda: ("prune_containers",) in svc.calls)
+            self.assertIn(("prune_containers",), svc.calls)
+
+    async def test_prune_cancelled_at_target_picker_does_not_call_docker(
+        self,
+    ) -> None:
+        svc = MockDockerService(lambda: EMPTY_SNAPSHOT)
+        app = DockSurfApp(docker=svc)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            prune_screen = await self._open_prune_screen(app)
+            prune_screen.dismiss(None)
+            await pilot.pause()
+            self.assertEqual(svc.calls, [])
+
+    async def test_prune_cancelled_at_confirm_does_not_call_docker(self) -> None:
+        svc = MockDockerService(lambda: EMPTY_SNAPSHOT)
+        app = DockSurfApp(docker=svc)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            prune_screen = await self._open_prune_screen(app)
+            prune_screen.dismiss("system")
+            await pilot.pause()
+
+            confirm = await self._open_confirm_dialog(app)
+            confirm.dismiss(False)
+            await pilot.pause()
+            self.assertEqual(svc.calls, [])
+
+    async def test_prune_volumes_confirm_mentions_anonymous(self) -> None:
+        svc = MockDockerService(lambda: EMPTY_SNAPSHOT)
+        app = DockSurfApp(docker=svc)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            prune_screen = await self._open_prune_screen(app)
+            prune_screen.dismiss("volumes")
+            await pilot.pause()
+
+            confirm = await self._open_confirm_dialog(app)
+            self.assertIn("anonymous", confirm._message)
+
+    async def test_prune_each_target_maps_to_matching_docker_method(self) -> None:
+        targets_to_methods = [
+            ("containers", "prune_containers"),
+            ("images", "prune_images"),
+            ("volumes", "prune_volumes"),
+            ("networks", "prune_networks"),
+            ("system", "prune_system"),
+        ]
+        for target, method_name in targets_to_methods:
+            with self.subTest(target=target):
+                svc = MockDockerService(lambda: EMPTY_SNAPSHOT)
+                app = DockSurfApp(docker=svc)
+                async with app.run_test() as pilot:
+                    await pilot.pause()
+
+                    prune_screen = await self._open_prune_screen(app)
+                    prune_screen.dismiss(target)
+                    await pilot.pause()
+
+                    confirm = await self._open_confirm_dialog(app)
+                    confirm.dismiss(True)
+                    await pilot.pause()
+
+                    await wait_until(lambda: (method_name,) in svc.calls)
+                    self.assertIn((method_name,), svc.calls)
+
+
+class ExecCustomActionTests(unittest.IsolatedAsyncioTestCase):
+    """Exercises the guard/prompt/cancel paths of `E` without ever reaching
+    the real `subprocess.run`/`self.suspend()` interactive-exec tail — the
+    shell-detection probe (`_container_has_shell`) is patched out since it
+    shells out to `docker exec ... which <shell>` for real."""
+
+    _HAS_SHELL_PATCH_TARGET = (
+        "docksurf_py.actions.ContainerActionHandler._container_has_shell"
+    )
+
+    async def _select_first_row(self, app: DockSurfApp) -> None:
+        await wait_until(lambda: bool(app._current.get(TabID.CONTAINERS)))
+        table = app.query_one(f"#{TableID.CONTAINERS}", DataTable)
+        table.move_cursor(row=0)
+
+    async def test_exec_custom_prompts_with_detected_shell_prefilled(self) -> None:
+        snapshot = _standalone_snapshot(running=True)
+        app = DockSurfApp(docker=MockDockerService(lambda: snapshot))
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await self._select_first_row(app)
+
+            with patch(self._HAS_SHELL_PATCH_TARGET, return_value=True):
+                app.action_exec_custom()
+                await wait_until(
+                    lambda: any(isinstance(s, PromptScreen) for s in app.screen_stack)
+                )
+            screen = app.screen_stack[-1]
+            inputs = list(screen.query(Input))
+            self.assertEqual(len(inputs), 2)
+            self.assertEqual(inputs[0].value, "bash")
+            self.assertEqual(inputs[1].value, "")
+
+    async def test_exec_custom_falls_back_to_sh_when_no_shell_detected(self) -> None:
+        snapshot = _standalone_snapshot(running=True)
+        app = DockSurfApp(docker=MockDockerService(lambda: snapshot))
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await self._select_first_row(app)
+
+            with patch(self._HAS_SHELL_PATCH_TARGET, return_value=False):
+                app.action_exec_custom()
+                await wait_until(
+                    lambda: any(isinstance(s, PromptScreen) for s in app.screen_stack)
+                )
+            screen = app.screen_stack[-1]
+            inputs = list(screen.query(Input))
+            self.assertEqual(inputs[0].value, "sh")
+
+    async def test_exec_custom_guarded_when_not_running(self) -> None:
+        snapshot = _standalone_snapshot(running=False)
+        app = DockSurfApp(docker=MockDockerService(lambda: snapshot))
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await self._select_first_row(app)
+
+            app.action_exec_custom()
+            await pilot.pause()
+            self.assertFalse(any(isinstance(s, PromptScreen) for s in app.screen_stack))
+
+    async def test_exec_custom_cancel_closes_without_running_anything(self) -> None:
+        snapshot = _standalone_snapshot(running=True)
+        app = DockSurfApp(docker=MockDockerService(lambda: snapshot))
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await self._select_first_row(app)
+
+            with patch(self._HAS_SHELL_PATCH_TARGET, return_value=True):
+                app.action_exec_custom()
+                await wait_until(
+                    lambda: any(isinstance(s, PromptScreen) for s in app.screen_stack)
+                )
+                app.screen_stack[-1].dismiss(None)
+                await pilot.pause()
+            self.assertFalse(any(isinstance(s, PromptScreen) for s in app.screen_stack))
+
+    async def test_exec_custom_empty_command_warns_without_running_anything(
+        self,
+    ) -> None:
+        snapshot = _standalone_snapshot(running=True)
+        app = DockSurfApp(docker=MockDockerService(lambda: snapshot))
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await self._select_first_row(app)
+
+            with patch(self._HAS_SHELL_PATCH_TARGET, return_value=True):
+                app.action_exec_custom()
+                await wait_until(
+                    lambda: any(isinstance(s, PromptScreen) for s in app.screen_stack)
+                )
+                app.screen_stack[-1].dismiss(["   ", ""])
+                await pilot.pause()
+            self.assertFalse(any(isinstance(s, PromptScreen) for s in app.screen_stack))
+
+
+class CopyFilesActionTests(unittest.IsolatedAsyncioTestCase):
+    async def _select_first_row(self, app: DockSurfApp) -> None:
+        await wait_until(lambda: bool(app._current.get(TabID.CONTAINERS)))
+        table = app.query_one(f"#{TableID.CONTAINERS}", DataTable)
+        table.move_cursor(row=0)
+
+    async def test_copy_files_prompts_with_prefilled_defaults(self) -> None:
+        snapshot = _standalone_snapshot(running=True)
+        app = DockSurfApp(docker=MockDockerService(lambda: snapshot))
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await self._select_first_row(app)
+
+            app.action_copy_files()
+            await wait_until(
+                lambda: any(isinstance(s, PromptScreen) for s in app.screen_stack)
+            )
+            screen = app.screen_stack[-1]
+            inputs = list(screen.query(Input))
+            self.assertEqual(inputs[0].value, "web:")
+            self.assertEqual(inputs[1].value, ".")
+
+    async def test_copy_files_guarded_when_nothing_focused(self) -> None:
+        app = DockSurfApp(docker=MockDockerService(lambda: EMPTY_SNAPSHOT))
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.action_copy_files()
+            await pilot.pause()
+            self.assertFalse(any(isinstance(s, PromptScreen) for s in app.screen_stack))
+
+    async def test_copy_files_cancel_does_not_call_docker(self) -> None:
+        snapshot = _standalone_snapshot(running=True)
+        svc = MockDockerService(lambda: snapshot)
+        app = DockSurfApp(docker=svc)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await self._select_first_row(app)
+
+            app.action_copy_files()
+            await wait_until(
+                lambda: any(isinstance(s, PromptScreen) for s in app.screen_stack)
+            )
+            app.screen_stack[-1].dismiss(None)
+            await pilot.pause()
+            self.assertEqual(svc.calls, [])
+
+    async def test_copy_files_invalid_prefix_warns_without_calling_docker(
+        self,
+    ) -> None:
+        snapshot = _standalone_snapshot(running=True)
+        svc = MockDockerService(lambda: snapshot)
+        app = DockSurfApp(docker=svc)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await self._select_first_row(app)
+
+            app.action_copy_files()
+            await wait_until(
+                lambda: any(isinstance(s, PromptScreen) for s in app.screen_stack)
+            )
+            # Neither side prefixed with "web:" -- invalid.
+            app.screen_stack[-1].dismiss(["./a", "./b"])
+            await pilot.pause()
+            self.assertEqual(svc.calls, [])
+
+    async def test_copy_files_valid_input_calls_docker_container_cp(self) -> None:
+        snapshot = _standalone_snapshot(running=True)
+        svc = MockDockerService(lambda: snapshot)
+        app = DockSurfApp(docker=svc)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await self._select_first_row(app)
+
+            app.action_copy_files()
+            await wait_until(
+                lambda: any(isinstance(s, PromptScreen) for s in app.screen_stack)
+            )
+            app.screen_stack[-1].dismiss(["web:/etc/hosts", "./hosts"])
+            await pilot.pause()
+            await wait_until(lambda: bool(svc.calls))
+            self.assertIn(("container_cp", "web:/etc/hosts", "./hosts"), svc.calls)
 
 
 if __name__ == "__main__":

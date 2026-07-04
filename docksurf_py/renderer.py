@@ -18,6 +18,7 @@ from textual.widgets import DataTable, Input, LoadingIndicator, TabbedContent
 
 from docksurf_py.constants import (
     DETAIL_PANE_ID,
+    MARK_GLYPH,
     REFRESH_LOADING_ID,
     SEARCH_BAR_ID,
     STATUS_BAR_ID,
@@ -77,6 +78,13 @@ def _status_markup(c: Container) -> SafeMarkup:
 def _safe_row(table: DataTable, *values) -> None:
     """Add a row, escaping plain strings and passing SafeMarkup through unchanged."""
     table.add_row(*(v if isinstance(v, SafeMarkup) else escape(str(v)) for v in values))
+
+
+def _mark_cell(
+    marked: set[tuple[str, str]], key: tuple[str, str] | None
+) -> SafeMarkup | str:
+    """Leading-column cell for a row: the mark glyph if selected, else blank."""
+    return MARK_GLYPH if key is not None and key in marked else ""
 
 
 def _health_markup(c: Container) -> SafeMarkup:
@@ -156,9 +164,16 @@ class TableRenderer(_Base):
         }
         # Compose project names whose service rows are currently hidden.
         self._collapsed_projects: set[str] = set()
+        # Multi-select: per-tab sets of marked row-keys (see `_row_key`).
+        self._marked: dict[TabID, set[tuple[str, str]]] = {
+            tab_id: set() for tab_id in self._resource_registry
+        }
 
         for entry in self._resource_registry.values():
             table = self.query_one(f"#{entry.table_id}", DataTable)
+            # Leading mark column, added separately (not part of ResourceEntry.
+            # columns) so every populate method just prepends one cell per row.
+            table.add_column("", width=2)
             table.add_columns(*entry.columns)
             table.cursor_type = "row"
 
@@ -170,6 +185,7 @@ class TableRenderer(_Base):
             items = self.snapshot.containers
 
         projects, standalone = _group_by_project(items)
+        marked = self._marked[TabID.CONTAINERS]
 
         # `_current` is the row-backing list: each row index maps to either a
         # `ComposeProject` header or a `Container` service/standalone row.
@@ -185,6 +201,7 @@ class TableRenderer(_Base):
             rows.append(project)
             _safe_row(
                 table,
+                "",  # project headers can't be marked
                 SafeMarkup(f"[b]{glyph} {escape(project.name)}[/b]"),
                 config,
                 _project_status_markup(project),
@@ -200,6 +217,7 @@ class TableRenderer(_Base):
                 name = SafeMarkup(f"  {branch} {escape(c.compose_service or c.name)}")
                 _safe_row(
                     table,
+                    _mark_cell(marked, self._row_key(c)),
                     name,
                     c.image_name,
                     _status_markup(c),
@@ -211,6 +229,7 @@ class TableRenderer(_Base):
             rows.append(c)
             _safe_row(
                 table,
+                _mark_cell(marked, self._row_key(c)),
                 c.name,
                 c.image_name,
                 _status_markup(c),
@@ -220,15 +239,22 @@ class TableRenderer(_Base):
 
         self._current[TabID.CONTAINERS] = rows
 
-    def _rerender_containers(self) -> None:
-        """Re-run the container populate honouring any active search filter.
+    def _rerender_active_table(self) -> None:
+        """Re-populate the active tab's table honouring any active search filter.
 
-        Used after a group is collapsed/expanded — `_apply_filter` (with the
-        current query, empty when the bar is closed) clears and repopulates the
-        Containers table, which re-groups from scratch.
+        `_apply_filter` (with the current query, empty when the bar is closed)
+        clears and repopulates whichever tab is active — used after a mark-clear
+        or a bulk action, where several rows' mark cells changed at once.
         """
         search_bar = self.query_one(f"#{SEARCH_BAR_ID}", Input)
         self._apply_filter(search_bar.value if search_bar.display else "")
+
+    def _rerender_containers(self) -> None:
+        """Re-run the container populate honouring any active search filter.
+
+        Used after a group is collapsed/expanded.
+        """
+        self._rerender_active_table()
 
     def _populate_image_table(
         self, table: DataTable, items: list[Image] | None = None
@@ -237,8 +263,15 @@ class TableRenderer(_Base):
             assert self.snapshot is not None, "populate with no items needs a snapshot"
             items = self.snapshot.images
         self._current[TabID.IMAGES] = items
+        marked = self._marked[TabID.IMAGES]
         for i in items:
-            _safe_row(table, i.repository, i.tag, format_size(i.size_bytes))
+            _safe_row(
+                table,
+                _mark_cell(marked, self._row_key(i)),
+                i.repository,
+                i.tag,
+                format_size(i.size_bytes),
+            )
 
     def _populate_volume_table(
         self, table: DataTable, items: list[Volume] | None = None
@@ -247,10 +280,11 @@ class TableRenderer(_Base):
             assert self.snapshot is not None, "populate with no items needs a snapshot"
             items = self.snapshot.volumes
         self._current[TabID.VOLUMES] = items
+        marked = self._marked[TabID.VOLUMES]
         for v in items:
             status = markup_green("In Use") if v.used_by else markup_yellow("Orphaned")
             raw = v.name[:50] + "..." if len(v.name) > 50 else v.name
-            _safe_row(table, raw, status)
+            _safe_row(table, _mark_cell(marked, self._row_key(v)), raw, status)
 
     def _populate_network_table(
         self, table: DataTable, items: list[Network] | None = None
@@ -259,8 +293,11 @@ class TableRenderer(_Base):
             assert self.snapshot is not None, "populate with no items needs a snapshot"
             items = self.snapshot.networks
         self._current[TabID.NETWORKS] = items
+        marked = self._marked[TabID.NETWORKS]
         for n in items:
-            _safe_row(table, n.name, n.driver, n.scope)
+            _safe_row(
+                table, _mark_cell(marked, self._row_key(n)), n.name, n.driver, n.scope
+            )
 
 
 class SnapshotManager(_Base):
@@ -343,6 +380,16 @@ class SnapshotManager(_Base):
         active = self.query_one(TabbedContent).active
         focus_key = self._focused_row_key(active)
 
+        # Drop marks on resources that no longer exist — checked against the
+        # full snapshot (not a search-filtered view), before any repopulate.
+        for tab_id, entry in self._resource_registry.items():
+            live_keys = {
+                key
+                for item in entry.snapshot_items(snapshot)
+                if (key := self._row_key(item)) is not None
+            }
+            self._marked[tab_id] &= live_keys
+
         for entry in self._resource_registry.values():
             table = self.query_one(f"#{entry.table_id}", DataTable)
             table.clear(columns=False)
@@ -399,8 +446,9 @@ class SnapshotManager(_Base):
                 except IndexError:
                     pane.clear_details()
                 # Cursor may not have moved (same index) so RowHighlighted won't
-                # fire — sync stats here in case the item's running state changed.
+                # fire — sync stats/top here in case the item's state changed.
                 self._sync_stats()
+                self._sync_top()
                 return
         # The previously-focused resource is gone — select the first row.
         self._auto_select_first()

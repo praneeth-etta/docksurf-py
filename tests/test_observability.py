@@ -9,8 +9,14 @@ from docksurf_py.docker import (
     _parse_system_df,
     format_uptime,
 )
-from docksurf_py.models import ContainerStats, DiskUsageEntry, DockerSnapshot, SystemDf
-from docksurf_py.observability import _render_df, _render_stats
+from docksurf_py.models import (
+    ContainerStats,
+    ContainerTop,
+    DiskUsageEntry,
+    DockerSnapshot,
+    SystemDf,
+)
+from docksurf_py.observability import _render_df, _render_stats, _render_top
 from docksurf_py.widgets import SystemDfScreen
 from tests.test_app import EMPTY_SNAPSHOT, MockDockerService, wait_until
 from tests.test_compose import make_container
@@ -224,6 +230,21 @@ class RenderSmokeTests(unittest.TestCase):
         )
         self.assertIsNotNone(_render_df(df))
 
+    def test_render_top_does_not_raise_and_uses_all_titles(self) -> None:
+        top = ContainerTop(
+            titles=["PID", "USER", "CMD"],
+            processes=[["1", "root", "python app.py"], ["7", "root", "sh"]],
+        )
+        panel = _render_top(top, "web")
+        self.assertIsNotNone(panel)
+        table = panel.renderable
+        self.assertEqual([c.header for c in table.columns], ["PID", "USER", "CMD"])
+        self.assertEqual(table.row_count, 2)
+
+    def test_render_top_handles_no_processes(self) -> None:
+        top = ContainerTop(titles=["PID", "CMD"], processes=[])
+        self.assertIsNotNone(_render_top(top, "web"))
+
 
 class _OneEventStream:
     """Yields a single container event, then ends (mirrors EventStream shape)."""
@@ -337,6 +358,77 @@ class LiveObservabilityAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(
                 any(isinstance(s, SystemDfScreen) for s in app.screen_stack)
             )
+
+    async def test_container_top_fetches_then_toggles_off(self) -> None:
+        snap = DockerSnapshot([make_container("web", running=True)], [], [], [])
+        svc = MockDockerService(lambda: snap)
+
+        def fake_container_top(cid: str) -> ContainerTop:
+            svc.calls.append(("container_top", cid))
+            return ContainerTop(titles=["PID", "CMD"], processes=[["1", "python"]])
+
+        svc.container_top = fake_container_top  # type: ignore[method-assign]
+        app = DockSurfApp(docker=svc)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await wait_until(lambda: app._get_focused_container() is not None)
+
+            app.action_container_top()
+            # `_top_target` is set synchronously (before the threaded fetch
+            # even starts) — wait on the actual fetch call, not the target.
+            await wait_until(lambda: ("container_top", "web") in svc.calls, timeout=2.0)
+            self.assertEqual(app._top_target, "web")
+
+            # Pressing `t` again on the same container toggles it off.
+            app.action_container_top()
+            await pilot.pause()
+            self.assertIsNone(app._top_target)
+
+    async def test_container_top_guarded_when_not_running(self) -> None:
+        snap = DockerSnapshot([make_container("web", running=False)], [], [], [])
+        app = DockSurfApp(docker=MockDockerService(lambda: snap))
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await wait_until(lambda: app._get_focused_container() is not None)
+
+            app.action_container_top()
+            await pilot.pause()
+            self.assertIsNone(app._top_target)
+
+    async def test_selecting_different_container_clears_top(self) -> None:
+        from textual.widgets import DataTable
+
+        from docksurf_py.constants import TabID, TableID
+
+        snap = DockerSnapshot(
+            [
+                make_container("web", running=True),
+                make_container("worker", running=True),
+            ],
+            [],
+            [],
+            [],
+        )
+        svc = MockDockerService(lambda: snap)
+        svc.container_top = lambda cid: ContainerTop(  # type: ignore[method-assign]
+            titles=["PID"], processes=[["1"]]
+        )
+        app = DockSurfApp(docker=svc)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await wait_until(
+                lambda: len(app._current.get(TabID.CONTAINERS, [])) == 2, timeout=2.0
+            )
+            table = app.query_one(f"#{TableID.CONTAINERS}", DataTable)
+            table.move_cursor(row=0)
+            await pilot.pause()
+
+            app.action_container_top()
+            await wait_until(lambda: app._top_target == "web", timeout=2.0)
+
+            table.move_cursor(row=1)
+            await pilot.pause()
+            self.assertIsNone(app._top_target)
 
 
 if __name__ == "__main__":

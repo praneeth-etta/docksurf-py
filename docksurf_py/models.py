@@ -209,3 +209,15 @@ class SystemDf:
     entries: list[DiskUsageEntry]
     total_size: int
     total_reclaimable: int
+
+
+@dataclass(slots=True, frozen=True)
+class ContainerTop:
+    """Parsed `container.top()` result — one running-process snapshot.
+
+    `titles` are the `ps` column headers; each entry in `processes` is one
+    row, positionally aligned with `titles`.
+    """
+
+    titles: list[str]
+    processes: list[list[str]]
