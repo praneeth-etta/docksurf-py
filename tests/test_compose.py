@@ -10,6 +10,7 @@ from docksurf_py.models import (
     CommandErrorKind,
     ComposeProject,
     Container,
+    HealthProbe,
 )
 from docksurf_py.renderer import _group_by_project
 
@@ -22,6 +23,10 @@ def make_container(
     service: str = "",
     config_files: str = "",
     working_dir: str = "",
+    health: str = "",
+    started_at: str = "",
+    restart_count: int = 0,
+    health_log: list[HealthProbe] | None = None,
 ) -> Container:
     labels: dict[str, str] = {}
     if project:
@@ -38,13 +43,16 @@ def make_container(
         state="running" if running else "exited",
         running=running,
         exit_code=0,
-        health="",
+        health=health,
         ports=[],
         mounts=[],
         networks=[],
         created="",
         env=[],
         labels=labels,
+        started_at=started_at,
+        restart_count=restart_count,
+        health_log=health_log or [],
     )
 
 

@@ -44,6 +44,19 @@ class PortBinding:
     host_port: str = ""
 
 
+@dataclass(slots=True, frozen=True)
+class HealthProbe:
+    """One entry from `State.Health.Log` — the result of a single healthcheck run.
+
+    `exit_code` is 0 for a passing probe; `output` is the (possibly multi-line)
+    stdout/stderr the check emitted.
+    """
+
+    start: str
+    exit_code: int
+    output: str
+
+
 # Docker Compose writes these labels onto every container it manages.
 COMPOSE_PROJECT_LABEL = "com.docker.compose.project"
 COMPOSE_SERVICE_LABEL = "com.docker.compose.service"
@@ -68,6 +81,9 @@ class Container:
     created: str
     env: list[str]
     labels: dict[str, str]
+    started_at: str
+    restart_count: int
+    health_log: list[HealthProbe]
 
     @property
     def compose_project(self) -> str:
@@ -155,3 +171,41 @@ class ComposeProject:
     @property
     def all_running(self) -> bool:
         return bool(self.containers) and self.running_count == self.total_count
+
+
+@dataclass(slots=True, frozen=True)
+class ContainerStats:
+    """One live-usage sample for a single container (from the SDK stats stream).
+
+    Raw values; the renderer turns them into display strings. `cpu_percent` and
+    `mem_percent` are 0–100 (or higher for multi-core CPU).
+    """
+
+    cpu_percent: float
+    mem_used: int
+    mem_limit: int
+    mem_percent: float
+    net_rx: int
+    net_tx: int
+    blk_read: int
+    blk_write: int
+
+
+@dataclass(slots=True, frozen=True)
+class DiskUsageEntry:
+    """One row of `docker system df` — a resource category's disk footprint."""
+
+    kind: str  # "Images" / "Containers" / "Local Volumes" / "Build Cache"
+    total_count: int
+    active_count: int
+    size_bytes: int
+    reclaimable_bytes: int
+
+
+@dataclass(slots=True, frozen=True)
+class SystemDf:
+    """Parsed `docker system df` result: per-category entries plus totals."""
+
+    entries: list[DiskUsageEntry]
+    total_size: int
+    total_reclaimable: int

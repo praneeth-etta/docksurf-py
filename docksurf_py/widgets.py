@@ -63,19 +63,40 @@ class ContainerTable(DataTable):
 
 
 class DetailPane(VerticalScroll):
-    """A custom container that displays a key-value table and collapsible extras."""
+    """A custom container that displays a key-value table and collapsible extras.
+
+    The `_stats_panel` region shows live resource usage for the selected running
+    container; it updates independently of `update_details` (which rebuilds the
+    main panel + collapsibles) so streaming stats don't reset the collapsibles.
+    The live-stats renderable is built by the controller, keeping this widget
+    display-only (no Docker/model imports).
+    """
 
     _panel: Static
+    _stats_panel: Static
     _env_collapsible: "Collapsible | None" = None
+    _health_collapsible: "Collapsible | None" = None
 
     def compose(self) -> ComposeResult:
         self._panel = Static(
             Panel("Select an item to view details.", border_style="dim")
         )
         yield self._panel
+        self._stats_panel = Static("")
+        yield self._stats_panel
+
+    def update_live_stats(self, content) -> None:
+        self._stats_panel.update(content)
+
+    def clear_live_stats(self) -> None:
+        self._stats_panel.update("")
 
     def update_details(
-        self, title: str, data: dict, env_vars: list[str] | None = None
+        self,
+        title: str,
+        data: dict,
+        env_vars: list[str] | None = None,
+        health_log: str | None = None,
     ) -> None:
         safe_title = title if isinstance(title, SafeMarkup) else escape(title)
 
@@ -95,6 +116,9 @@ class DetailPane(VerticalScroll):
         if self._env_collapsible is not None:
             self._env_collapsible.remove()
             self._env_collapsible = None
+        if self._health_collapsible is not None:
+            self._health_collapsible.remove()
+            self._health_collapsible = None
 
         if env_vars:
             env_static = Static(escape("\n".join(env_vars)))
@@ -104,11 +128,23 @@ class DetailPane(VerticalScroll):
             )
             self.mount(self._env_collapsible)
 
+        if health_log:
+            health_static = Static(escape(health_log))
+            health_static.styles.padding = (1, 2)
+            self._health_collapsible = Collapsible(
+                health_static, title="Health checks (recent)", collapsed=True
+            )
+            self.mount(self._health_collapsible)
+
     def clear_details(self) -> None:
         self._panel.update(Panel("Select an item to view details.", border_style="dim"))
+        self._stats_panel.update("")
         if self._env_collapsible is not None:
             self._env_collapsible.remove()
             self._env_collapsible = None
+        if self._health_collapsible is not None:
+            self._health_collapsible.remove()
+            self._health_collapsible = None
 
 
 class ConfirmDialog(ModalScreen):
@@ -417,6 +453,33 @@ class HelpScreen(ModalScreen):
             yield Button("Close", variant="primary", id="help-close")
 
     @on(Button.Pressed, "#help-close")
+    def _close(self) -> None:
+        self.dismiss()
+
+
+class SystemDfScreen(ModalScreen):
+    """Modal showing a `docker system df` breakdown.
+
+    Display-only: the caller passes a pre-built Rich renderable (the controller
+    formats the `SystemDf`), keeping this widget free of Docker/model imports.
+    Dismisses on Escape or `w` (the key that opened it).
+    """
+
+    def __init__(self, content) -> None:
+        super().__init__()
+        self._content = content
+
+    def on_key(self, event) -> None:
+        if event.key in ("escape", "w"):
+            self.dismiss()
+
+    def compose(self) -> ComposeResult:
+        with Vertical():
+            yield Label("[b]Disk usage — docker system df[/b]", id="df-title")
+            yield Static(self._content)
+            yield Button("Close", variant="primary", id="df-close")
+
+    @on(Button.Pressed, "#df-close")
     def _close(self) -> None:
         self.dismiss()
 

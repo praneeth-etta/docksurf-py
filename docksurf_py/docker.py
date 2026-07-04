@@ -3,6 +3,7 @@ docker.py — All system-level Docker execution lives here.
 """
 
 import logging
+import os
 import queue
 import shutil
 import subprocess
@@ -29,14 +30,33 @@ from docksurf_py.models import (
     CommandErrorKind,
     CommandResult,
     Container,
+    ContainerStats,
+    DiskUsageEntry,
     DockerSnapshot,
+    HealthProbe,
     Image,
     Network,
     PortBinding,
+    SystemDf,
     Volume,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _safe_close(generator) -> None:
+    """Close a stream generator, tolerating a cross-thread mid-read close.
+
+    `stop()` runs on the UI thread while the pump thread may be blocked inside
+    the generator; CPython raises "generator already executing" in that race.
+    The stream's `_active` flag already stops consumption, so closing (which
+    just unblocks a pending read) is best-effort.
+    """
+    if generator is not None and hasattr(generator, "close"):
+        try:
+            generator.close()
+        except Exception:
+            pass
 
 
 class LogStream:
@@ -76,8 +96,7 @@ class LogStream:
         if self._active:
             logger.info("Log stream stopped for container %s", self._container_id)
         self._active = False
-        if self._generator and hasattr(self._generator, "close"):
-            self._generator.close()
+        _safe_close(self._generator)
 
 
 def _assign_service_colors(services: list[str]) -> dict[str, str]:
@@ -148,6 +167,139 @@ class MergedLogStream:
             stream.stop()
 
 
+def _parse_stats(sample: dict) -> ContainerStats:
+    """Turn one raw SDK stats sample into a typed `ContainerStats`.
+
+    CPU% is derived from the in-sample `cpu_stats`/`precpu_stats` delta the same
+    way `docker stats` computes it; memory subtracts the reclaimable page cache
+    (`inactive_file`) to match the CLI's used figure.
+    """
+    cpu = sample.get("cpu_stats") or {}
+    precpu = sample.get("precpu_stats") or {}
+    cpu_usage = (cpu.get("cpu_usage") or {}).get("total_usage", 0)
+    precpu_usage = (precpu.get("cpu_usage") or {}).get("total_usage", 0)
+    cpu_delta = cpu_usage - precpu_usage
+    system_delta = cpu.get("system_cpu_usage", 0) - precpu.get("system_cpu_usage", 0)
+    online = (
+        cpu.get("online_cpus")
+        or len((cpu.get("cpu_usage") or {}).get("percpu_usage") or [])
+        or 1
+    )
+    cpu_percent = (
+        (cpu_delta / system_delta) * online * 100.0
+        if system_delta > 0 and cpu_delta > 0
+        else 0.0
+    )
+
+    mem = sample.get("memory_stats") or {}
+    mem_limit = mem.get("limit", 0) or 0
+    cache = (mem.get("stats") or {}).get("inactive_file", 0)
+    mem_used = max((mem.get("usage", 0) or 0) - cache, 0)
+    mem_percent = (mem_used / mem_limit * 100.0) if mem_limit else 0.0
+
+    net_rx = net_tx = 0
+    for iface in (sample.get("networks") or {}).values():
+        net_rx += iface.get("rx_bytes", 0)
+        net_tx += iface.get("tx_bytes", 0)
+
+    blk_read = blk_write = 0
+    for entry in (sample.get("blkio_stats") or {}).get(
+        "io_service_bytes_recursive"
+    ) or []:
+        op = (entry.get("op") or "").lower()
+        if op == "read":
+            blk_read += entry.get("value", 0)
+        elif op == "write":
+            blk_write += entry.get("value", 0)
+
+    return ContainerStats(
+        cpu_percent=cpu_percent,
+        mem_used=mem_used,
+        mem_limit=mem_limit,
+        mem_percent=mem_percent,
+        net_rx=net_rx,
+        net_tx=net_tx,
+        blk_read=blk_read,
+        blk_write=blk_write,
+    )
+
+
+class StatsStream:
+    """Streams live `ContainerStats` for one container — mirrors `LogStream`.
+
+    Wraps the SDK's `container.stats(stream=True)` generator; `__iter__` yields a
+    parsed `ContainerStats` per sample (~1/sec) and `stop()` unblocks it.
+    """
+
+    def __init__(self, container_id: str, sdk_client) -> None:
+        self._container_id = container_id
+        self._client = sdk_client
+        self._active = False
+        self._generator: Iterator[dict] | None = None
+
+    def __iter__(self) -> Iterator[ContainerStats]:
+        if not self._client:
+            return
+        self._active = True
+        logger.info("Stats stream started for container %s", self._container_id)
+        try:
+            container = self._client.containers.get(self._container_id)
+            self._generator = container.stats(stream=True, decode=True)
+            for sample in self._generator:
+                if not self._active:
+                    break
+                yield _parse_stats(sample)
+        except NotFound:
+            logger.warning("Stats stream: container %s not found", self._container_id)
+        except Exception as e:
+            logger.exception("Stats stream error for %s: %s", self._container_id, e)
+        finally:
+            self.stop()
+
+    def stop(self) -> None:
+        if self._active:
+            logger.info("Stats stream stopped for container %s", self._container_id)
+        self._active = False
+        _safe_close(self._generator)
+
+
+class EventStream:
+    """Streams decoded Docker daemon events — mirrors `LogStream`.
+
+    Filtered to the resource types the UI renders; `__iter__` yields each event
+    dict and `stop()` unblocks the (otherwise indefinitely blocking) generator.
+    """
+
+    _FILTERS = {"type": ["container", "image", "volume", "network"]}
+
+    def __init__(self, sdk_client) -> None:
+        self._client = sdk_client
+        self._active = False
+        self._generator: Iterator[dict] | None = None
+
+    def __iter__(self) -> Iterator[dict]:
+        if not self._client:
+            return
+        self._active = True
+        logger.info("Event stream started")
+        try:
+            self._generator = self._client.events(decode=True, filters=self._FILTERS)
+            for event in self._generator:
+                if not self._active:
+                    break
+                yield event
+        except Exception as e:
+            logger.exception("Event stream error: %s", e)
+        finally:
+            self.stop()
+
+    def stop(self) -> None:
+        if self._active:
+            logger.info("Event stream stopped")
+        self._active = False
+        _safe_close(self._generator)
+
+
 _AGE_UNITS = (
     (60, 1, "s"),
     (3600, 60, "m"),
@@ -167,11 +319,8 @@ def _format_age(diff: int) -> str:
     return f"{diff // (86400 * 365)}y ago"
 
 
-def format_relative_time(ts: str) -> str:
-    """Convert a Docker timestamp string to a human-readable relative age."""
-    if not ts:
-        return "Unknown"
-
+def _parse_docker_ts(ts: str) -> datetime | None:
+    """Parse a Docker RFC3339 timestamp to an aware datetime, or None."""
     ts_clean = ts
     dot = ts_clean.find(".")
     if dot != -1:
@@ -188,13 +337,37 @@ def format_relative_time(ts: str) -> str:
     try:
         dt = datetime.fromisoformat(ts_clean)
     except ValueError:
-        return ts
+        return None
 
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
+    return dt
 
+
+def format_relative_time(ts: str) -> str:
+    """Convert a Docker timestamp string to a human-readable relative age."""
+    if not ts:
+        return "Unknown"
+    dt = _parse_docker_ts(ts)
+    if dt is None:
+        return ts
     diff = int((datetime.now(timezone.utc) - dt).total_seconds())
     return _format_age(diff)
+
+
+def format_uptime(started_at: str) -> str:
+    """How long a container has been running, e.g. "3h" — "—" if not started.
+
+    Docker reports `StartedAt` as the zero time ("0001-01-01T…") for containers
+    that have never run.
+    """
+    if not started_at or started_at.startswith("0001"):
+        return "—"
+    dt = _parse_docker_ts(started_at)
+    if dt is None:
+        return "—"
+    diff = int((datetime.now(timezone.utc) - dt).total_seconds())
+    return _format_age(diff).removesuffix(" ago")
 
 
 def format_size(size_in_bytes: int | None) -> str:
@@ -221,6 +394,115 @@ def format_ports(ports: list[PortBinding]) -> str:
 
 def format_labels(labels: dict[str, str]) -> str:
     return ", ".join(f"{k}={v}" for k, v in labels.items())
+
+
+def _parse_system_df(raw: dict) -> SystemDf:
+    """Parse the raw `/system/df` payload into typed per-category entries.
+
+    Reclaimable figures are approximate (image sizes include shared layers, so
+    unused-image reclaimable can be slightly overstated) — enough to answer
+    "what can I prune?" at a glance, matching `docker system df` closely.
+    """
+    entries: list[DiskUsageEntry] = []
+
+    images = raw.get("Images") or []
+    entries.append(
+        DiskUsageEntry(
+            kind="Images",
+            total_count=len(images),
+            active_count=sum(1 for i in images if i.get("Containers", 0)),
+            size_bytes=sum(i.get("Size", 0) or 0 for i in images),
+            reclaimable_bytes=sum(
+                (i.get("Size", 0) or 0) for i in images if not i.get("Containers", 0)
+            ),
+        )
+    )
+
+    containers = raw.get("Containers") or []
+
+    def _running(c: dict) -> bool:
+        return (c.get("State") or "").lower() == "running"
+
+    entries.append(
+        DiskUsageEntry(
+            kind="Containers",
+            total_count=len(containers),
+            active_count=sum(1 for c in containers if _running(c)),
+            size_bytes=sum(c.get("SizeRw", 0) or 0 for c in containers),
+            reclaimable_bytes=sum(
+                (c.get("SizeRw", 0) or 0) for c in containers if not _running(c)
+            ),
+        )
+    )
+
+    volumes = raw.get("Volumes") or []
+
+    def _vsize(v: dict) -> int:
+        return (v.get("UsageData") or {}).get("Size", 0) or 0
+
+    def _vactive(v: dict) -> bool:
+        return ((v.get("UsageData") or {}).get("RefCount", 0) or 0) > 0
+
+    entries.append(
+        DiskUsageEntry(
+            kind="Local Volumes",
+            total_count=len(volumes),
+            active_count=sum(1 for v in volumes if _vactive(v)),
+            size_bytes=sum(_vsize(v) for v in volumes),
+            reclaimable_bytes=sum(_vsize(v) for v in volumes if not _vactive(v)),
+        )
+    )
+
+    cache = raw.get("BuildCache") or []
+    entries.append(
+        DiskUsageEntry(
+            kind="Build Cache",
+            total_count=len(cache),
+            active_count=sum(1 for b in cache if b.get("InUse")),
+            size_bytes=sum(b.get("Size", 0) or 0 for b in cache),
+            reclaimable_bytes=sum(
+                (b.get("Size", 0) or 0) for b in cache if not b.get("InUse")
+            ),
+        )
+    )
+
+    return SystemDf(
+        entries=entries,
+        total_size=sum(e.size_bytes for e in entries),
+        total_reclaimable=sum(e.reclaimable_bytes for e in entries),
+    )
+
+
+_DEFAULT_DOCKER_SOCK = "unix:///var/run/docker.sock"
+
+
+def _create_sdk_client() -> "docker.DockerClient":
+    """Create the SDK client, honoring the active `docker context`.
+
+    `docker.from_env()` only reads `DOCKER_HOST` (falling back to the default
+    socket) — it ignores `docker context` entirely. Without this, DockSurf would
+    silently talk to a *different daemon* than the user's `docker`/`docker
+    compose` CLI whenever a non-default context is active (Docker Desktop
+    alongside native docker, colima, a remote context, …), so its resource list
+    wouldn't match theirs. Precedence matches the CLI: `DOCKER_HOST` >
+    active context > default socket. The default-socket case still goes through
+    `from_env()`, so existing setups (and its TLS-env handling) are unchanged.
+    """
+    if os.environ.get("DOCKER_HOST"):
+        return docker.from_env()
+    try:
+        from docker.context import ContextAPI
+
+        ctx = ContextAPI.get_current_context()
+    except Exception:
+        ctx = None
+    if ctx is not None and ctx.Host and ctx.Host != _DEFAULT_DOCKER_SOCK:
+        logger.info("Connecting via docker context %s → %s", ctx.Name, ctx.Host)
+        kwargs: dict = {"base_url": ctx.Host, "tls": ctx.TLSConfig or False}
+        if ctx.Host.startswith("ssh://"):
+            kwargs["use_ssh_client"] = True
+        return docker.DockerClient(**kwargs)
+    return docker.from_env()
 
 
 class DockerResourceFetcher:
@@ -268,6 +550,14 @@ class DockerResourceFetcher:
 
             sdk_state = attrs.get("State", {})
             health_info = sdk_state.get("Health") or {}
+            health_log = [
+                HealthProbe(
+                    start=probe.get("Start", ""),
+                    exit_code=probe.get("ExitCode", 0),
+                    output=(probe.get("Output") or "").strip(),
+                )
+                for probe in (health_info.get("Log") or [])
+            ]
 
             containers.append(
                 Container(
@@ -286,6 +576,9 @@ class DockerResourceFetcher:
                     created=attrs.get("Created", ""),
                     env=env_vars,
                     labels=labels,
+                    started_at=sdk_state.get("StartedAt", ""),
+                    restart_count=attrs.get("RestartCount", 0),
+                    health_log=health_log,
                 )
             )
         return containers
@@ -417,7 +710,7 @@ class DockerClient:
         context = _get_docker_context()
         host = _get_docker_host()
         try:
-            sdk = docker.from_env()
+            sdk = _create_sdk_client()
             sdk.ping()  # real round-trip — surfaces connection errors at init time
             self._sdk = sdk
             self._fetcher = DockerResourceFetcher(sdk)
@@ -479,6 +772,25 @@ class DockerClient:
     def stream_project_logs(self, specs: list[tuple[str, str]]) -> MergedLogStream:
         """Build a merged log stream over a project's (service, id) pairs."""
         return MergedLogStream(specs, self._sdk)
+
+    def stream_stats(self, container_id: str) -> StatsStream:
+        """Live resource-usage stream for one container."""
+        return StatsStream(container_id, self._sdk)
+
+    def stream_events(self) -> EventStream:
+        """Live stream of Docker daemon events (for auto-refresh)."""
+        return EventStream(self._sdk)
+
+    def system_df(self) -> SystemDf:
+        """Disk usage per resource category (`docker system df`).
+
+        Slow on the daemon side (it sums layer/volume sizes), so callers should
+        run this off the UI thread and never on the snapshot path.
+        """
+        if not self._sdk:
+            return SystemDf(entries=[], total_size=0, total_reclaimable=0)
+        raw = self._sdk.df()
+        return _parse_system_df(raw)
 
     # --- Writes ---
 

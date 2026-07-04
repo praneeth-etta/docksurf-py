@@ -1,31 +1,43 @@
 # docksurf-py
 
-A keyboard-driven terminal UI for visualising and managing Docker resources — containers, images, volumes, and networks. No GUI, no browser tab.
+A keyboard-driven terminal UI for visualising and managing Docker resources like containers, images, volumes, and networks. Compose-aware and live: it reacts to Docker events on its own and streams real time resource usage, so you're observing, not polling. No GUI, no browser tab.
 
 ```
-┌──────────────────────────────────────────────────────────────────────┐
-│  DockSurf                                                  12:34:56  │
-├───────────────────────────┬──────────────────────────────────────────┤
-│ Containers  Images        │  Container: api-server                   │
-│ Volumes     Networks      │  ────────────────────────────────────    │
-│                           │  ID         a1b2c3d4                     │
-│  ● api-server             │  Image      myapp-api:2.1                │
-│  ● nginx-proxy            │  Status     Up 3 hours                   │
-│  ● worker                 │  Created    3 hours ago                  │
-│  ○ deploy-build           │  Ports      0.0.0.0:8080->8080/tcp       │
-│                           │  Networks   myapp_net                    │
-│                           │  Mounts     /uploads, /app/pgdata        │
-│                           │  ▶ Environment Variables                 │
-└───────────────────────────┴──────────────────────────────────────────┘
-  Containers: 3 running / 1 stopped  |  Images: 12 total  |  Volumes: 2 orphaned
-  q Quit  r Refresh  / Search  ? Help  l Logs  e Exec  s Stop  S Start  d Delete
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  DockSurf                                                          12:34:56  │
+├──────────────────────────────────┬───────────────────────────────────────────┤
+│ Containers Images Volumes Nets   │  Container: myapp-api-1                   │
+│                                  │  ─────────────────────────────────────    │
+│ Name         Status   Health Up  │  Project    myapp                         │
+│ ▾ myapp      3/4 run             │  Service    api                           │
+│   ├ api      Up ✓     healthy 2h │  Status     Up 2 hours ✓                  │
+│   ├ web      Up       —       2h │  Health     healthy                       │
+│   └ worker   Exited(1)—       —  │  Uptime     2h     Restarts  0            │
+│ ▸ infra      2/2 run             │ ┌ Live stats: myapp-api-1 ──────────────┐ │
+│                                  │ │ CPU  ▐███▌     42.1%                  │ │
+│ redis        Up       —       5h │ │ MEM  ▐█▌  180 MiB / 512 MiB (35%)     │ │
+│                                  │ │ NET  ↓ 1.2 MB   ↑ 340 KB              │ │
+│                                  │ └───────────────────────────────────────┘ │
+└──────────────────────────────────┴───────────────────────────────────────────┘
+  Containers: 4 running / 1 stopped │ Images: 12 │ Volumes: 2 orphaned │ Context: default
+  q Quit  r Refresh  / Search  ? Help  l Logs  s Stop  u Up  k Down  w Disk
 ```
+
+## Highlights
+
+- **Live by default** — the tables auto-refresh on `docker events` (container start/stop/die, image pull/delete, …); `r` is a manual reload.
+- **Docker Compose–aware** — containers are grouped by project into a collapsible tree, with project-wide up / down / stop / start / restart and interleaved, colour-coded-per-service logs.
+- **Live resource stats** — CPU %, memory, network and block I/O streamed into the detail pane for the selected running container.
+- **Operational signals at a glance** — colour-coded health column, uptime and restart count, plus recent health-check probe output in the detail pane.
+- **Disk usage** — a `docker system df` breakdown (per-type size + reclaimable) on demand.
+- **Local or remote** — honours your active `docker context`, so it manages the same daemon your CLI does like the local, Docker Desktop, Colima, or a remote host over SSH.
 
 ## Requirements
 
 - Python 3.11+
-- Docker daemon running locally
+- A reachable Docker daemon (local, or a remote one via `docker context`)
 - [`uv`](https://github.com/astral-sh/uv) (package manager)
+- The `docker` CLI on `PATH` — only needed for exec-shell (`e`) and Compose project actions (`u`/`k`); everything else uses the SDK. DockSurf degrades gracefully if it's absent.
 
 ## Install
 
@@ -49,45 +61,46 @@ uv run python -m docksurf_py.app
 
 ### Global
 
-| Key   | Action                              |
-|-------|-------------------------------------|
-| `r`   | Refresh all Docker data             |
-| `/`   | Open search / filter for active tab |
-| `?`   | Help screen                         |
-| `q`   | Quit                                |
-| `Tab` | Switch between tabs                 |
-| `↑/↓` | Navigate rows                       |
+| Key   | Action                                       |
+|-------|----------------------------------------------|
+| `r`   | Refresh all Docker data                      |
+| `/`   | Open search / filter for active tab          |
+| `w`   | Disk-usage screen (`docker system df`)       |
+| `?`   | Help screen                                  |
+| `q`   | Quit                                         |
+| `d`   | Delete selected resource (with confirmation) |
+| `Tab` | Switch between tabs                          |
+| `↑/↓` | Navigate rows                                |
 
 ### Containers tab
 
-| Key | Action                             |
-|-----|------------------------------------|
-| `s` | Stop container                     |
-| `S` | Start container                    |
-| `x` | Restart container                  |
-| `e` | Exec shell into container (`sh`)   |
-| `l` | Toggle log viewer                  |
-| `d` | Delete (with confirmation dialog)  |
+The container/project keys are context-sensitive: on a Compose **project header** (compose stack) row they act on the whole project; on a single container row they act on that container.
 
-### All tabs
-
-| Key | Action                             |
-|-----|------------------------------------|
-| `d` | Delete selected resource           |
+| Key | On a container row        | On a project header row          |
+|-----|---------------------------|----------------------------------|
+| `s` | Stop container            | Stop whole project               |
+| `S` | Start container           | Start whole project              |
+| `x` | Restart container         | Restart whole project            |
+| `l` | Toggle log viewer         | Aggregated project logs          |
+| `e` | Exec shell (`bash`→`sh`)  | —                                |
+| `u` | Compose **up** (`docker compose up -d`) — brings the focused project up |
+| `k` | Compose **down** (`docker compose down`, confirmed) — tears the project down |
+| `space` | Collapse / expand the focused Compose project group |
 
 ### Log pane (when open)
 
 | Key | Action                                       |
 |-----|----------------------------------------------|
-| `f` | Toggle live log follow (`docker logs -f`)    |
+| `f` | Toggle live log follow                       |
 | `z` | Expand log pane to full width / collapse     |
 | `l` | Close log viewer, return to detail pane      |
+| `/` | Filter log lines (Esc to clear)              |
 
 The `⛶ Expand` / `⊡ Collapse` button in the log toolbar is also clickable.
 
 ## Tabs
 
-**Containers** — all containers (running and stopped). Detail pane shows image, ports, networks, mounts, and a collapsible environment variable section.
+**Containers** — all containers (running and stopped), **grouped by Compose project** into a collapsible tree (project header → service rows), with standalone containers listed below. Columns: name, status, colour-coded health, and uptime. The detail pane shows image, ports, networks, project/service, uptime, restart count, a collapsible environment-variable section, a collapsible recent-health-probe log, and — for a running container — a live CPU/mem/net/block-IO panel.
 
 **Images** — all images, tagged as *In Use*, *Unused*, or *Dangling*. Detail pane shows size, created date, architecture, and which containers reference the image.
 
@@ -97,22 +110,28 @@ The `⛶ Expand` / `⊡ Collapse` button in the log toolbar is also clickable.
 
 ## Architecture
 
-Four modules with strict layering:
+Eleven modules with strict layering (_models.py_ and _constants.py_ are leaf nodes and nothing imports into them):
 
-- **`constants.py`** — all widget/tab/table IDs and Rich markup helpers. Nothing imports into this module.
-- **`docker.py`** — all Docker I/O via the [Docker SDK for Python](https://docker-py.readthedocs.io/). `DockerClient` owns the SDK connection; `DockerResourceFetcher` handles parallel reads; `LogStream` handles live log iteration. Returns typed dataclasses (`Container`, `Image`, `Volume`, `Network`, `DockerSnapshot`).
-- **`widgets.py`** — Textual UI components with no Docker knowledge: `DetailPane`, `LogPane`, `SearchBar`, `ConfirmDialog`, `HelpScreen`, `StatusBar`.
-- **`app.py`** — assembles layout and event wiring through seven focused mixin classes (`TableRenderer`, `SnapshotManager`, `ResourceFocusResolver`, `DetailPaneRenderer`, `ContainerActionHandler`, `ResourceDeletionHandler`, `ResourceSearchController`) composed into `DockSurfApp`.
+- **`constants.py`** — widget/tab/table IDs, the _SafeMarkup_ render-boundary marker, and Rich markup helpers.
+- **`models.py`** — typed dataclasses for every resource (_Container_, _Image_, _Volume_, _Network_, _ComposeProject_, _ContainerStats_, _SystemDf_, …). No presentation logic.
+- **`connection.py`** — Docker connection detection/classification, context and host resolution.
+- **`docker.py`** — all Docker I/O via the [Docker SDK for Python](https://docker-py.readthedocs.io/). _DockerClient_ owns the SDK connection (honouring _docker context_); _DockerResourceFetcher_ does the parallel reads; _LogStream_/_MergedLogStream_/_StatsStream_/_EventStream_ are the live iterators.
+- **`service.py`** — the _DockerService_ protocol _DockerClient_ implements (swappable in tests).
+- **`widgets.py`** — Textual UI components with no Docker knowledge: _ContainerTable_, _DetailPane_, _LogPane_, _SearchBar_, _ConfirmDialog_, _HelpScreen_, _SystemDfScreen_, _StatusBar_.
+- **`renderer.py`**, **`actions.py`**, **`search.py`**, **`observability.py`** — focused mixin classes (table rendering & snapshot/event lifecycle, container/Compose/delete actions, search, and live stats + disk usage) composed into _DockSurfApp_ in **_app.py_**, driven by a single per-tab ResourceEntry registry.
 
 ## How data is fetched
 
-DockSurf uses the Docker SDK (`docker-py`) — no subprocess calls, no raw CLI parsing. All four resource types are fetched in parallel via `ThreadPoolExecutor` on each refresh, so the UI never blocks. Press `r` to refresh on demand.
+DockSurf talks to Docker through the SDK (`docker-py`), not the CLI but with two sanctioned exceptions, both guarded on the `docker` CLI being present: the interactive **exec-shell** (needs a real TTY the SDK can't hand back) and **Compose project actions** (docker-py has no Compose support, and `up` must recreate containers from the compose file).
 
-Logs are streamed live from the SDK's generator and fed into the `LogPane` via a background thread.
+- **Snapshots** — all four resource types are fetched in parallel via `ThreadPoolExecutor` on each refresh, so the UI never blocks.
+- **Event-driven refresh** — a background worker subscribes to `docker events` and debounces bursts into a refresh, ignoring high-frequency noise (exec probes, per-interval health-status pings). A refresh preserves your current selection rather than resetting the cursor.
+- **Live stats** — `container.stats(stream=True)` is streamed for the selected running container on a background thread and rendered into the detail pane (one stream at a time, to stay cheap).
+- **Logs** — streamed live from the SDK's generator; a Compose project's logs are merged across its containers with a colour-coded per-service prefix.
 
 ## Docker contexts — local and remote
 
-DockSurf connects to whatever daemon your active Docker context points at. That doesn't have to be your local machine.
+DockSurf connects to whatever daemon your active Docker context points at (matching the `docker` CLI's precedence: `DOCKER_HOST` → active context → default socket). That doesn't have to be your local machine.
 
 ```bash
 # Create a context pointing at a remote server over SSH
@@ -125,7 +144,7 @@ docker context use prod
 docksurf-py
 ```
 
-The active context name is shown in the status bar at the bottom of the TUI. Switch contexts between runs to manage different environments from the same tool.
+The active context name and endpoint are shown in the status bar at the bottom of the TUI. Switch contexts between runs to manage different environments from the same tool.
 
 **Common use cases:**
 - Managing a VPS or cloud instance without keeping an SSH session open
@@ -136,4 +155,4 @@ Any runtime that registers a Docker context works — Docker Desktop, Colima, Ra
 
 ## Logging
 
-App logs are written to `~/.local/share/docksurf-py/docksurf.log` — never to stdout (which belongs to the TUI). Useful for debugging refresh errors, failed Docker API calls, and container action results.
+App logs are written to `~/.local/share/docksurf-py/docksurf.log` — never to stdout (which belongs to the TUI). Useful for debugging refresh errors, failed Docker API calls, container/Compose action results, and stream lifecycle events.

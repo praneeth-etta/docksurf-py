@@ -39,6 +39,7 @@ from docksurf_py.constants import (
     TableID,
 )
 from docksurf_py.models import Container, DockerSnapshot
+from docksurf_py.observability import LiveStatsController
 from docksurf_py.renderer import (
     DetailPaneRenderer,
     ResourceFocusResolver,
@@ -129,11 +130,13 @@ class AppContext(Protocol):
     _current: dict[TabID, list]
     _resource_registry: dict[TabID, ResourceEntry]
     _collapsed_projects: set[str]
+    is_running: bool  # really a textual.app.App property
 
     def start_refresh(self) -> None: ...
     def _auto_select_first(self) -> None: ...
     def _apply_filter(self, query: str) -> None: ...
     def _rerender_containers(self) -> None: ...
+    def _sync_stats(self) -> None: ...
     def _get_focused_container(self) -> Container | None: ...
     def _get_focused_resource(self, tab_id: TabID) -> Any: ...
     def _get_focused_project(self) -> Any: ...
@@ -150,7 +153,9 @@ class AppContext(Protocol):
     def query_one(self, *args: Any, **kwargs: Any) -> Any: ...
     def call_from_thread(self, *args: Any, **kwargs: Any) -> Any: ...
     def push_screen_wait(self, *args: Any, **kwargs: Any) -> Any: ...
+    def push_screen(self, *args: Any, **kwargs: Any) -> Any: ...
     def suspend(self, *args: Any, **kwargs: Any) -> Any: ...
+    def set_timer(self, *args: Any, **kwargs: Any) -> Any: ...
 
 
 class DockSurfApp(
@@ -162,6 +167,7 @@ class DockSurfApp(
     ComposeActionHandler,
     ResourceDeletionHandler,
     ResourceSearchController,
+    LiveStatsController,
     App,
 ):
     snapshot: DockerSnapshot | None = None
@@ -187,6 +193,7 @@ class DockSurfApp(
         ("u", "compose_up", "Compose Up"),
         ("k", "compose_down", "Compose Down"),
         ("space", "toggle_group", "Collapse/Expand"),
+        ("w", "system_df", "Disk usage"),
     ]
     CSS_PATH = "app.tcss"
 
@@ -196,7 +203,7 @@ class DockSurfApp(
         self._resource_registry = {
             TabID.CONTAINERS: ResourceEntry(
                 table_id=TableID.CONTAINERS,
-                columns=("Name", "Image", "Status"),
+                columns=("Name", "Image", "Status", "Health", "Uptime"),
                 label="container",
                 snapshot_items=lambda snap: snap.containers,
                 populate=self._populate_container_table,
@@ -264,6 +271,12 @@ class DockSurfApp(
         # first fetch comes back.
         self.setup_tables()
         self.start_refresh()
+        # Live: react to `docker events` so the tables stay current without `r`.
+        self.start_event_listener()
+
+    def on_unmount(self) -> None:
+        self.stop_event_listener()
+        self.stop_stats()
 
     def action_refresh(self) -> None:
         self.start_refresh()
@@ -276,16 +289,19 @@ class DockSurfApp(
         entry = self._resource_registry.get(active)
         if entry is None:
             pane.clear_details()
+            self._sync_stats()
             return
         current = self._current.get(active, [])
         if not current:
             pane.clear_details()
+            self._sync_stats()
             return
         self.query_one(f"#{entry.table_id}", DataTable).move_cursor(row=0)
         try:
             entry.show_details(pane, 0)
         except IndexError:
             pane.clear_details()
+        self._sync_stats()
 
     @on(DataTable.RowHighlighted)
     def update_details(self, event: DataTable.RowHighlighted) -> None:
@@ -300,6 +316,7 @@ class DockSurfApp(
             entry.show_details(pane, event.cursor_row)
         except IndexError:
             pane.clear_details()
+        self._sync_stats()
 
     @on(TabbedContent.TabActivated)
     def clear_on_tab_switch(self) -> None:

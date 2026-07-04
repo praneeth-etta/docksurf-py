@@ -14,12 +14,13 @@ from docksurf_py.app import (
 )
 from docksurf_py.connection import ConnectionState, ConnectionStatus
 from docksurf_py.constants import TabID, TableID
-from docksurf_py.docker import LogStream
+from docksurf_py.docker import EventStream, LogStream, StatsStream
 from docksurf_py.models import (
     CommandResult,
     ComposeProject,
     Container,
     DockerSnapshot,
+    SystemDf,
 )
 from docksurf_py.widgets import HelpScreen
 from tests.test_compose import make_container
@@ -52,6 +53,15 @@ class MockDockerService:
 
     def stream_project_logs(self, specs):
         return LogStream("", None)
+
+    def stream_stats(self, container_id):
+        return StatsStream(container_id, None)
+
+    def stream_events(self):
+        return EventStream(None)
+
+    def system_df(self) -> SystemDf:
+        return SystemDf(entries=[], total_size=0, total_reclaimable=0)
 
     def compose_action(
         self, project, verb, config_files="", working_dir=""

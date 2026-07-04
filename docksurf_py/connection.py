@@ -33,7 +33,20 @@ def _get_docker_context() -> str:
 
 
 def _get_docker_host() -> str:
-    return os.environ.get("DOCKER_HOST", "unix:///var/run/docker.sock")
+    # Mirror the connection precedence in docker._create_sdk_client so the
+    # status bar shows the endpoint we actually talk to: DOCKER_HOST wins,
+    # otherwise the active context's host, else the default socket.
+    if host := os.environ.get("DOCKER_HOST"):
+        return host
+    try:
+        import docker.context as ctx_mod
+
+        ctx = ctx_mod.ContextAPI.get_current_context()
+        if ctx and ctx.Host:
+            return ctx.Host
+    except Exception:
+        pass
+    return "unix:///var/run/docker.sock"
 
 
 def _classify_docker_error(exc: Exception) -> ConnectionState:

@@ -8,8 +8,8 @@ implementations.
 from typing import Protocol
 
 from docksurf_py.connection import ConnectionState
-from docksurf_py.docker import LogStream, MergedLogStream
-from docksurf_py.models import CommandResult, DockerSnapshot
+from docksurf_py.docker import EventStream, LogStream, MergedLogStream, StatsStream
+from docksurf_py.models import CommandResult, DockerSnapshot, SystemDf
 
 
 class DockerService(Protocol):
@@ -24,6 +24,12 @@ class DockerService(Protocol):
     def stream_logs(self, container_id: str) -> LogStream: ...
 
     def stream_project_logs(self, specs: list[tuple[str, str]]) -> MergedLogStream: ...
+
+    def stream_stats(self, container_id: str) -> StatsStream: ...
+
+    def stream_events(self) -> EventStream: ...
+
+    def system_df(self) -> SystemDf: ...
 
     def compose_action(
         self,
