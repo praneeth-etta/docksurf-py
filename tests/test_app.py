@@ -5,7 +5,14 @@ from typing import Callable
 from unittest.mock import patch
 
 from rich.table import Table as RichTable
-from textual.widgets import DataTable, Input, LoadingIndicator, Static, TabbedContent
+from textual.widgets import (
+    DataTable,
+    Input,
+    LoadingIndicator,
+    RichLog,
+    Static,
+    TabbedContent,
+)
 
 from docksurf_py.actions import ContainerActionHandler
 from docksurf_py.app import (
@@ -14,8 +21,8 @@ from docksurf_py.app import (
     _container_only_actions,
 )
 from docksurf_py.connection import ConnectionState, ConnectionStatus
-from docksurf_py.constants import TabID, TableID
-from docksurf_py.docker import EventStream, LogStream, StatsStream
+from docksurf_py.constants import LOG_PANE_ID, LogLine, LogOptions, TabID, TableID
+from docksurf_py.docker import EventStream, StatsStream
 from docksurf_py.models import (
     CommandResult,
     ComposeProject,
@@ -29,6 +36,8 @@ from docksurf_py.widgets import (
     ConfirmDialog,
     HelpScreen,
     InspectScreen,
+    LogOptionsScreen,
+    LogPane,
     PromptScreen,
     PruneScreen,
 )
@@ -45,6 +54,23 @@ _CONNECTED_STATE = ConnectionState(
 )
 
 
+class FakeLogStream:
+    """A finite `LogSource` yielding fixed `LogLine`s, for driving `LogPane`."""
+
+    def __init__(self, lines: list[LogLine]) -> None:
+        self._lines = list(lines)
+        self._active = True
+
+    def __iter__(self):
+        for line in self._lines:
+            if not self._active:
+                break
+            yield line
+
+    def stop(self) -> None:
+        self._active = False
+
+
 class MockDockerService:
     def __init__(self, fetch_fn: Callable[[], DockerSnapshot]) -> None:
         self._fetch_fn = fetch_fn
@@ -52,6 +78,12 @@ class MockDockerService:
         # Recorded (method_name, *args) tuples for every write call — lets
         # bulk/prune tests assert who was actually invoked.
         self.calls: list[tuple] = []
+        # Lines a log stream yields; tests can override before opening logs.
+        self.log_lines: list[LogLine] = [
+            LogLine(text="starting up", ts="2024-01-01T00:00:00Z"),
+            LogLine(text="request handled", ts="2024-01-01T00:00:01Z"),
+            LogLine(text="boom", ts="2024-01-01T00:00:02Z", stream="stderr"),
+        ]
 
     @property
     def is_connected(self) -> bool:
@@ -60,11 +92,13 @@ class MockDockerService:
     def fetch_snapshot(self) -> DockerSnapshot:
         return self._fetch_fn()
 
-    def stream_logs(self, container_id: str) -> LogStream:
-        return LogStream(container_id, None)
+    def stream_logs(self, container_id, options=None):
+        self.calls.append(("stream_logs", container_id, options))
+        return FakeLogStream(self.log_lines)
 
-    def stream_project_logs(self, specs):
-        return LogStream("", None)
+    def stream_project_logs(self, specs, options=None):
+        self.calls.append(("stream_project_logs", tuple(specs), options))
+        return FakeLogStream(self.log_lines)
 
     def stream_stats(self, container_id):
         return StatsStream(container_id, None)
@@ -813,6 +847,109 @@ class CopyFilesActionTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             await wait_until(lambda: bool(svc.calls))
             self.assertIn(("container_cp", "web:/etc/hosts", "./hosts"), svc.calls)
+
+
+class LogViewerTests(unittest.IsolatedAsyncioTestCase):
+    async def _open_logs(self, app: DockSurfApp, pilot) -> LogPane:
+        await wait_until(lambda: bool(app._current.get(TabID.CONTAINERS)))
+        # Focus the container table and open logs via the real keybinding, so
+        # the test exercises binding routing (keys resolve through
+        # ContainerTable.BINDINGS while the table keeps focus), not just the
+        # action handlers.
+        table = app.query_one(f"#{TableID.CONTAINERS}", DataTable)
+        table.focus()
+        table.move_cursor(row=0)
+        await pilot.press("l")
+        log_pane = app.query_one(f"#{LOG_PANE_ID}", LogPane)
+        # Wait for the daemon stream thread to marshal all lines into the buffer.
+        await wait_until(lambda: len(log_pane._line_buffer) == 3)
+        return log_pane
+
+    async def test_open_logs_streams_lines_into_buffer(self) -> None:
+        snapshot = _standalone_snapshot(running=True)
+        app = DockSurfApp(docker=MockDockerService(lambda: snapshot))
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            log_pane = await self._open_logs(app, pilot)
+            self.assertTrue(log_pane.display)
+            texts = [line.text for line in log_pane._line_buffer]
+            self.assertEqual(texts, ["starting up", "request handled", "boom"])
+            self.assertEqual(log_pane._line_buffer[2].stream, "stderr")
+
+    async def test_toggle_timestamps_and_wrap_via_keys(self) -> None:
+        snapshot = _standalone_snapshot(running=True)
+        app = DockSurfApp(docker=MockDockerService(lambda: snapshot))
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            log_pane = await self._open_logs(app, pilot)
+
+            self.assertFalse(log_pane._show_timestamps)
+            await pilot.press("T")
+            self.assertTrue(log_pane._show_timestamps)
+
+            self.assertFalse(log_pane._wrap)
+            await pilot.press("W")
+            self.assertTrue(log_pane._wrap)
+            self.assertTrue(app.query_one(f"#{LOG_PANE_ID} RichLog", RichLog).wrap)
+
+    async def test_filter_and_match_jump(self) -> None:
+        snapshot = _standalone_snapshot(running=True)
+        app = DockSurfApp(docker=MockDockerService(lambda: snapshot))
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            log_pane = await self._open_logs(app, pilot)
+
+            # Drive the filter directly (the "/" key needs the pane focused).
+            log_pane._filter = "handled"
+            log_pane._render_to_view()
+            self.assertEqual(log_pane._match_count, 1)
+            self.assertEqual(log_pane._match_cursor, -1)
+
+            app.action_next_match()
+            self.assertEqual(log_pane._match_cursor, 0)
+            # Wraps around a single match.
+            app.action_next_match()
+            self.assertEqual(log_pane._match_cursor, 0)
+            app.action_prev_match()
+            self.assertEqual(log_pane._match_cursor, 0)
+
+    async def test_export_writes_file(self) -> None:
+        snapshot = _standalone_snapshot(running=True)
+        app = DockSurfApp(docker=MockDockerService(lambda: snapshot))
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await self._open_logs(app, pilot)
+            with patch("docksurf_py.actions._write_log_export") as writer:
+                writer.return_value = "/tmp/web-x.log"
+                app.action_export_logs()
+            self.assertTrue(writer.called)
+            name, text = writer.call_args.args
+            self.assertEqual(name, "web")
+            self.assertIn("boom", text)
+            self.assertIn("[stderr]", text)
+
+    async def test_log_options_applies_new_options(self) -> None:
+        snapshot = _standalone_snapshot(running=True)
+        svc = MockDockerService(lambda: snapshot)
+        app = DockSurfApp(docker=svc)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            log_pane = await self._open_logs(app, pilot)
+
+            app.action_log_options()
+            await wait_until(
+                lambda: any(isinstance(s, LogOptionsScreen) for s in app.screen_stack)
+            )
+            app.screen_stack[-1].dismiss(LogOptions(tail=5000, since_seconds=300))
+            await wait_until(lambda: log_pane.options.tail == 5000)
+            self.assertEqual(log_pane.options.since_seconds, 300)
+            # The re-subscribe passed the new options to the stream factory.
+            self.assertTrue(
+                any(
+                    c[0] == "stream_logs" and c[2] == LogOptions(5000, 300)
+                    for c in svc.calls
+                )
+            )
 
 
 if __name__ == "__main__":

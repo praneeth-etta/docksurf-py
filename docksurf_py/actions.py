@@ -8,10 +8,13 @@ that compose into DockSurfApp via Python MRO.
 import asyncio
 import json
 import logging
+import re
 import shlex
 import shutil
 import subprocess
 from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
 from rich.markup import escape
@@ -19,7 +22,13 @@ from textual import on, work
 from textual.coordinate import Coordinate
 from textual.widgets import DataTable, TabbedContent
 
-from docksurf_py.constants import DETAIL_PANE_ID, LOG_PANE_ID, MARK_GLYPH, TabID
+from docksurf_py.constants import (
+    DETAIL_PANE_ID,
+    LOG_PANE_ID,
+    MARK_GLYPH,
+    LogOptions,
+    TabID,
+)
 from docksurf_py.models import (
     CommandErrorKind,
     CommandResult,
@@ -33,6 +42,7 @@ from docksurf_py.widgets import (
     ConfirmDialog,
     DetailPane,
     InspectScreen,
+    LogOptionsScreen,
     LogPane,
     PromptField,
     PromptScreen,
@@ -53,6 +63,17 @@ logger = logging.getLogger(__name__)
 EXEC_SHELL_CANDIDATES = ("bash", "sh")
 
 _PROJECT_HINT = "Select a Compose project (or one of its containers) first"
+
+
+def _write_log_export(name: str, text: str) -> Path:
+    """Write a log buffer to ~/.local/share/docksurf-py/exports and return the path."""
+    export_dir = Path.home() / ".local/share/docksurf-py/exports"
+    export_dir.mkdir(parents=True, exist_ok=True)
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("_") or "logs"
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    path = export_dir / f"{safe}-{stamp}.log"
+    path.write_text(text, encoding="utf-8")
+    return path
 
 
 def select_exec_shell(
@@ -473,7 +494,7 @@ class ContainerActionHandler(_Base):
         log_pane.load(
             project.name,
             f"project: {project.name}",
-            lambda _key: self.docker.stream_project_logs(specs),
+            lambda _key, opts: self.docker.stream_project_logs(specs, opts),
         )
         self.query_one(f"#{DETAIL_PANE_ID}", DetailPane).display = False
         log_pane.display = True
@@ -511,6 +532,66 @@ class ContainerActionHandler(_Base):
         if not log_pane.display:
             return
         log_pane.toggle_search()
+
+    def action_toggle_timestamps(self) -> None:
+        log_pane = self.query_one(f"#{LOG_PANE_ID}", LogPane)
+        if not log_pane.display:
+            return
+        log_pane.toggle_timestamps()
+
+    def action_toggle_log_wrap(self) -> None:
+        log_pane = self.query_one(f"#{LOG_PANE_ID}", LogPane)
+        if not log_pane.display:
+            return
+        log_pane.toggle_wrap()
+
+    def action_next_match(self) -> None:
+        log_pane = self.query_one(f"#{LOG_PANE_ID}", LogPane)
+        if not log_pane.display:
+            return
+        log_pane.jump(1)
+
+    def action_prev_match(self) -> None:
+        log_pane = self.query_one(f"#{LOG_PANE_ID}", LogPane)
+        if not log_pane.display:
+            return
+        log_pane.jump(-1)
+
+    def action_log_top(self) -> None:
+        log_pane = self.query_one(f"#{LOG_PANE_ID}", LogPane)
+        if not log_pane.display:
+            return
+        log_pane.jump_home()
+
+    def action_log_bottom(self) -> None:
+        log_pane = self.query_one(f"#{LOG_PANE_ID}", LogPane)
+        if not log_pane.display:
+            return
+        log_pane.jump_end()
+
+    def action_export_logs(self) -> None:
+        log_pane = self.query_one(f"#{LOG_PANE_ID}", LogPane)
+        if not log_pane.display:
+            return
+        try:
+            path = _write_log_export(log_pane.log_title, log_pane.export_text())
+        except OSError as e:
+            logger.warning("Log export failed: %s", e)
+            self.notify(f"Export failed: {e}", severity="error")
+            return
+        logger.info("Exported logs to %s", path)
+        self.notify(f"Logs exported to {path}")
+
+    def action_log_options(self) -> None:
+        log_pane = self.query_one(f"#{LOG_PANE_ID}", LogPane)
+        if not log_pane.display:
+            return
+
+        def _apply(options: LogOptions | None) -> None:
+            if options is not None:
+                log_pane.set_options(options)
+
+        self.push_screen(LogOptionsScreen(log_pane.options), _apply)
 
     @on(LogPane.ToggleExpand)
     def on_log_pane_toggle_expand(self) -> None:

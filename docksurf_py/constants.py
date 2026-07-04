@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from enum import StrEnum
 
 
@@ -23,6 +24,12 @@ LOG_PANE_HEADER_ID = "log-pane-header"
 LOG_PANE_TOOLBAR_ID = "log-pane-toolbar"
 LOG_PANE_SEARCH_ID = "log-pane-search"
 BTN_EXPAND_ID = "expand-btn"
+
+# LogOptionsScreen widget IDs
+LOG_OPTIONS_TAIL_ID = "log-options-tail"
+LOG_OPTIONS_SINCE_ID = "log-options-since"
+BTN_LOG_OPTIONS_OK_ID = "log-options-ok"
+BTN_LOG_OPTIONS_CANCEL_ID = "log-options-cancel"
 
 # InspectScreen widget IDs
 INSPECT_VIEW_ID = "inspect-view"
@@ -73,6 +80,40 @@ LOG_SERVICE_COLORS = (
     "bright_cyan",
     "bright_magenta",
 )
+
+
+@dataclass(frozen=True, slots=True)
+class LogOptions:
+    """Stream-shaping options for the log viewer.
+
+    Only covers what changes *what the daemon sends* (so a change requires
+    re-subscribing the stream). Display-only toggles (timestamps, wrap) live on
+    the `LogPane` widget, since they never re-fetch. `tail=None` means "all";
+    `since_seconds=0` means no `--since` window.
+    """
+
+    tail: int | None = 500
+    since_seconds: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class LogLine:
+    """One rendered log line, carrying everything the view needs to style it.
+
+    Replaces the old flat `list[str]` buffer so timestamps and per-service
+    (merged-project) labels survive from the stream layer to the renderer
+    without pre-formatted-markup special cases. `text` is the message only
+    (timestamp split out into `ts`). `stream` is `"stdout"` for container
+    output (docker-py can't demux logs, so real lines are always stdout) and
+    `"stderr"` for our own stream-error messages, which the view styles
+    dim-red. `service`/`color` are set only for merged project streams.
+    """
+
+    text: str
+    ts: str = ""
+    stream: str = "stdout"
+    service: str = ""
+    color: str = ""
 
 
 class SafeMarkup(str):

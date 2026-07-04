@@ -8,15 +8,16 @@ import queue
 import shutil
 import subprocess
 import threading
+import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Callable, Iterator
 
 import docker
 import requests.exceptions
 from docker.errors import APIError, DockerException, NotFound
-from rich.markup import escape
 
 from docksurf_py.connection import (
     ConnectionState,
@@ -25,7 +26,7 @@ from docksurf_py.connection import (
     _get_docker_context,
     _get_docker_host,
 )
-from docksurf_py.constants import LOG_SERVICE_COLORS, SafeMarkup
+from docksurf_py.constants import LOG_SERVICE_COLORS, LogLine, LogOptions
 from docksurf_py.models import (
     CommandErrorKind,
     CommandResult,
@@ -60,16 +61,51 @@ def _safe_close(generator) -> None:
             pass
 
 
-class LogStream:
-    """Wraps docker SDK log generator and exposes it as a line iterator."""
+def _split_timestamp(raw: str) -> tuple[str, str]:
+    """Split a docker `timestamps=True` log line into (timestamp, message).
 
-    def __init__(self, container_id: str, sdk_client) -> None:
+    Docker prefixes each line with an RFC3339 timestamp and a single space,
+    e.g. `2024-01-01T12:00:00.000000000Z hello`. The timestamp is stored
+    separately so the view can show/hide it without a re-fetch and so the
+    search filter matches on the message only. Lines without a recognisable
+    timestamp (our own error strings) come back as `("", raw)`.
+    """
+    head, sep, rest = raw.partition(" ")
+    looks_like_ts = "T" in head and (
+        head.endswith("Z") or "+" in head or head[-6:-5] in "+-"
+    )
+    if sep and looks_like_ts:
+        return head, rest
+    return "", raw
+
+
+class LogStream:
+    """Wraps docker SDK log generator and exposes it as a `LogLine` iterator."""
+
+    def __init__(
+        self, container_id: str, sdk_client, options: LogOptions | None = None
+    ) -> None:
         self._container_id = container_id
         self._client = sdk_client
+        self._options = options or LogOptions()
         self._active = False
-        self._generator: Iterator[bytes] | None = None
+        self._generator: Iterator | None = None
 
-    def __iter__(self) -> Iterator[str]:
+    def _logs_kwargs(self, follow: bool) -> dict:
+        # docker-py 7.x `logs()` has no `demux`, so stdout/stderr come back
+        # combined (both default True) — there's no per-line origin to recover.
+        # We request timestamps and honour the tail/since options.
+        kwargs: dict = {
+            "stream": True,
+            "follow": follow,
+            "timestamps": True,
+            "tail": self._options.tail if self._options.tail is not None else "all",
+        }
+        if self._options.since_seconds > 0:
+            kwargs["since"] = int(time.time()) - self._options.since_seconds
+        return kwargs
+
+    def __iter__(self) -> Iterator[LogLine]:
         if not self._client:
             return
 
@@ -78,18 +114,23 @@ class LogStream:
         try:
             container = self._client.containers.get(self._container_id)
             follow = container.status == "running"
-            self._generator = container.logs(stream=True, follow=follow, tail=500)
+            self._generator = container.logs(**self._logs_kwargs(follow))
 
             for raw_line in self._generator:
                 if not self._active:
                     break
-                yield raw_line.decode("utf-8", errors="replace").rstrip()
+                ts, text = _split_timestamp(
+                    raw_line.decode("utf-8", errors="replace").rstrip()
+                )
+                yield LogLine(text=text, ts=ts)
         except NotFound:
             logger.warning("Log stream: container %s not found", self._container_id)
-            yield f"Container {self._container_id} not found"
+            yield LogLine(
+                text=f"Container {self._container_id} not found", stream="stderr"
+            )
         except Exception as e:
             logger.exception("Log stream error for %s: %s", self._container_id, e)
-            yield f"Log stream error: {e}"
+            yield LogLine(text=f"Log stream error: {e}", stream="stderr")
         finally:
             self.stop()
 
@@ -110,24 +151,29 @@ def _assign_service_colors(services: list[str]) -> dict[str, str]:
 
 
 class MergedLogStream:
-    """Interleaves several containers' logs into one line iterator.
+    """Interleaves several containers' logs into one `LogLine` iterator.
 
-    Each source line is prefixed with a colour-coded service label (emitted as
-    `SafeMarkup` so `LogPane` renders the colour instead of escaping it), giving
-    the combined stream a `docker compose logs -f` feel. Satisfies the
-    `LogSource` structural protocol (`__iter__` + `stop()`) the same way
-    `LogStream` does.
+    Each child line is tagged with its service label and a cycled colour, so
+    `LogPane` can render a `docker compose logs -f`-style colour-coded prefix.
+    Presentation lives in the view — this class only sets `service`/`color` on
+    the child `LogLine`s. Satisfies the `LogSource` structural protocol
+    (`__iter__` + `stop()`) the same way `LogStream` does.
     """
 
-    def __init__(self, specs: list[tuple[str, str]], sdk_client) -> None:
+    def __init__(
+        self,
+        specs: list[tuple[str, str]],
+        sdk_client,
+        options: LogOptions | None = None,
+    ) -> None:
         # specs: list of (service_name, container_id)
         self._specs = specs
         self._client = sdk_client
-        self._streams = [LogStream(cid, sdk_client) for _, cid in specs]
+        self._streams = [LogStream(cid, sdk_client, options) for _, cid in specs]
         self._active = False
         self._queue: queue.Queue = queue.Queue()
 
-    def __iter__(self) -> Iterator[str]:
+    def __iter__(self) -> Iterator[LogLine]:
         if not self._client or not self._specs:
             return
 
@@ -142,9 +188,7 @@ class MergedLogStream:
                 for line in stream:
                     if not self._active:
                         break
-                    self._queue.put(
-                        SafeMarkup(f"[{color}]{service:>14}[/] │ {escape(line)}")
-                    )
+                    self._queue.put(replace(line, service=service, color=color))
             finally:
                 self._queue.put(sentinel)
 
@@ -767,12 +811,16 @@ class DockerClient:
         except Exception as e:
             return f"Error fetching logs: {e}"
 
-    def stream_logs(self, container_id: str) -> LogStream:
-        return LogStream(container_id, self._sdk)
+    def stream_logs(
+        self, container_id: str, options: LogOptions | None = None
+    ) -> LogStream:
+        return LogStream(container_id, self._sdk, options)
 
-    def stream_project_logs(self, specs: list[tuple[str, str]]) -> MergedLogStream:
+    def stream_project_logs(
+        self, specs: list[tuple[str, str]], options: LogOptions | None = None
+    ) -> MergedLogStream:
         """Build a merged log stream over a project's (service, id) pairs."""
-        return MergedLogStream(specs, self._sdk)
+        return MergedLogStream(specs, self._sdk, options)
 
     def stream_stats(self, container_id: str) -> StatsStream:
         """Live resource-usage stream for one container."""
