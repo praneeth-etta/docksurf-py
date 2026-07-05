@@ -306,6 +306,24 @@ class VolumeIntegrationTests(_LiveDockerTestCase):
         snap = self.client.fetch_snapshot()
         self.assertFalse(any(v.name == name for v in snap.volumes))
 
+    def test_create_volume_then_appears_in_snapshot(self) -> None:
+        name = _unique_name("vol")
+        self._volumes.append(name)  # register for cleanup before creating
+        result = self.client.create_volume(name, "local", {"docksurf-it": "1"})
+        self.assertTrue(result.ok)
+
+        snap = self.client.fetch_snapshot()
+        match = next((v for v in snap.volumes if v.name == name), None)
+        self.assertIsNotNone(match)
+        assert match is not None
+        self.assertEqual(match.labels.get("docksurf-it"), "1")
+
+    def test_volume_sizes_includes_created_volume(self) -> None:
+        name = self._create_volume()
+        sizes = self.client.volume_sizes()
+        self.assertIn(name, sizes)
+        self.assertGreaterEqual(sizes[name], 0)
+
 
 @unittest.skipUnless(_DOCKER_AVAILABLE, _SKIP_REASON)
 class NetworkIntegrationTests(_LiveDockerTestCase):
@@ -320,6 +338,49 @@ class NetworkIntegrationTests(_LiveDockerTestCase):
 
         snap = self.client.fetch_snapshot()
         self.assertFalse(any(n.name == name for n in snap.networks))
+
+    def test_create_network_with_subnet(self) -> None:
+        name = _unique_name("net")
+        self._networks.append(name)  # register for cleanup before creating
+        result = self.client.create_network(name, "bridge", "172.31.251.0/24")
+        self.assertTrue(result.ok)
+
+        snap = self.client.fetch_snapshot()
+        match = next((n for n in snap.networks if n.name == name), None)
+        self.assertIsNotNone(match)
+        assert match is not None
+        self.assertEqual(match.subnet, "172.31.251.0/24")
+
+    def test_connect_disconnect_and_endpoint_detail(self) -> None:
+        net = self._create_network()
+        cname = self._run_container("--network", net, "busybox", "sleep", "60")
+        c = self._find_container(cname)
+        assert c is not None
+
+        # The endpoint should show up in Network.endpoints (greedy list inspect).
+        match = next(
+            (n for n in self.client.fetch_snapshot().networks if n.name == net), None
+        )
+        assert match is not None
+        self.assertTrue(any(ep.container_name == cname for ep in match.endpoints))
+        attached = next(ep for ep in match.endpoints if ep.container_name == cname)
+        self.assertTrue(attached.ipv4)  # has an IP within the network
+
+        result = self.client.disconnect_container(net, c.id)
+        self.assertTrue(result.ok)
+        match = next(
+            (n for n in self.client.fetch_snapshot().networks if n.name == net), None
+        )
+        assert match is not None
+        self.assertFalse(any(ep.container_name == cname for ep in match.endpoints))
+
+        result = self.client.connect_container(net, c.id)
+        self.assertTrue(result.ok)
+        match = next(
+            (n for n in self.client.fetch_snapshot().networks if n.name == net), None
+        )
+        assert match is not None
+        self.assertTrue(any(ep.container_name == cname for ep in match.endpoints))
 
 
 @unittest.skipUnless(_DOCKER_AVAILABLE, _SKIP_REASON)
@@ -356,6 +417,31 @@ class ImageIntegrationTests(unittest.TestCase):
         self.assertFalse(
             any(i.repository == repo and i.tag == tag for i in snap.images)
         )
+
+    def test_tag_image_creates_new_ref(self) -> None:
+        # busybox:latest is pulled by setUpModule; tag it under our unique repo.
+        snap = self.client.fetch_snapshot()
+        busybox = next((i for i in snap.images if i.repository == "busybox"), None)
+        self.assertIsNotNone(busybox)
+        assert busybox is not None
+
+        repo, _, tag = self.tag.partition(":")
+        result = self.client.tag_image(busybox.id, repo, tag)
+        self.assertTrue(result.ok)
+
+        snap = self.client.fetch_snapshot()
+        self.assertTrue(any(i.repository == repo and i.tag == tag for i in snap.images))
+
+    def test_image_history_returns_layers(self) -> None:
+        snap = self.client.fetch_snapshot()
+        busybox = next((i for i in snap.images if i.repository == "busybox"), None)
+        self.assertIsNotNone(busybox)
+        assert busybox is not None
+
+        layers = self.client.image_history(busybox.id)
+        self.assertIsNotNone(layers)
+        assert layers is not None
+        self.assertGreater(len(layers), 0)
 
 
 if __name__ == "__main__":

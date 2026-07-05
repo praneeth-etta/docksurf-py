@@ -27,10 +27,13 @@ from docksurf_py.actions import (
     ComposeActionHandler,
     ContainerActionHandler,
     DeletePlan,
+    ImageActionHandler,
     InspectHandler,
+    NetworkActionHandler,
     PruneHandler,
     ResourceDeletionHandler,
     SelectionHandler,
+    VolumeActionHandler,
 )
 from docksurf_py.constants import (
     DETAIL_PANE_ID,
@@ -96,6 +99,20 @@ def _compose_actions() -> frozenset[str]:
     )
 
 
+def _tab_actions(mixin: type) -> frozenset[str]:
+    """Action names implemented directly by a tab-scoped handler mixin.
+
+    Used to give the help screen a per-tab scope column for Image/Volume/
+    Network actions — reflected from the mixin so it can't drift from what's
+    actually bound (same trick as `_container_only_actions`).
+    """
+    return frozenset(
+        name.removeprefix("action_")
+        for name, member in vars(mixin).items()
+        if name.startswith("action_") and callable(member)
+    )
+
+
 @dataclass(frozen=True)
 class ResourceEntry:
     """Everything the app needs to treat one resource type generically.
@@ -135,6 +152,7 @@ class AppContext(Protocol):
     _resource_registry: dict[TabID, ResourceEntry]
     _collapsed_projects: set[str]
     _marked: dict[TabID, set[tuple[str, str]]]
+    _volume_sizes: dict[str, int]
     is_running: bool  # really a textual.app.App property
 
     def start_refresh(self) -> None: ...
@@ -160,6 +178,7 @@ class AppContext(Protocol):
     def action_compose_start(self) -> None: ...
     def action_compose_restart(self) -> None: ...
     def action_toggle_group(self) -> None: ...
+    def _handle_write_result(self, result: CommandResult) -> None: ...
 
     # These five are really `textual.app.App` methods. DockSurfApp's real
     # MRO includes both `App` and (fictitiously, TYPE_CHECKING-only) this
@@ -185,6 +204,9 @@ class DockSurfApp(
     SelectionHandler,
     InspectHandler,
     PruneHandler,
+    ImageActionHandler,
+    VolumeActionHandler,
+    NetworkActionHandler,
     ResourceSearchController,
     LiveStatsController,
     App,
@@ -229,6 +251,16 @@ class DockSurfApp(
         ("w", "system_df", "Disk usage"),
         ("P", "prune", "Prune"),
         Binding("escape", "clear_marks", "Clear marks", show=False),
+        # Image / Volume / Network tab actions (Roadmap §5). Tab-scoped: each
+        # action guards its tab and notifies a hint elsewhere. show=False keeps
+        # the footer uncluttered; all are documented in the `?` help screen.
+        Binding("plus", "new_resource", "New / Pull", show=False),
+        Binding("h", "image_history", "Image layer history", show=False),
+        Binding("y", "tag_image", "Tag image", show=False),
+        Binding("a", "mark_all_dangling", "Mark dangling images", show=False),
+        Binding("b", "volume_size", "Volume size on disk", show=False),
+        Binding("v", "network_connect", "Connect to network", show=False),
+        Binding("m", "network_disconnect", "Disconnect from network", show=False),
     ]
     CSS_PATH = "app.tcss"
 
@@ -343,7 +375,11 @@ class DockSurfApp(
 
     @on(DataTable.RowHighlighted)
     def update_details(self, event: DataTable.RowHighlighted) -> None:
-        if not self.snapshot:
+        # A queued RowHighlighted can dispatch during teardown (a write action's
+        # refresh repopulates a table just as the app unmounts) — the widgets
+        # are gone, so bail rather than raise NoMatches, matching the
+        # is_running guard in SnapshotManager._apply_snapshot.
+        if not self.is_running or not self.snapshot:
             return
         active = self.query_one(TabbedContent).active
         entry = self._resource_registry.get(active)
@@ -361,9 +397,30 @@ class DockSurfApp(
     def clear_on_tab_switch(self) -> None:
         self._auto_select_first()
 
+    def action_new_resource(self) -> None:
+        """`+`: create/pull on whichever non-container tab is active."""
+        active = self.query_one(TabbedContent).active
+        if active == TabID.IMAGES:
+            self.action_pull_image()
+        elif active == TabID.VOLUMES:
+            self.action_create_volume()
+        elif active == TabID.NETWORKS:
+            self.action_create_network()
+        else:
+            self.notify("Nothing to create on this tab", severity="information")
+
     def action_help(self) -> None:
         self.push_screen(
-            HelpScreen(self.BINDINGS, _container_only_actions(), _compose_actions())
+            HelpScreen(
+                self.BINDINGS,
+                _container_only_actions(),
+                _compose_actions(),
+                tab_actions={
+                    "Images tab": _tab_actions(ImageActionHandler),
+                    "Volumes tab": _tab_actions(VolumeActionHandler),
+                    "Networks tab": _tab_actions(NetworkActionHandler),
+                },
+            )
         )
 
 

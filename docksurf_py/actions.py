@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
 from rich.markup import escape
+from rich.table import Table
 from textual import on, work
 from textual.coordinate import Coordinate
 from textual.widgets import DataTable, TabbedContent
@@ -29,24 +30,29 @@ from docksurf_py.constants import (
     LogOptions,
     TabID,
 )
+from docksurf_py.docker import format_size
 from docksurf_py.models import (
     CommandErrorKind,
     CommandResult,
     ComposeProject,
     Container,
     Image,
+    ImageLayer,
     Network,
     Volume,
 )
 from docksurf_py.widgets import (
     ConfirmDialog,
+    ContainerPickerScreen,
     DetailPane,
     InspectScreen,
+    LayerHistoryScreen,
     LogOptionsScreen,
     LogPane,
     PromptField,
     PromptScreen,
     PruneScreen,
+    PullProgressScreen,
 )
 
 if TYPE_CHECKING:
@@ -848,6 +854,51 @@ def _display_name(item: Any) -> str:
     return getattr(item, "name", str(item))
 
 
+def _parse_labels(raw: str) -> dict[str, str]:
+    """Parse a `k=v,k2=v2` prompt string into a labels dict (blank pairs skipped)."""
+    labels: dict[str, str] = {}
+    for pair in raw.split(","):
+        pair = pair.strip()
+        if not pair or "=" not in pair:
+            continue
+        key, _, value = pair.partition("=")
+        key = key.strip()
+        if key:
+            labels[key] = value.strip()
+    return labels
+
+
+def _format_pull_chunk(chunk: dict) -> str | None:
+    """Format one `docker pull` progress dict into a display line, or None.
+
+    Layer-scoped chunks (`id` present) are prefixed with the short layer id;
+    top-level status lines (Pulling from…, Digest…, Status…) are bolded.
+    """
+    status = chunk.get("status")
+    if not status:
+        return None
+    layer = chunk.get("id")
+    if layer:
+        return f"[cyan]{escape(str(layer))}[/]  {escape(str(status))}"
+    return f"[b]{escape(str(status))}[/]"
+
+
+def _render_layers(image_ref: str, layers: list[ImageLayer]) -> Table:
+    """Build the `docker history` layer table for `LayerHistoryScreen`."""
+    table = Table(box=None, expand=True)
+    table.add_column("Size", justify="right", style="cyan", width=12)
+    table.add_column("Created by")
+    for layer in layers:
+        command = layer.created_by or "—"
+        # docker history prefixes real build steps with "/bin/sh -c #(nop) " for
+        # metadata ops and "/bin/sh -c " for RUN — trim the noise for readability.
+        command = command.replace("/bin/sh -c #(nop) ", "").replace(
+            "/bin/sh -c ", "RUN "
+        )
+        table.add_row(format_size(layer.size_bytes), command)
+    return table
+
+
 class InspectHandler(_Base):
     """The `docker inspect` escape hatch — full raw JSON for any resource on
     any tab, in a scrollable/searchable modal (see `InspectScreen`)."""
@@ -935,6 +986,342 @@ class PruneHandler(_Base):
         else:
             logger.warning("Prune failed: %s", result.message)
             self.notify(f"Error: {result.message}", severity="error")
+
+
+class ImageActionHandler(_Base):
+    """Image-tab actions: pull (with live progress), layer history, tag, and a
+    one-key mark-all-dangling convenience that feeds the existing bulk delete.
+
+    Each action guards the Images tab and notifies a hint elsewhere, mirroring
+    how container actions guard on a focused container.
+    """
+
+    _IMAGE_TAB_HINT = "Switch to the Images tab and select an image"
+
+    def _on_images_tab(self) -> bool:
+        return self.query_one(TabbedContent).active == TabID.IMAGES
+
+    def _get_focused_image(self) -> Image | None:
+        item = self._get_focused_resource(TabID.IMAGES)
+        return item if isinstance(item, Image) else None
+
+    def _handle_write_result(self, result: CommandResult) -> None:
+        """Shared success/failure handling for the simple create/tag/connect
+        writes (also used by Volume/Network handlers via the composed app)."""
+        if result.ok:
+            logger.info("%s", result.message)
+            self.notify(result.message)
+            self.start_refresh()
+        else:
+            logger.warning("Action failed: %s", result.message)
+            self.notify(f"Error: {result.message}", severity="error")
+
+    @work
+    async def action_pull_image(self) -> None:
+        if not self._on_images_tab():
+            self.notify(self._IMAGE_TAB_HINT, severity="warning")
+            return
+        values = await self.push_screen_wait(
+            PromptScreen(
+                "Pull image",
+                [PromptField("Image (name:tag)", placeholder="e.g. alpine:latest")],
+            )
+        )
+        if values is None:
+            return
+        ref = values[0].strip()
+        if not ref:
+            self.notify("No image specified", severity="warning")
+            return
+        repository, _, tag = ref.partition(":")
+        tag = tag or "latest"
+        screen = PullProgressScreen(f"Pulling {repository}:{tag}")
+        self.push_screen(screen)
+        self._execute_pull(screen, repository, tag)
+
+    @work(thread=True)
+    def _execute_pull(
+        self, screen: PullProgressScreen, repository: str, tag: str
+    ) -> None:
+        stream = self.docker.stream_pull(repository, tag)
+        error: str | None = None
+        last: dict[str, str] = {}
+        for chunk in stream:
+            if not isinstance(chunk, dict):
+                continue
+            if chunk.get("error"):
+                error = str(chunk["error"])
+                line: str | None = f"[red]{escape(error)}[/]"
+            else:
+                layer = str(chunk.get("id") or "")
+                status = str(chunk.get("status") or "")
+                if not status or last.get(layer) == status:
+                    continue
+                last[layer] = status
+                line = _format_pull_chunk(chunk)
+            if not line:
+                continue
+            try:
+                self.call_from_thread(screen.append, line)
+            except Exception:
+                break
+        try:
+            self.call_from_thread(self._finish_pull, screen, repository, tag, error)
+        except Exception:
+            pass
+
+    def _finish_pull(
+        self,
+        screen: PullProgressScreen,
+        repository: str,
+        tag: str,
+        error: str | None,
+    ) -> None:
+        if error:
+            self.notify(f"Pull failed: {error}", severity="error")
+        else:
+            msg = f"Pulled {repository}:{tag}"
+            logger.info("%s", msg)
+            screen.append("[green]✓ Pull complete[/]")
+            self.notify(msg)
+            self.start_refresh()
+
+    @work
+    async def action_tag_image(self) -> None:
+        if not self._on_images_tab():
+            self.notify(self._IMAGE_TAB_HINT, severity="warning")
+            return
+        image = self._get_focused_image()
+        if image is None:
+            self.notify(self._IMAGE_TAB_HINT, severity="warning")
+            return
+        values = await self.push_screen_wait(
+            PromptScreen(
+                f"Tag {escape(image.repository)}:{escape(image.tag)}",
+                [
+                    PromptField("Repository", value=image.repository),
+                    PromptField("Tag", value="latest"),
+                ],
+            )
+        )
+        if values is None:
+            return
+        repository, tag = (v.strip() for v in values)
+        if not repository:
+            self.notify("Repository is required", severity="warning")
+            return
+        self._execute_tag(image.id, repository, tag or "latest")
+
+    @work(thread=True)
+    def _execute_tag(self, image_id: str, repository: str, tag: str) -> None:
+        result = self.docker.tag_image(image_id, repository, tag)
+        self.call_from_thread(self._handle_write_result, result)
+
+    def action_image_history(self) -> None:
+        if not self._on_images_tab():
+            self.notify(self._IMAGE_TAB_HINT, severity="warning")
+            return
+        image = self._get_focused_image()
+        if image is None:
+            self.notify(self._IMAGE_TAB_HINT, severity="warning")
+            return
+        self._execute_history(image.id, _display_name(image))
+
+    @work(thread=True)
+    def _execute_history(self, image_id: str, name: str) -> None:
+        layers = self.docker.image_history(image_id)
+        if layers is None:
+            self.call_from_thread(
+                self.notify,
+                f"Could not load history for {escape(name)}",
+                severity="error",
+            )
+            return
+        table = _render_layers(name, layers)
+        self.call_from_thread(
+            self.push_screen, LayerHistoryScreen(f"History — {name}", table)
+        )
+
+    def action_mark_all_dangling(self) -> None:
+        if not self._on_images_tab():
+            self.notify(self._IMAGE_TAB_HINT, severity="warning")
+            return
+        if not self.snapshot:
+            return
+        dangling = [i for i in self.snapshot.images if i.is_dangling]
+        if not dangling:
+            self.notify("No dangling images")
+            return
+        marked = self._marked[TabID.IMAGES]
+        for img in dangling:
+            key = self._row_key(img)
+            if key is not None:
+                marked.add(key)
+        self._rerender_active_table()
+        self.notify(f"Marked {len(dangling)} dangling image(s) — press d to remove")
+
+
+class VolumeActionHandler(_Base):
+    """Volume-tab actions: create, and on-demand per-volume size on disk."""
+
+    _VOLUME_TAB_HINT = "Switch to the Volumes tab"
+
+    def _on_volumes_tab(self) -> bool:
+        return self.query_one(TabbedContent).active == TabID.VOLUMES
+
+    @work
+    async def action_create_volume(self) -> None:
+        if not self._on_volumes_tab():
+            self.notify(self._VOLUME_TAB_HINT, severity="warning")
+            return
+        values = await self.push_screen_wait(
+            PromptScreen(
+                "Create volume",
+                [
+                    PromptField("Name", placeholder="leave blank for anonymous"),
+                    PromptField("Driver", value="local"),
+                    PromptField("Labels (k=v,k=v)"),
+                ],
+            )
+        )
+        if values is None:
+            return
+        name, driver, labels_raw = values
+        self._execute_create_volume(
+            name.strip(), driver.strip() or "local", _parse_labels(labels_raw)
+        )
+
+    @work(thread=True)
+    def _execute_create_volume(
+        self, name: str, driver: str, labels: dict[str, str]
+    ) -> None:
+        result = self.docker.create_volume(name, driver, labels)
+        self.call_from_thread(self._handle_write_result, result)
+
+    def action_volume_size(self) -> None:
+        if not self._on_volumes_tab():
+            self.notify(self._VOLUME_TAB_HINT, severity="warning")
+            return
+        self.notify("Computing volume sizes…")
+        self._execute_volume_sizes()
+
+    @work(thread=True)
+    def _execute_volume_sizes(self) -> None:
+        sizes = self.docker.volume_sizes()
+        self.call_from_thread(self._apply_volume_sizes, sizes)
+
+    def _apply_volume_sizes(self, sizes: dict[str, int]) -> None:
+        self._volume_sizes = sizes
+        if self.query_one(TabbedContent).active != TabID.VOLUMES:
+            return
+        # Re-render the focused volume's detail so the Size row appears now.
+        entry = self._resource_registry[TabID.VOLUMES]
+        table = self.query_one(f"#{entry.table_id}", DataTable)
+        row = table.cursor_row
+        if row is not None:
+            pane = self.query_one(f"#{DETAIL_PANE_ID}", DetailPane)
+            try:
+                entry.show_details(pane, row)
+            except IndexError:
+                pass
+        self.notify("Volume sizes updated")
+
+
+class NetworkActionHandler(_Base):
+    """Network-tab actions: create, and connect/disconnect a container."""
+
+    _NETWORK_TAB_HINT = "Switch to the Networks tab and select a network"
+
+    def _get_focused_network(self) -> Network | None:
+        item = self._get_focused_resource(TabID.NETWORKS)
+        return item if isinstance(item, Network) else None
+
+    def _require_network(self) -> Network | None:
+        if self.query_one(TabbedContent).active != TabID.NETWORKS:
+            self.notify(self._NETWORK_TAB_HINT, severity="warning")
+            return None
+        net = self._get_focused_network()
+        if net is None:
+            self.notify(self._NETWORK_TAB_HINT, severity="warning")
+        return net
+
+    @work
+    async def action_create_network(self) -> None:
+        if self.query_one(TabbedContent).active != TabID.NETWORKS:
+            self.notify(self._NETWORK_TAB_HINT, severity="warning")
+            return
+        values = await self.push_screen_wait(
+            PromptScreen(
+                "Create network",
+                [
+                    PromptField("Name"),
+                    PromptField("Driver", value="bridge"),
+                    PromptField("Subnet (optional)", placeholder="e.g. 172.30.0.0/16"),
+                ],
+            )
+        )
+        if values is None:
+            return
+        name, driver, subnet = (v.strip() for v in values)
+        if not name:
+            self.notify("Network name is required", severity="warning")
+            return
+        self._execute_create_network(name, driver or "bridge", subnet)
+
+    @work(thread=True)
+    def _execute_create_network(self, name: str, driver: str, subnet: str) -> None:
+        result = self.docker.create_network(name, driver, subnet)
+        self.call_from_thread(self._handle_write_result, result)
+
+    @work
+    async def action_network_connect(self) -> None:
+        net = self._require_network()
+        if net is None:
+            return
+        attached = {ep.container_name for ep in net.endpoints}
+        containers = self.snapshot.containers if self.snapshot else []
+        options = [(c.id, c.name) for c in containers if c.name not in attached]
+        if not options:
+            self.notify(
+                f"All containers already attached to {escape(net.name)}",
+                severity="information",
+            )
+            return
+        container = await self.push_screen_wait(
+            ContainerPickerScreen(f"Connect a container to {net.name}", options)
+        )
+        if container is None:
+            return
+        self._execute_net_membership(net.name, container, connect=True)
+
+    @work
+    async def action_network_disconnect(self) -> None:
+        net = self._require_network()
+        if net is None:
+            return
+        if not net.endpoints:
+            self.notify(
+                f"No containers attached to {escape(net.name)}",
+                severity="information",
+            )
+            return
+        options = [(ep.container_name, ep.container_name) for ep in net.endpoints]
+        container = await self.push_screen_wait(
+            ContainerPickerScreen(f"Disconnect a container from {net.name}", options)
+        )
+        if container is None:
+            return
+        self._execute_net_membership(net.name, container, connect=False)
+
+    @work(thread=True)
+    def _execute_net_membership(
+        self, network_name: str, container: str, connect: bool
+    ) -> None:
+        if connect:
+            result = self.docker.connect_container(network_name, container)
+        else:
+            result = self.docker.disconnect_container(network_name, container)
+        self.call_from_thread(self._handle_write_result, result)
 
 
 class SelectionHandler(_Base):

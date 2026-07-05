@@ -384,5 +384,213 @@ class ContainerCpTests(unittest.TestCase):
         self.assertEqual(result.kind, CommandErrorKind.UNKNOWN)
 
 
+class ImageWriteTests(unittest.TestCase):
+    def _client(self) -> DockerClient:
+        client = DockerClient()
+        client._sdk = MagicMock()
+        return client
+
+    def test_tag_image_calls_sdk_tag(self) -> None:
+        client = self._client()
+        client._sdk.images.get.return_value.tag.return_value = True
+        result = client.tag_image("sha256:x", "myrepo", "v2")
+        client._sdk.images.get.assert_called_once_with("sha256:x")
+        client._sdk.images.get.return_value.tag.assert_called_once_with(
+            "myrepo", tag="v2"
+        )
+        self.assertTrue(result.ok)
+        self.assertIn("myrepo:v2", result.message)
+
+    def test_tag_image_rejected_returns_failure(self) -> None:
+        client = self._client()
+        client._sdk.images.get.return_value.tag.return_value = False
+        result = client.tag_image("sha256:x", "myrepo", "v2")
+        self.assertFalse(result.ok)
+        self.assertEqual(result.kind, CommandErrorKind.UNKNOWN)
+
+    def test_tag_image_not_found_is_classified(self) -> None:
+        client = self._client()
+        client._sdk.images.get.side_effect = NotFound("no such image")
+        result = client.tag_image("sha256:x", "myrepo", "v2")
+        self.assertFalse(result.ok)
+        self.assertEqual(result.kind, CommandErrorKind.NOT_FOUND)
+
+    def test_image_history_maps_layers(self) -> None:
+        client = self._client()
+        client._sdk.images.get.return_value.history.return_value = [
+            {"CreatedBy": "/bin/sh -c apk add curl", "Size": 2048, "Created": 1},
+            {"CreatedBy": "/bin/sh -c #(nop) CMD", "Size": 0, "Created": 2},
+        ]
+        layers = client.image_history("sha256:x")
+        assert layers is not None
+        self.assertEqual(len(layers), 2)
+        self.assertEqual(layers[0].size_bytes, 2048)
+        self.assertEqual(layers[0].created_by, "/bin/sh -c apk add curl")
+
+    def test_image_history_not_found_returns_none(self) -> None:
+        client = self._client()
+        client._sdk.images.get.side_effect = NotFound("no such image")
+        self.assertIsNone(client.image_history("sha256:x"))
+
+    def test_image_history_not_connected_returns_none(self) -> None:
+        client = DockerClient()
+        self.assertIsNone(client.image_history("sha256:x"))
+
+
+class VolumeWriteTests(unittest.TestCase):
+    def _client(self) -> DockerClient:
+        client = DockerClient()
+        client._sdk = MagicMock()
+        return client
+
+    def test_create_volume_calls_sdk_create(self) -> None:
+        client = self._client()
+        client._sdk.volumes.create.return_value.name = "myvol"
+        result = client.create_volume("myvol", "local", {"env": "test"})
+        client._sdk.volumes.create.assert_called_once_with(
+            name="myvol", driver="local", labels={"env": "test"}
+        )
+        self.assertTrue(result.ok)
+        self.assertIn("myvol", result.message)
+
+    def test_create_volume_anonymous_passes_none_name(self) -> None:
+        client = self._client()
+        client._sdk.volumes.create.return_value.name = "auto"
+        client.create_volume("", "local", {})
+        _, kwargs = client._sdk.volumes.create.call_args
+        self.assertIsNone(kwargs["name"])
+
+    def test_volume_sizes_parses_df(self) -> None:
+        client = self._client()
+        client._sdk.df.return_value = {
+            "Volumes": [
+                {"Name": "a", "UsageData": {"Size": 100}},
+                {"Name": "b", "UsageData": {"Size": 0}},
+                {"Name": "c"},  # no UsageData
+            ]
+        }
+        sizes = client.volume_sizes()
+        self.assertEqual(sizes, {"a": 100, "b": 0, "c": 0})
+
+    def test_volume_sizes_not_connected_returns_empty(self) -> None:
+        client = DockerClient()
+        self.assertEqual(client.volume_sizes(), {})
+
+
+class NetworkWriteTests(unittest.TestCase):
+    def _client(self) -> DockerClient:
+        client = DockerClient()
+        client._sdk = MagicMock()
+        return client
+
+    def test_create_network_without_subnet_passes_no_ipam(self) -> None:
+        client = self._client()
+        client._sdk.networks.create.return_value.name = "net1"
+        result = client.create_network("net1", "bridge", "")
+        _, kwargs = client._sdk.networks.create.call_args
+        self.assertIsNone(kwargs["ipam"])
+        self.assertTrue(result.ok)
+
+    def test_create_network_with_subnet_builds_ipam(self) -> None:
+        client = self._client()
+        client._sdk.networks.create.return_value.name = "net1"
+        client.create_network("net1", "bridge", "172.30.0.0/16")
+        _, kwargs = client._sdk.networks.create.call_args
+        self.assertIsNotNone(kwargs["ipam"])
+
+    def test_connect_container_calls_sdk(self) -> None:
+        client = self._client()
+        result = client.connect_container("net1", "cid")
+        client._sdk.networks.get.assert_called_with("net1")
+        client._sdk.networks.get.return_value.connect.assert_called_once_with("cid")
+        self.assertTrue(result.ok)
+
+    def test_disconnect_container_calls_sdk_with_force(self) -> None:
+        client = self._client()
+        result = client.disconnect_container("net1", "cid")
+        client._sdk.networks.get.return_value.disconnect.assert_called_once_with(
+            "cid", force=True
+        )
+        self.assertTrue(result.ok)
+
+    def test_create_network_not_connected_is_daemon_unreachable(self) -> None:
+        client = DockerClient()
+        result = client.create_network("net1")
+        self.assertFalse(result.ok)
+        self.assertEqual(result.kind, CommandErrorKind.DAEMON_UNREACHABLE)
+
+
+class GetNetworksEndpointTests(unittest.TestCase):
+    def test_parses_attached_container_endpoints(self) -> None:
+        from docksurf_py.docker import DockerResourceFetcher
+
+        fake_net = MagicMock()
+        fake_net.short_id = "abc123"
+        fake_net.name = "mynet"
+        fake_net.attrs = {
+            "Driver": "bridge",
+            "Scope": "local",
+            "IPAM": {"Config": [{"Subnet": "172.18.0.0/16", "Gateway": "172.18.0.1"}]},
+            "Containers": {
+                "cid1": {
+                    "Name": "web",
+                    "IPv4Address": "172.18.0.2/16",
+                    "IPv6Address": "",
+                    "MacAddress": "02:42:ac:12:00:02",
+                },
+            },
+        }
+        sdk = MagicMock()
+        sdk.networks.list.return_value = [fake_net]
+        networks = DockerResourceFetcher(sdk).get_networks()
+        self.assertEqual(len(networks), 1)
+        self.assertEqual(len(networks[0].endpoints), 1)
+        ep = networks[0].endpoints[0]
+        self.assertEqual(ep.container_name, "web")
+        self.assertEqual(ep.ipv4, "172.18.0.2/16")
+        self.assertEqual(ep.mac, "02:42:ac:12:00:02")
+
+    def test_no_containers_yields_empty_endpoints(self) -> None:
+        from docksurf_py.docker import DockerResourceFetcher
+
+        fake_net = MagicMock()
+        fake_net.short_id = "abc123"
+        fake_net.name = "mynet"
+        fake_net.attrs = {"Driver": "bridge", "Scope": "local", "IPAM": {"Config": []}}
+        sdk = MagicMock()
+        sdk.networks.list.return_value = [fake_net]
+        networks = DockerResourceFetcher(sdk).get_networks()
+        self.assertEqual(networks[0].endpoints, [])
+
+
+class PullStreamTests(unittest.TestCase):
+    def test_yields_chunks_from_api_pull(self) -> None:
+        from docksurf_py.docker import PullStream
+
+        sdk = MagicMock()
+        sdk.api.pull.return_value = iter(
+            [{"status": "Pulling"}, {"status": "Pull complete", "id": "x"}]
+        )
+        chunks = list(PullStream("alpine", "latest", sdk))
+        self.assertEqual(len(chunks), 2)
+        sdk.api.pull.assert_called_once_with(
+            "alpine", tag="latest", stream=True, decode=True
+        )
+
+    def test_api_error_yields_error_chunk(self) -> None:
+        from docksurf_py.docker import PullStream
+
+        sdk = MagicMock()
+        sdk.api.pull.side_effect = DockerException("no such image")
+        chunks = list(PullStream("nope", "latest", sdk))
+        self.assertEqual(len(chunks), 1)
+        self.assertIn("error", chunks[0])
+
+    def test_no_client_yields_nothing(self) -> None:
+        from docksurf_py.docker import PullStream
+
+        self.assertEqual(list(PullStream("alpine", "latest", None)), [])
+
+
 if __name__ == "__main__":
     unittest.main()

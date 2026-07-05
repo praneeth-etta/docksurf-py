@@ -4,6 +4,7 @@ import unittest
 from typing import Callable
 from unittest.mock import patch
 
+from rich.console import Console
 from rich.table import Table as RichTable
 from textual.widgets import (
     DataTable,
@@ -14,14 +15,27 @@ from textual.widgets import (
     TabbedContent,
 )
 
-from docksurf_py.actions import ContainerActionHandler
+from docksurf_py.actions import (
+    ContainerActionHandler,
+    ImageActionHandler,
+    NetworkActionHandler,
+    VolumeActionHandler,
+)
 from docksurf_py.app import (
     DockSurfApp,
     _compose_actions,
     _container_only_actions,
+    _tab_actions,
 )
 from docksurf_py.connection import ConnectionState, ConnectionStatus
-from docksurf_py.constants import LOG_PANE_ID, LogLine, LogOptions, TabID, TableID
+from docksurf_py.constants import (
+    DETAIL_PANE_ID,
+    LOG_PANE_ID,
+    LogLine,
+    LogOptions,
+    TabID,
+    TableID,
+)
 from docksurf_py.docker import EventStream, StatsStream
 from docksurf_py.models import (
     CommandResult,
@@ -30,16 +44,24 @@ from docksurf_py.models import (
     ContainerTop,
     DockerSnapshot,
     Image,
+    ImageLayer,
+    Network,
+    NetworkEndpoint,
     SystemDf,
+    Volume,
 )
 from docksurf_py.widgets import (
     ConfirmDialog,
+    ContainerPickerScreen,
+    DetailPane,
     HelpScreen,
     InspectScreen,
+    LayerHistoryScreen,
     LogOptionsScreen,
     LogPane,
     PromptScreen,
     PruneScreen,
+    PullProgressScreen,
 )
 from tests.test_compose import make_container
 
@@ -71,6 +93,23 @@ class FakeLogStream:
         self._active = False
 
 
+class FakePullStream:
+    """A finite pull stream yielding fixed progress dicts, for driving pull UI."""
+
+    def __init__(self, chunks: list[dict]) -> None:
+        self._chunks = list(chunks)
+        self._active = True
+
+    def __iter__(self):
+        for chunk in self._chunks:
+            if not self._active:
+                break
+            yield chunk
+
+    def stop(self) -> None:
+        self._active = False
+
+
 class MockDockerService:
     def __init__(self, fetch_fn: Callable[[], DockerSnapshot]) -> None:
         self._fetch_fn = fetch_fn
@@ -83,6 +122,21 @@ class MockDockerService:
             LogLine(text="starting up", ts="2024-01-01T00:00:00Z"),
             LogLine(text="request handled", ts="2024-01-01T00:00:01Z"),
             LogLine(text="boom", ts="2024-01-01T00:00:02Z", stream="stderr"),
+        ]
+        # Progress dicts a pull stream yields; tests can override.
+        self.pull_chunks: list[dict] = [
+            {"status": "Pulling from library/alpine"},
+            {"status": "Pull complete", "id": "abc123"},
+            {"status": "Status: Downloaded newer image for alpine:latest"},
+        ]
+        # Per-volume sizes returned by volume_sizes(); tests can override.
+        self.volume_size_map: dict[str, int] = {}
+        # Layer history returned by image_history(); tests can override.
+        self.history_layers: list[ImageLayer] = [
+            ImageLayer(created_by="/bin/sh -c #(nop) CMD", size_bytes=0, created="0"),
+            ImageLayer(
+                created_by="/bin/sh -c apk add curl", size_bytes=1024, created="0"
+            ),
         ]
 
     @property
@@ -106,8 +160,20 @@ class MockDockerService:
     def stream_events(self):
         return EventStream(None)
 
+    def stream_pull(self, repository: str, tag: str = "latest"):
+        self.calls.append(("stream_pull", repository, tag))
+        return FakePullStream(self.pull_chunks)
+
     def system_df(self) -> SystemDf:
         return SystemDf(entries=[], total_size=0, total_reclaimable=0)
+
+    def image_history(self, image_id: str):
+        self.calls.append(("image_history", image_id))
+        return self.history_layers
+
+    def volume_sizes(self) -> dict[str, int]:
+        self.calls.append(("volume_sizes",))
+        return self.volume_size_map
 
     def compose_action(
         self, project, verb, config_files="", working_dir=""
@@ -142,6 +208,37 @@ class MockDockerService:
     def remove_network(self, network_name: str) -> CommandResult:
         self.calls.append(("remove_network", network_name))
         return CommandResult.success()
+
+    def tag_image(
+        self, image_id: str, repository: str, tag: str = "latest"
+    ) -> CommandResult:
+        self.calls.append(("tag_image", image_id, repository, tag))
+        return CommandResult.success(f"Tagged {repository}:{tag}")
+
+    def create_volume(
+        self,
+        name: str,
+        driver: str = "local",
+        labels: dict[str, str] | None = None,
+    ) -> CommandResult:
+        self.calls.append(("create_volume", name, driver, labels or {}))
+        return CommandResult.success(f"Created volume {name}")
+
+    def create_network(
+        self, name: str, driver: str = "bridge", subnet: str = ""
+    ) -> CommandResult:
+        self.calls.append(("create_network", name, driver, subnet))
+        return CommandResult.success(f"Created network {name}")
+
+    def connect_container(self, network_name: str, container_id: str) -> CommandResult:
+        self.calls.append(("connect_container", network_name, container_id))
+        return CommandResult.success("Connected")
+
+    def disconnect_container(
+        self, network_name: str, container_id: str, force: bool = True
+    ) -> CommandResult:
+        self.calls.append(("disconnect_container", network_name, container_id))
+        return CommandResult.success("Disconnected")
 
     def pause_container(self, container_id: str) -> CommandResult:
         self.calls.append(("pause_container", container_id))
@@ -375,6 +472,11 @@ class HelpScreenTests(unittest.IsolatedAsyncioTestCase):
             )
             rows = list(zip(*(list(c.cells) for c in table.columns)))
 
+            tab_scopes = {
+                "Images tab": _tab_actions(ImageActionHandler),
+                "Volumes tab": _tab_actions(VolumeActionHandler),
+                "Networks tab": _tab_actions(NetworkActionHandler),
+            }
             for item in app.BINDINGS:
                 if isinstance(item, tuple):
                     key, action, description = item
@@ -389,6 +491,10 @@ class HelpScreenTests(unittest.IsolatedAsyncioTestCase):
                     expected_scope = "Container only"
                 else:
                     expected_scope = "Global"
+                    for label, actions in tab_scopes.items():
+                        if action in actions:
+                            expected_scope = label
+                            break
                 self.assertEqual(match[2], expected_scope, f"key={key} action={action}")
 
             # Regression: the old hand-maintained frozenset mislabeled
@@ -950,6 +1056,266 @@ class LogViewerTests(unittest.IsolatedAsyncioTestCase):
                     for c in svc.calls
                 )
             )
+
+
+def _image(repo="alpine", tag="latest", dangling=False, image_id="sha256:img1"):
+    return Image(
+        id=image_id,
+        repository=repo,
+        tag=tag,
+        size_bytes=100,
+        is_dangling=dangling,
+        used_by=[],
+        created="",
+        architecture="amd64",
+    )
+
+
+def _volume(name="vol1"):
+    return Volume(name=name, driver="local", mountpoint="/m", used_by=[], labels={})
+
+
+def _network(name="net1", endpoints=None):
+    return Network(
+        id="n1",
+        name=name,
+        driver="bridge",
+        subnet="172.18.0.0/16",
+        gateway="172.18.0.1",
+        scope="local",
+        used_by=[],
+        endpoints=endpoints or [],
+    )
+
+
+class ImageActionTests(unittest.IsolatedAsyncioTestCase):
+    async def _on_images(self, app: DockSurfApp, pilot) -> None:
+        app.query_one(TabbedContent).active = TabID.IMAGES
+        await pilot.pause()
+        await wait_until(lambda: bool(app._current.get(TabID.IMAGES)))
+        app.query_one(f"#{TableID.IMAGES}", DataTable).move_cursor(row=0)
+
+    async def test_pull_prompts_streams_and_pulls(self) -> None:
+        svc = MockDockerService(lambda: DockerSnapshot([], [_image()], [], []))
+        app = DockSurfApp(docker=svc)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await self._on_images(app, pilot)
+
+            app.action_pull_image()
+            await wait_until(
+                lambda: any(isinstance(s, PromptScreen) for s in app.screen_stack)
+            )
+            app.screen_stack[-1].dismiss(["redis:7"])
+            await wait_until(
+                lambda: any(isinstance(s, PullProgressScreen) for s in app.screen_stack)
+            )
+            await wait_until(lambda: ("stream_pull", "redis", "7") in svc.calls)
+
+    async def test_pull_defaults_tag_to_latest(self) -> None:
+        svc = MockDockerService(lambda: DockerSnapshot([], [_image()], [], []))
+        app = DockSurfApp(docker=svc)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await self._on_images(app, pilot)
+            app.action_pull_image()
+            await wait_until(
+                lambda: any(isinstance(s, PromptScreen) for s in app.screen_stack)
+            )
+            app.screen_stack[-1].dismiss(["busybox"])
+            await wait_until(lambda: ("stream_pull", "busybox", "latest") in svc.calls)
+
+    async def test_pull_guarded_off_images_tab(self) -> None:
+        svc = MockDockerService(lambda: EMPTY_SNAPSHOT)
+        app = DockSurfApp(docker=svc)
+        async with app.run_test() as pilot:
+            await pilot.pause()  # Containers tab active
+            app.action_pull_image()
+            await pilot.pause()
+            self.assertFalse(any(isinstance(s, PromptScreen) for s in app.screen_stack))
+
+    async def test_tag_image_prompts_and_tags(self) -> None:
+        svc = MockDockerService(lambda: DockerSnapshot([], [_image()], [], []))
+        app = DockSurfApp(docker=svc)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await self._on_images(app, pilot)
+            app.action_tag_image()
+            await wait_until(
+                lambda: any(isinstance(s, PromptScreen) for s in app.screen_stack)
+            )
+            app.screen_stack[-1].dismiss(["myrepo", "v2"])
+            await wait_until(
+                lambda: ("tag_image", "sha256:img1", "myrepo", "v2") in svc.calls
+            )
+
+    async def test_image_history_opens_screen(self) -> None:
+        svc = MockDockerService(lambda: DockerSnapshot([], [_image()], [], []))
+        app = DockSurfApp(docker=svc)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await self._on_images(app, pilot)
+            app.action_image_history()
+            await wait_until(lambda: ("image_history", "sha256:img1") in svc.calls)
+            await wait_until(
+                lambda: any(isinstance(s, LayerHistoryScreen) for s in app.screen_stack)
+            )
+
+    async def test_mark_all_dangling_marks_only_dangling(self) -> None:
+        images = [
+            _image(repo="alpine", image_id="sha256:keep", dangling=False),
+            _image(repo="<none>", tag="<none>", image_id="sha256:d1", dangling=True),
+            _image(repo="<none>", tag="<none>", image_id="sha256:d2", dangling=True),
+        ]
+        svc = MockDockerService(lambda: DockerSnapshot([], images, [], []))
+        app = DockSurfApp(docker=svc)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await self._on_images(app, pilot)
+            app.action_mark_all_dangling()
+            await pilot.pause()
+            self.assertEqual(
+                app._marked[TabID.IMAGES],
+                {("image", "sha256:d1"), ("image", "sha256:d2")},
+            )
+
+
+class VolumeActionTests(unittest.IsolatedAsyncioTestCase):
+    async def _on_volumes(self, app: DockSurfApp, pilot) -> None:
+        app.query_one(TabbedContent).active = TabID.VOLUMES
+        await pilot.pause()
+
+    async def test_create_volume_prompts_and_creates(self) -> None:
+        svc = MockDockerService(lambda: DockerSnapshot([], [], [_volume()], []))
+        app = DockSurfApp(docker=svc)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await self._on_volumes(app, pilot)
+            app.action_create_volume()
+            await wait_until(
+                lambda: any(isinstance(s, PromptScreen) for s in app.screen_stack)
+            )
+            app.screen_stack[-1].dismiss(["data", "local", "env=test"])
+            await wait_until(
+                lambda: ("create_volume", "data", "local", {"env": "test"}) in svc.calls
+            )
+
+    async def test_new_resource_on_volumes_tab_creates_volume(self) -> None:
+        svc = MockDockerService(lambda: DockerSnapshot([], [], [_volume()], []))
+        app = DockSurfApp(docker=svc)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await self._on_volumes(app, pilot)
+            app.action_new_resource()
+            await wait_until(
+                lambda: any(isinstance(s, PromptScreen) for s in app.screen_stack)
+            )
+
+    async def test_volume_size_populates_detail(self) -> None:
+        svc = MockDockerService(lambda: DockerSnapshot([], [], [_volume("vol1")], []))
+        svc.volume_size_map = {"vol1": 4096}
+        app = DockSurfApp(docker=svc)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await self._on_volumes(app, pilot)
+            await wait_until(lambda: bool(app._current.get(TabID.VOLUMES)))
+            app.query_one(f"#{TableID.VOLUMES}", DataTable).move_cursor(row=0)
+            app.action_volume_size()
+            await wait_until(lambda: ("volume_sizes",) in svc.calls)
+            await wait_until(lambda: app._volume_sizes == {"vol1": 4096})
+
+
+class NetworkActionTests(unittest.IsolatedAsyncioTestCase):
+    async def _on_networks(self, app: DockSurfApp, pilot) -> None:
+        app.query_one(TabbedContent).active = TabID.NETWORKS
+        await pilot.pause()
+        await wait_until(lambda: bool(app._current.get(TabID.NETWORKS)))
+        app.query_one(f"#{TableID.NETWORKS}", DataTable).move_cursor(row=0)
+
+    async def test_create_network_prompts_and_creates(self) -> None:
+        svc = MockDockerService(lambda: DockerSnapshot([], [], [], [_network()]))
+        app = DockSurfApp(docker=svc)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await self._on_networks(app, pilot)
+            app.action_create_network()
+            await wait_until(
+                lambda: any(isinstance(s, PromptScreen) for s in app.screen_stack)
+            )
+            app.screen_stack[-1].dismiss(["mynet", "bridge", "10.5.0.0/16"])
+            await wait_until(
+                lambda: (
+                    ("create_network", "mynet", "bridge", "10.5.0.0/16") in svc.calls
+                )
+            )
+
+    async def test_connect_picker_connects_selected_container(self) -> None:
+        container = make_container(name="web")  # make_container sets id == name
+        net = _network()
+        svc = MockDockerService(lambda: DockerSnapshot([container], [], [], [net]))
+        app = DockSurfApp(docker=svc)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await self._on_networks(app, pilot)
+            app.action_network_connect()
+            await wait_until(
+                lambda: any(
+                    isinstance(s, ContainerPickerScreen) for s in app.screen_stack
+                )
+            )
+            app.screen_stack[-1].dismiss("web")
+            await wait_until(lambda: ("connect_container", "net1", "web") in svc.calls)
+
+    async def test_disconnect_lists_attached_and_disconnects(self) -> None:
+        net = _network(
+            endpoints=[NetworkEndpoint(container_name="web", ipv4="1.2.3.4")]
+        )
+        svc = MockDockerService(lambda: DockerSnapshot([], [], [], [net]))
+        app = DockSurfApp(docker=svc)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await self._on_networks(app, pilot)
+            app.action_network_disconnect()
+            await wait_until(
+                lambda: any(
+                    isinstance(s, ContainerPickerScreen) for s in app.screen_stack
+                )
+            )
+            app.screen_stack[-1].dismiss("web")
+            await wait_until(
+                lambda: ("disconnect_container", "net1", "web") in svc.calls
+            )
+
+    async def test_disconnect_no_endpoints_does_nothing(self) -> None:
+        net = _network(endpoints=[])
+        svc = MockDockerService(lambda: DockerSnapshot([], [], [], [net]))
+        app = DockSurfApp(docker=svc)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await self._on_networks(app, pilot)
+            app.action_network_disconnect()
+            await pilot.pause()
+            self.assertFalse(
+                any(isinstance(s, ContainerPickerScreen) for s in app.screen_stack)
+            )
+
+    async def test_network_detail_shows_attached_endpoint(self) -> None:
+        net = _network(
+            endpoints=[NetworkEndpoint(container_name="web", ipv4="172.18.0.2/16")]
+        )
+        svc = MockDockerService(lambda: DockerSnapshot([], [], [], [net]))
+        app = DockSurfApp(docker=svc)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await self._on_networks(app, pilot)
+            pane = app.query_one(f"#{DETAIL_PANE_ID}", DetailPane)
+            # Render the detail Panel to text and assert the endpoint shows up.
+            console = Console(width=200)
+            with console.capture() as cap:
+                console.print(pane._panel.content)
+            out = cap.get()
+            self.assertIn("web", out)
+            self.assertIn("172.18.0.2", out)
 
 
 if __name__ == "__main__":

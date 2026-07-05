@@ -18,6 +18,7 @@ from typing import Callable, Iterator
 import docker
 import requests.exceptions
 from docker.errors import APIError, DockerException, NotFound
+from docker.types import IPAMConfig, IPAMPool
 
 from docksurf_py.connection import (
     ConnectionState,
@@ -37,7 +38,9 @@ from docksurf_py.models import (
     DockerSnapshot,
     HealthProbe,
     Image,
+    ImageLayer,
     Network,
+    NetworkEndpoint,
     PortBinding,
     SystemDf,
     Volume,
@@ -341,6 +344,53 @@ class EventStream:
     def stop(self) -> None:
         if self._active:
             logger.info("Event stream stopped")
+        self._active = False
+        _safe_close(self._generator)
+
+
+class PullStream:
+    """Streams `docker pull` progress for one image — mirrors `EventStream`.
+
+    Wraps the low-level `api.pull(stream=True, decode=True)` generator; `__iter__`
+    yields each raw progress dict (`{"status", "id", "progress", "error", ...}`)
+    and `stop()` unblocks it. Consumers format the dicts (kept untyped like
+    `EventStream`, since the shape is display-only). A pull that fails mid-stream
+    yields a dict carrying an `"error"` key rather than raising.
+    """
+
+    def __init__(self, repository: str, tag: str, sdk_client) -> None:
+        self._repository = repository
+        self._tag = tag
+        self._client = sdk_client
+        self._active = False
+        self._generator: Iterator[dict] | None = None
+
+    def __iter__(self) -> Iterator[dict]:
+        if not self._client:
+            return
+        self._active = True
+        ref = f"{self._repository}:{self._tag}"
+        logger.info("Pull stream started for %s", ref)
+        try:
+            self._generator = self._client.api.pull(
+                self._repository, tag=self._tag, stream=True, decode=True
+            )
+            for chunk in self._generator:
+                if not self._active:
+                    break
+                yield chunk
+        except (APIError, DockerException, requests.exceptions.RequestException) as e:
+            logger.warning("Pull stream error for %s: %s", ref, e)
+            yield {"error": str(e)}
+        except Exception as e:  # noqa: BLE001 - surface any unexpected failure
+            logger.exception("Pull stream error for %s: %s", ref, e)
+            yield {"error": str(e)}
+        finally:
+            self.stop()
+
+    def stop(self) -> None:
+        if self._active:
+            logger.info("Pull stream stopped for %s:%s", self._repository, self._tag)
         self._active = False
         _safe_close(self._generator)
 
@@ -666,12 +716,26 @@ class DockerResourceFetcher:
 
     def get_networks(self) -> list[Network]:
         networks = []
-        for n in self._client.networks.list():
+        # greedy=True inspects each network so `attrs["Containers"]` (the
+        # attached endpoints with per-container IP/MAC) is populated — the plain
+        # list endpoint leaves it empty. Networks are few, so the extra inspects
+        # are cheap (unlike the container list's N+1 concern).
+        for n in self._client.networks.list(greedy=True):
             ipam_config = n.attrs.get("IPAM", {}).get("Config", [])
             subnet = gateway = "N/A"
             if ipam_config and isinstance(ipam_config, list) and len(ipam_config) > 0:
                 subnet = ipam_config[0].get("Subnet", "N/A")
                 gateway = ipam_config[0].get("Gateway", "N/A")
+            endpoints = []
+            for ep in (n.attrs.get("Containers") or {}).values():
+                endpoints.append(
+                    NetworkEndpoint(
+                        container_name=ep.get("Name", ""),
+                        ipv4=ep.get("IPv4Address", ""),
+                        ipv6=ep.get("IPv6Address", ""),
+                        mac=ep.get("MacAddress", ""),
+                    )
+                )
             networks.append(
                 Network(
                     id=n.short_id,
@@ -681,6 +745,7 @@ class DockerResourceFetcher:
                     gateway=gateway,
                     scope=n.attrs.get("Scope", ""),
                     used_by=[],
+                    endpoints=endpoints,
                 )
             )
         return networks
@@ -830,6 +895,58 @@ class DockerClient:
         """Live stream of Docker daemon events (for auto-refresh)."""
         return EventStream(self._sdk)
 
+    def stream_pull(self, repository: str, tag: str = "latest") -> PullStream:
+        """Progress stream for pulling one image (`docker pull repo:tag`)."""
+        return PullStream(repository, tag, self._sdk)
+
+    def image_history(self, image_id: str) -> list[ImageLayer] | None:
+        """Layer history for one image (`docker history`) — `None` on error.
+
+        Read-only, so it mirrors `container_top`'s try/except shape rather than
+        the write-path `_run_management_op`.
+        """
+        if not self._sdk:
+            return None
+        try:
+            raw = self._sdk.images.get(image_id).history()
+        except NotFound:
+            logger.warning("History: image %s not found", image_id)
+            return None
+        except (APIError, DockerException, requests.exceptions.RequestException) as e:
+            logger.warning("History failed for %s: %s", image_id, e)
+            return None
+        layers: list[ImageLayer] = []
+        for entry in raw:
+            layers.append(
+                ImageLayer(
+                    created_by=(entry.get("CreatedBy") or "").strip(),
+                    size_bytes=entry.get("Size", 0) or 0,
+                    created=str(entry.get("Created", "")),
+                )
+            )
+        return layers
+
+    def volume_sizes(self) -> dict[str, int]:
+        """Per-volume on-disk size, keyed by volume name (`docker system df -v`).
+
+        Slow (the daemon walks each volume), so callers run it off the UI thread
+        and on-demand only — never on the snapshot path. Returns an empty dict
+        if disconnected or the daemon reports no usage data.
+        """
+        if not self._sdk:
+            return {}
+        try:
+            raw = self._sdk.df()
+        except (APIError, DockerException, requests.exceptions.RequestException) as e:
+            logger.warning("volume_sizes failed: %s", e)
+            return {}
+        sizes: dict[str, int] = {}
+        for v in raw.get("Volumes") or []:
+            name = v.get("Name")
+            if name:
+                sizes[name] = (v.get("UsageData") or {}).get("Size", 0) or 0
+        return sizes
+
     def system_df(self) -> SystemDf:
         """Disk usage per resource category (`docker system df`).
 
@@ -876,6 +993,63 @@ class DockerClient:
     def remove_network(self, network_name: str) -> CommandResult:
         return self._run_management_command(
             lambda sdk: sdk.networks.get(network_name).remove(), "OK"
+        )
+
+    def tag_image(
+        self, image_id: str, repository: str, tag: str = "latest"
+    ) -> CommandResult:
+        def op(sdk: "docker.DockerClient") -> CommandResult:
+            ok = sdk.images.get(image_id).tag(repository, tag=tag)
+            if not ok:
+                return CommandResult.failure(
+                    f"Docker rejected tag {repository}:{tag}",
+                    kind=CommandErrorKind.UNKNOWN,
+                )
+            return CommandResult.success(f"Tagged {repository}:{tag}")
+
+        return self._run_management_op(op)
+
+    def create_volume(
+        self,
+        name: str,
+        driver: str = "local",
+        labels: dict[str, str] | None = None,
+    ) -> CommandResult:
+        def op(sdk: "docker.DockerClient") -> CommandResult:
+            vol = sdk.volumes.create(
+                name=name or None, driver=driver or "local", labels=labels or {}
+            )
+            return CommandResult.success(f"Created volume {vol.name}")
+
+        return self._run_management_op(op)
+
+    def create_network(
+        self, name: str, driver: str = "bridge", subnet: str = ""
+    ) -> CommandResult:
+        def op(sdk: "docker.DockerClient") -> CommandResult:
+            ipam = None
+            if subnet:
+                pool = IPAMPool(subnet=subnet)
+                ipam = IPAMConfig(pool_configs=[pool])
+            net = sdk.networks.create(name=name, driver=driver or "bridge", ipam=ipam)
+            return CommandResult.success(f"Created network {net.name}")
+
+        return self._run_management_op(op)
+
+    def connect_container(self, network_name: str, container_id: str) -> CommandResult:
+        return self._run_management_command(
+            lambda sdk: sdk.networks.get(network_name).connect(container_id),
+            "Connected",
+        )
+
+    def disconnect_container(
+        self, network_name: str, container_id: str, force: bool = True
+    ) -> CommandResult:
+        return self._run_management_command(
+            lambda sdk: sdk.networks.get(network_name).disconnect(
+                container_id, force=force
+            ),
+            "Disconnected",
         )
 
     def pause_container(self, container_id: str) -> CommandResult:

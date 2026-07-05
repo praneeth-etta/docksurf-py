@@ -168,6 +168,9 @@ class TableRenderer(_Base):
         self._marked: dict[TabID, set[tuple[str, str]]] = {
             tab_id: set() for tab_id in self._resource_registry
         }
+        # On-demand per-volume disk sizes (populated by the `b` size action),
+        # keyed by volume name; read by `_show_volume_details`.
+        self._volume_sizes: dict[str, int] = {}
 
         for entry in self._resource_registry.values():
             table = self.query_one(f"#{entry.table_id}", DataTable)
@@ -669,6 +672,10 @@ class DetailPaneRenderer(_Base):
                 else markup_yellow("Orphaned (safe to delete)")
             ),
         }
+        # Size is fetched on-demand (`b`); once known it's cached and shown here.
+        size = self._volume_sizes.get(volume.name)
+        if size is not None:
+            details["Size on disk"] = format_size(size)
         pane.update_details(f"Volume: {volume.name}", details)
 
     def _show_network_details(self, pane: DetailPane, row: int) -> None:
@@ -677,10 +684,20 @@ class DetailPaneRenderer(_Base):
             return
         network = networks[row]
 
+        if network.endpoints:
+            attached = "\n".join(
+                f"{ep.container_name}: {ep.ipv4 or '—'}"
+                + (f" / {ep.mac}" if ep.mac else "")
+                for ep in network.endpoints
+            )
+        else:
+            attached = "None"
         details = {
             "ID": network.id,
+            "Driver": network.driver,
+            "Scope": network.scope,
             "Subnet": network.subnet,
             "Gateway": network.gateway,
-            "Used By": "\n".join(network.used_by) if network.used_by else "None",
+            "Attached": attached,
         }
         pane.update_details(f"Network: {network.name}", details)

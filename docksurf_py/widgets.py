@@ -29,21 +29,26 @@ from textual.widgets import (
     DataTable,
     Input,
     Label,
+    OptionList,
     RichLog,
     Select,
     Static,
 )
+from textual.widgets.option_list import Option
 
 from docksurf_py.constants import (
     BTN_CANCEL_ID,
     BTN_CONFIRM_ID,
     BTN_EXPAND_ID,
     BTN_INSPECT_CLOSE_ID,
+    BTN_LAYER_HISTORY_CLOSE_ID,
     BTN_LOG_OPTIONS_CANCEL_ID,
     BTN_LOG_OPTIONS_OK_ID,
+    BTN_PICKER_CANCEL_ID,
     BTN_PROMPT_CANCEL_ID,
     BTN_PROMPT_OK_ID,
     BTN_PRUNE_CANCEL_ID,
+    BTN_PULL_PROGRESS_CLOSE_ID,
     INSPECT_SEARCH_ID,
     INSPECT_VIEW_ID,
     LOG_OPTIONS_SINCE_ID,
@@ -52,7 +57,9 @@ from docksurf_py.constants import (
     LOG_PANE_SEARCH_ID,
     LOG_PANE_TOOLBAR_ID,
     LOG_PANE_VIEW_ID,
+    PICKER_LIST_ID,
     PRUNE_TARGETS,
+    PULL_PROGRESS_VIEW_ID,
     LogLine,
     LogOptions,
     SafeMarkup,
@@ -576,11 +583,16 @@ class HelpScreen(ModalScreen):
         app_bindings: list,
         container_actions: frozenset[str],
         project_actions: frozenset[str] = frozenset(),
+        tab_actions: dict[str, frozenset[str]] | None = None,
     ) -> None:
         super().__init__()
         self._app_bindings = app_bindings
         self._container_actions = container_actions
         self._project_actions = project_actions
+        # Extra per-tab scopes ({scope_label: {action_name, ...}}), e.g.
+        # {"Images tab": {"pull_image", ...}} — lets Image/Volume/Network
+        # actions get their own scope column instead of "Global".
+        self._tab_actions = tab_actions or {}
 
     def on_key(self, event) -> None:
         if event.key in ("escape", "question_mark"):
@@ -610,6 +622,10 @@ class HelpScreen(ModalScreen):
                 scope = "Container only"
             else:
                 scope = "Global"
+                for label, actions in self._tab_actions.items():
+                    if action in actions:
+                        scope = label
+                        break
             table.add_row(f"[bold]{key}[/bold]", description, scope)
 
         table.add_section()
@@ -915,6 +931,109 @@ class LogOptionsScreen(ModalScreen):
         self.dismiss(LogOptions(tail=tail, since_seconds=int(str(since_raw))))
 
     @on(Button.Pressed, f"#{BTN_LOG_OPTIONS_CANCEL_ID}")
+    def _cancel(self) -> None:
+        self.dismiss(None)
+
+
+class PullProgressScreen(ModalScreen):
+    """Live `docker pull` progress — a scrolling status log.
+
+    Display-only: the controller streams the pull on a background worker and
+    calls `append(line)` per formatted progress line via `call_from_thread`.
+    Escape or Close dismisses; the background pull is guarded by the controller
+    (a write after dismiss just fails harmlessly and stops the pump).
+    """
+
+    def __init__(self, title: str) -> None:
+        super().__init__()
+        self._title = title
+
+    def compose(self) -> ComposeResult:
+        with Vertical():
+            yield Label(f"[b]{escape(self._title)}[/b]", id="pull-progress-title")
+            yield RichLog(id=PULL_PROGRESS_VIEW_ID, markup=True, highlight=False)
+            yield Button("Close", variant="primary", id=BTN_PULL_PROGRESS_CLOSE_ID)
+
+    def append(self, line: str) -> None:
+        self.query_one(f"#{PULL_PROGRESS_VIEW_ID}", RichLog).write(line)
+
+    def on_key(self, event) -> None:
+        if event.key == "escape":
+            event.stop()
+            self.dismiss()
+
+    @on(Button.Pressed, f"#{BTN_PULL_PROGRESS_CLOSE_ID}")
+    def _close(self) -> None:
+        self.dismiss()
+
+
+class LayerHistoryScreen(ModalScreen):
+    """Modal showing an image's `docker history` layer breakdown.
+
+    Display-only (same convention as `SystemDfScreen`): the controller passes a
+    pre-built Rich renderable. Dismisses on Escape or `h` (the key that opened
+    it).
+    """
+
+    def __init__(self, title: str, content) -> None:
+        super().__init__()
+        self._title = title
+        self._content = content
+
+    def on_key(self, event) -> None:
+        if event.key in ("escape", "h"):
+            # Stop the event — otherwise it bubbles to the app's global "h"
+            # binding after dismiss() and immediately reopens the screen.
+            event.stop()
+            self.dismiss()
+
+    def compose(self) -> ComposeResult:
+        with Vertical():
+            yield Label(f"[b]{escape(self._title)}[/b]", id="layer-history-title")
+            with VerticalScroll():
+                yield Static(self._content)
+            yield Button("Close", variant="primary", id=BTN_LAYER_HISTORY_CLOSE_ID)
+
+    @on(Button.Pressed, f"#{BTN_LAYER_HISTORY_CLOSE_ID}")
+    def _close(self) -> None:
+        self.dismiss()
+
+
+class ContainerPickerScreen(ModalScreen):
+    """Pick one container from a list — dismisses with its id or `None`.
+
+    Used for connecting/disconnecting a container to/from a network. The caller
+    passes `(container_id, display_label)` pairs (already filtered to the valid
+    set for the operation) and builds them into an `OptionList`.
+    """
+
+    def __init__(self, title: str, options: list[tuple[str, str]]) -> None:
+        super().__init__()
+        self._title = title
+        self._options = options
+
+    def compose(self) -> ComposeResult:
+        with Vertical():
+            yield Label(f"[b]{escape(self._title)}[/b]", id="picker-title")
+            yield OptionList(id=PICKER_LIST_ID)
+            yield Button("Cancel", variant="default", id=BTN_PICKER_CANCEL_ID)
+
+    def on_mount(self) -> None:
+        option_list = self.query_one(f"#{PICKER_LIST_ID}", OptionList)
+        for container_id, label in self._options:
+            option_list.add_option(Option(escape(label), id=container_id))
+        option_list.focus()
+
+    @on(OptionList.OptionSelected, f"#{PICKER_LIST_ID}")
+    def _selected(self, event: OptionList.OptionSelected) -> None:
+        self.dismiss(event.option.id)
+
+    def on_key(self, event) -> None:
+        if event.key == "escape":
+            event.stop()
+            self.dismiss(None)
+
+    @on(Button.Pressed, f"#{BTN_PICKER_CANCEL_ID}")
     def _cancel(self) -> None:
         self.dismiss(None)
 

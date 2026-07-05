@@ -33,6 +33,7 @@ A keyboard-driven terminal UI for visualising and managing Docker resources like
 - **Full lifecycle control** — pause/unpause and kill sit alongside stop/start/restart, so a `stop` that hangs on its 10s timeout never needs the CLI.
 - **Multi-select + bulk actions** — mark rows on any tab and stop/start/remove them as a batch; ideal for cleaning up after a test run.
 - **Inspect & prune** — the full raw `docker inspect` JSON for any resource in a searchable modal, plus a one-key menu to prune stopped containers, dangling images, unused volumes/networks, or everything at once.
+- **Image / volume / network operations** — pull images with live progress, view layer history, tag, and bulk-clean dangling images; create volumes and check per-volume disk size; create networks and connect/disconnect containers, with per-container IP/MAC in the detail pane.
 - **Power-user exec & copy** — a custom exec command with a chosen user, `docker cp` in/out of a container, and an on-demand `docker top` process snapshot, all via quick prompts.
 - **Disk usage** — a `docker system df` breakdown (per-type size + reclaimable) on demand.
 - **Local or remote** — honours your active `docker context`, so it manages the same daemon your CLI does like the local, Docker Desktop, Colima, or a remote host over SSH.
@@ -103,6 +104,22 @@ The container/project keys are context-sensitive: on a Compose **project header*
 | `k` | Compose **down** (`docker compose down`, confirmed) — tears the project down |
 | `space` | Mark for bulk action                          | Collapse / expand project group  |
 
+### Images / Volumes / Networks tabs
+
+Like the container keys, these are tab-scoped — each acts on the focused row of its tab (and no-ops with a hint elsewhere). `+` is shared: it creates/pulls whatever the active tab holds.
+
+| Key | Tab       | Action                                                             |
+|-----|-----------|--------------------------------------------------------------------|
+| `+` | Images    | **Pull** an image (`name:tag`) with a live progress view           |
+| `+` | Volumes   | **Create** a volume (name / driver / labels prompt)                |
+| `+` | Networks  | **Create** a network (name / driver / subnet prompt)               |
+| `h` | Images    | **Layer history** (`docker history`) — per-layer command + size    |
+| `y` | Images    | **Tag** the selected image (repository / tag prompt)               |
+| `a` | Images    | **Mark all dangling** images — then `d` removes them as a batch    |
+| `b` | Volumes   | **Size on disk** for the selected volume (on-demand; it's slow)    |
+| `v` | Networks  | **Connect** a container to the network (pick from a list)          |
+| `m` | Networks  | **Disconnect** a container from the network (pick from a list)     |
+
 ### Log pane (when open)
 
 | Key       | Action                                                           |
@@ -126,11 +143,11 @@ Every tab has a leading mark column (`space` to toggle) for multi-select + bulk 
 
 **Containers** — all containers (running and stopped), **grouped by Compose project** into a collapsible tree (project header → service rows), with standalone containers listed below. Columns: name, status, colour-coded health, and uptime. The detail pane shows image, ports, networks, project/service, uptime, restart count, a collapsible environment-variable section, a collapsible recent-health-probe log, a live CPU/mem/net/block-IO panel for a running container, and — on demand (`t`) — a `docker top` running-process snapshot.
 
-**Images** — all images, tagged as *In Use*, *Unused*, or *Dangling*. Detail pane shows size, created date, architecture, and which containers reference the image.
+**Images** — all images, tagged as *In Use*, *Unused*, or *Dangling*. Detail pane shows size, created date, architecture, and which containers reference the image. Pull new images with live progress (`+`), view per-layer history (`h`), retag (`y`), and one-key mark-all-dangling for bulk cleanup (`a`).
 
-**Volumes** — all volumes, tagged as *In Use* or *Orphaned*. Detail pane shows mountpoint, driver, labels, and attached containers.
+**Volumes** — all volumes, tagged as *In Use* or *Orphaned*. Detail pane shows mountpoint, driver, labels, and attached containers. Create volumes (`+`) and pull on-demand per-volume size on disk (`b`).
 
-**Networks** — all networks with driver and scope. Detail pane shows subnet, gateway, and attached containers.
+**Networks** — all networks with driver and scope. Detail pane shows driver, scope, subnet, gateway, and each attached container's IP/MAC within the network. Create networks (`+`) and connect/disconnect containers (`v`/`m`).
 
 ## Architecture
 

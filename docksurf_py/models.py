@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 
 
@@ -118,6 +118,21 @@ class Image:
     architecture: str
 
 
+@dataclass(slots=True, frozen=True)
+class ImageLayer:
+    """One entry from `image.history()` — a single image layer.
+
+    `created_by` is the build instruction that produced the layer (the raw
+    Dockerfile-ish command); `size_bytes` is that layer's on-disk size (0 for
+    metadata-only layers). The renderer turns `size_bytes` into a display
+    string via `format_size`, same as everywhere else.
+    """
+
+    created_by: str
+    size_bytes: int
+    created: str
+
+
 @dataclass(slots=True)
 class Volume:
     name: str
@@ -125,6 +140,20 @@ class Volume:
     mountpoint: str
     used_by: list[str]
     labels: dict[str, str]
+
+
+@dataclass(slots=True, frozen=True)
+class NetworkEndpoint:
+    """One container attached to a network (from `Network.attrs["Containers"]`).
+
+    `ipv4`/`ipv6`/`mac` are the container's address *within this network*;
+    any of them may be empty depending on the network's driver/config.
+    """
+
+    container_name: str
+    ipv4: str = ""
+    ipv6: str = ""
+    mac: str = ""
 
 
 @dataclass(slots=True)
@@ -136,6 +165,7 @@ class Network:
     gateway: str
     scope: str
     used_by: list[str]
+    endpoints: list[NetworkEndpoint] = field(default_factory=list)
 
 
 @dataclass(slots=True)

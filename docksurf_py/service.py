@@ -9,8 +9,20 @@ from typing import Protocol
 
 from docksurf_py.connection import ConnectionState
 from docksurf_py.constants import LogOptions
-from docksurf_py.docker import EventStream, LogStream, MergedLogStream, StatsStream
-from docksurf_py.models import CommandResult, ContainerTop, DockerSnapshot, SystemDf
+from docksurf_py.docker import (
+    EventStream,
+    LogStream,
+    MergedLogStream,
+    PullStream,
+    StatsStream,
+)
+from docksurf_py.models import (
+    CommandResult,
+    ContainerTop,
+    DockerSnapshot,
+    ImageLayer,
+    SystemDf,
+)
 
 
 class DockerService(Protocol):
@@ -34,7 +46,13 @@ class DockerService(Protocol):
 
     def stream_events(self) -> EventStream: ...
 
+    def stream_pull(self, repository: str, tag: str = "latest") -> PullStream: ...
+
     def system_df(self) -> SystemDf: ...
+
+    def image_history(self, image_id: str) -> list[ImageLayer] | None: ...
+
+    def volume_sizes(self) -> dict[str, int]: ...
 
     def compose_action(
         self,
@@ -59,6 +77,29 @@ class DockerService(Protocol):
     def remove_volume(self, volume_name: str) -> CommandResult: ...
 
     def remove_network(self, network_name: str) -> CommandResult: ...
+
+    def tag_image(
+        self, image_id: str, repository: str, tag: str = "latest"
+    ) -> CommandResult: ...
+
+    def create_volume(
+        self,
+        name: str,
+        driver: str = "local",
+        labels: dict[str, str] | None = None,
+    ) -> CommandResult: ...
+
+    def create_network(
+        self, name: str, driver: str = "bridge", subnet: str = ""
+    ) -> CommandResult: ...
+
+    def connect_container(
+        self, network_name: str, container_id: str
+    ) -> CommandResult: ...
+
+    def disconnect_container(
+        self, network_name: str, container_id: str, force: bool = True
+    ) -> CommandResult: ...
 
     def pause_container(self, container_id: str) -> CommandResult: ...
 

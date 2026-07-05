@@ -304,6 +304,100 @@ LogOptionsScreen Button {
     margin: 0 2;
 }
 
+PullProgressScreen {
+    align: center middle;
+    background: $background 60%;
+}
+
+PullProgressScreen > Vertical {
+    width: 80%;
+    height: 70%;
+    border: double $accent;
+    background: $surface;
+    padding: 1 3;
+}
+
+PullProgressScreen #pull-progress-title {
+    text-align: center;
+    width: 100%;
+    margin-bottom: 1;
+    color: $accent;
+    text-style: bold;
+}
+
+PullProgressScreen #pull-progress-view {
+    height: 1fr;
+    border: solid $primary-background-lighten-2;
+}
+
+PullProgressScreen Button {
+    margin-top: 1;
+    width: 100%;
+}
+
+LayerHistoryScreen {
+    align: center middle;
+    background: $background 60%;
+}
+
+LayerHistoryScreen > Vertical {
+    width: 90%;
+    height: 85%;
+    border: double $accent;
+    background: $surface;
+    padding: 1 3;
+}
+
+LayerHistoryScreen #layer-history-title {
+    text-align: center;
+    width: 100%;
+    margin-bottom: 1;
+    color: $accent;
+    text-style: bold;
+}
+
+LayerHistoryScreen VerticalScroll {
+    height: 1fr;
+    border: solid $primary-background-lighten-2;
+}
+
+LayerHistoryScreen Button {
+    margin-top: 1;
+    width: 100%;
+}
+
+ContainerPickerScreen {
+    align: center middle;
+    background: $background 60%;
+}
+
+ContainerPickerScreen > Vertical {
+    width: 60;
+    height: auto;
+    max-height: 80%;
+    border: double $accent;
+    background: $surface;
+    padding: 1 3;
+}
+
+ContainerPickerScreen #picker-title {
+    text-align: center;
+    width: 100%;
+    margin-bottom: 1;
+    color: $accent;
+    text-style: bold;
+}
+
+ContainerPickerScreen #picker-list {
+    height: auto;
+    max-height: 20;
+    margin-bottom: 1;
+}
+
+ContainerPickerScreen Button {
+    width: 100%;
+}
+
 #status-bar {
     dock: bottom;
     margin-bottom: 1; /* Leaves room for the built-in Footer */

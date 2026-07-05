@@ -31,11 +31,11 @@ def _matches_image(i: Image, q: str) -> bool:
 
 
 def _matches_volume(v: Volume, q: str) -> bool:
-    return q in v.name.lower() or q in v.driver.lower()
+    return q in v.name.lower() or q in v.driver.lower() or q in v.mountpoint.lower()
 
 
 def _matches_network(n: Network, q: str) -> bool:
-    return q in n.name.lower() or q in n.driver.lower()
+    return q in n.name.lower() or q in n.driver.lower() or q in n.subnet.lower()
 
 
 class ResourceSearchController(_Base):

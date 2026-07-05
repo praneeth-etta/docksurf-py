@@ -36,6 +36,17 @@ INSPECT_VIEW_ID = "inspect-view"
 INSPECT_SEARCH_ID = "inspect-search"
 BTN_INSPECT_CLOSE_ID = "inspect-close"
 
+# PullProgressScreen widget IDs
+PULL_PROGRESS_VIEW_ID = "pull-progress-view"
+BTN_PULL_PROGRESS_CLOSE_ID = "pull-progress-close"
+
+# LayerHistoryScreen widget IDs
+BTN_LAYER_HISTORY_CLOSE_ID = "layer-history-close"
+
+# ContainerPickerScreen widget IDs
+PICKER_LIST_ID = "picker-list"
+BTN_PICKER_CANCEL_ID = "picker-cancel"
+
 # Prune target keys shared between PruneScreen (widgets.py) and PruneHandler
 # (actions.py) — dismissing PruneScreen with one of these selects the
 # matching `DockerClient.prune_*` method. Also doubles as each target
