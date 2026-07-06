@@ -16,6 +16,7 @@ from textual import work
 from textual.timer import Timer
 from textual.widgets import DataTable, Input, LoadingIndicator, TabbedContent
 
+from docksurf_py.connection import ConnectionState, ConnectionStatus
 from docksurf_py.constants import (
     DETAIL_PANE_ID,
     MARK_GLYPH,
@@ -311,13 +312,13 @@ class SnapshotManager(_Base):
     _event_stream: EventStream | None = None
     _event_stop: threading.Event | None = None
     _refresh_debounce: Timer | None = None
+    # Tracks the last connection state we've reported so notifications are shown
+    # only when the connection actually changes.
+    _last_conn_status: ConnectionStatus = ConnectionStatus.NOT_CONNECTED
 
-    # Docker action *prefixes* that fire constantly and never change what we
-    # render. Matched against the part before ":" because exec actions arrive
-    # as e.g. "exec_create: /bin/sh -c <healthcheck>" — the command is appended.
-    # `health_status` fires on every healthcheck probe (even when unchanged), so
-    # it's the dominant source of refresh spam; a real state change (start/die/
-    # etc.) still triggers a refresh that repaints the Health column.
+    # Docker event prefixes that don't change the rendered state and would only
+    # trigger unnecessary refreshes. Exec events include a command after ':', so
+    # matching is done on the action prefix.
     _EVENT_NOISE = frozenset(
         {
             "exec_create",
@@ -375,7 +376,7 @@ class SnapshotManager(_Base):
                 state.context,
                 state.host,
             )
-            self.notify(f"{state.message}\n{state.hint}", severity="error", timeout=12)
+        self._maybe_notify_connection_change(self.docker.connection)
 
         # Remember what the user had selected so a background refresh doesn't
         # yank the cursor back to the top (and needlessly restart the stats
@@ -456,6 +457,31 @@ class SnapshotManager(_Base):
         # The previously-focused resource is gone — select the first row.
         self._auto_select_first()
 
+    def _maybe_notify_connection_change(self, state: ConnectionState) -> None:
+        """UI-thread only — call via `call_from_thread` from a worker.
+
+        No-ops unless `state.status` actually changed since the last call, so
+        a poll loop retrying every couple seconds doesn't spam a toast on
+        every attempt. Feeds the StatusBar's connection segment either way
+        the first time, then only a real transition after that.
+        """
+        previous = self._last_conn_status
+        if state.status == previous:
+            return
+        was_down = previous not in (
+            ConnectionStatus.NOT_CONNECTED,
+            ConnectionStatus.CONNECTED,
+        )
+        self._last_conn_status = state.status
+        connected = state.status == ConnectionStatus.CONNECTED
+        status_bar = self.query_one(f"#{STATUS_BAR_ID}", StatusBar)
+        status_bar.set_connection_state(connected, "" if connected else state.message)
+        if connected:
+            if was_down:
+                self.notify("Reconnected to Docker")
+        else:
+            self.notify(f"{state.message}\n{state.hint}", severity="error", timeout=12)
+
     def _finish_refresh(
         self, snapshot: DockerSnapshot | None, error: str | None
     ) -> None:
@@ -478,11 +504,11 @@ class SnapshotManager(_Base):
 
     @work(thread=True)
     def start_event_listener(self) -> None:
-        """Watch `docker events` and auto-refresh the UI, so `r` is a fallback.
+        """Watch `docker events` and keep the UI in sync.
 
-        Runs on its own daemon worker; if the stream ends (daemon down or a
-        hiccup) it backs off and re-subscribes, so it "just works" across a
-        daemon restart the same way `ensure_connected()` does.
+        Runs on a background thread. If the event stream ends because the daemon
+        becomes unavailable, it also acts as the reconnect loop, retrying until the
+        connection is restored and triggering an immediate refresh when it succeeds.
         """
         stop = threading.Event()
         self._event_stop = stop
@@ -497,9 +523,27 @@ class SnapshotManager(_Base):
                         continue
                     self.call_from_thread(self._on_docker_event)
             except Exception:
+                # Usually a `call_from_thread` race during app shutdown, not a Docker
+                # failure. `EventStream` records daemon errors in `.error` instead of
+                # propagating them.
                 logger.exception("Event listener error")
-            # Stream ended (daemon down or a hiccup) — back off, then
-            # re-subscribe; the wait returns immediately once we're told to stop.
+
+            if stream.error is not None:
+                self.docker.mark_disconnected(stream.error)
+            self.call_from_thread(
+                self._maybe_notify_connection_change, self.docker.connection
+            )
+
+            if not self.docker.is_connected:
+                stop.wait(2.0)
+                if stop.is_set():
+                    break
+                state = self.docker.ensure_connected()
+                self.call_from_thread(self._maybe_notify_connection_change, state)
+                if state.status == ConnectionStatus.CONNECTED:
+                    self.call_from_thread(self.start_refresh)
+                continue
+
             stop.wait(2.0)
 
     def _on_docker_event(self) -> None:

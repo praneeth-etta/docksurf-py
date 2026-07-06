@@ -249,6 +249,8 @@ class RenderSmokeTests(unittest.TestCase):
 class _OneEventStream:
     """Yields a single container event, then ends (mirrors EventStream shape)."""
 
+    error = None
+
     def __iter__(self):
         yield {"Type": "container", "Action": "start"}
 

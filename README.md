@@ -36,7 +36,9 @@ A keyboard-driven terminal UI for visualising and managing Docker resources like
 - **Image / volume / network operations** — pull images with live progress, view layer history, tag, and bulk-clean dangling images; create volumes and check per-volume disk size; create networks and connect/disconnect containers, with per-container IP/MAC in the detail pane.
 - **Power-user exec & copy** — a custom exec command with a chosen user, `docker cp` in/out of a container, and an on-demand `docker top` process snapshot, all via quick prompts.
 - **Disk usage** — a `docker system df` breakdown (per-type size + reclaimable) on demand.
-- **Local or remote** — honours your active `docker context`, so it manages the same daemon your CLI does like the local, Docker Desktop, Colima, or a remote host over SSH.
+- **Local or remote** — honours your active `docker context` on startup, so it manages the same daemon your CLI does: local, Docker Desktop, Colima, or a remote host over SSH/TCP.
+- **In-app context switching** — list and switch Docker contexts from inside the TUI (`D`) without ever running `docker context use`, so other terminals keep whatever context they already had. The choice is remembered across restarts.
+- **Auto-reconnect** — if the daemon goes down mid-session, the status bar flags it immediately and DockSurf reconnects on its own the moment it's back, with a full refresh — no restart required.
 
 ## Requirements
 
@@ -74,6 +76,7 @@ uv run python -m docksurf_py.app
 | `i`     | Inspect focused resource — full `docker inspect` JSON, searchable (works on any tab) |
 | `P`     | Prune menu — stopped containers / dangling images / unused volumes / unused networks / everything |
 | `w`     | Disk-usage screen (`docker system df`)                     |
+| `D`     | Switch Docker context — in-app only, never touches `docker context use` (see [Docker contexts](#docker-contexts--local-and-remote)) |
 | `space` | Mark the focused row for a bulk action (or collapse/expand a Compose project header — see below) |
 | `escape`| Clear all marks on the active tab (no-op if nothing's marked) |
 | `?`     | Help screen                                                 |
@@ -154,12 +157,12 @@ Every tab has a leading mark column (`space` to toggle) for multi-select + bulk 
 Eleven modules with strict layering (_models.py_ and _constants.py_ are leaf nodes and nothing imports into them):
 
 - **`constants.py`** — widget/tab/table IDs, the _SafeMarkup_ render-boundary marker, and Rich markup helpers.
-- **`models.py`** — typed dataclasses for every resource (_Container_, _Image_, _Volume_, _Network_, _ComposeProject_, _ContainerStats_, _ContainerTop_, _SystemDf_, …). No presentation logic.
+- **`models.py`** — typed dataclasses for every resource (_Container_, _Image_, _Volume_, _Network_, _ComposeProject_, _ContainerStats_, _ContainerTop_, _SystemDf_, _ContextInfo_, …). No presentation logic.
 - **`connection.py`** — Docker connection detection/classification, context and host resolution.
-- **`docker.py`** — all Docker I/O via the [Docker SDK for Python](https://docker-py.readthedocs.io/). _DockerClient_ owns the SDK connection (honouring _docker context_) and every management call — full container lifecycle (stop/start/restart/pause/kill/remove), prune, inspect, `top`, and file copy; _DockerResourceFetcher_ does the parallel reads; _LogStream_/_MergedLogStream_/_StatsStream_/_EventStream_ are the live iterators.
+- **`docker.py`** — all Docker I/O via the [Docker SDK for Python](https://docker-py.readthedocs.io/). _DockerClient_ owns the SDK connection (honouring _docker context_, with an in-app override for `switch_context`) and every management call — full container lifecycle (stop/start/restart/pause/kill/remove), prune, inspect, `top`, file copy, and context listing/switching; it also detects a dropped daemon (`mark_disconnected`) so reconnecting doesn't need a restart. _DockerResourceFetcher_ does the parallel reads; _LogStream_/_MergedLogStream_/_StatsStream_/_EventStream_ are the live iterators.
 - **`service.py`** — the _DockerService_ protocol _DockerClient_ implements (swappable in tests).
-- **`widgets.py`** — Textual UI components with no Docker knowledge: _ContainerTable_, _DetailPane_, _LogPane_, _SearchBar_, _ConfirmDialog_, _HelpScreen_, _SystemDfScreen_, _InspectScreen_, _PruneScreen_, _PromptScreen_, _StatusBar_.
-- **`renderer.py`**, **`actions.py`**, **`search.py`**, **`observability.py`** — focused mixin classes composed into _DockSurfApp_ in **_app.py_**, driven by a single per-tab ResourceEntry registry: table rendering, snapshot/event lifecycle, and multi-select marking (`renderer.py`); container lifecycle, Compose, delete, bulk actions, inspect, prune, exec, and file-copy actions (`actions.py`); search (`search.py`); live stats, disk usage, and `docker top` (`observability.py`).
+- **`widgets.py`** — Textual UI components with no Docker knowledge: _ContainerTable_, _DetailPane_, _LogPane_, _SearchBar_, _ConfirmDialog_, _HelpScreen_, _SystemDfScreen_, _InspectScreen_, _PruneScreen_, _PromptScreen_, _StatusBar_ (now also renders a connection-lost indicator).
+- **`renderer.py`**, **`actions.py`**, **`search.py`**, **`observability.py`** — focused mixin classes composed into _DockSurfApp_ in **_app.py_**, driven by a single per-tab ResourceEntry registry: table rendering, snapshot/event lifecycle, connection-state tracking, and multi-select marking (`renderer.py`); container lifecycle, Compose, delete, bulk actions, inspect, prune, exec, file-copy, and context-switching actions (`actions.py`); search (`search.py`); live stats, disk usage, and `docker top` (`observability.py`).
 
 ## How data is fetched
 
@@ -172,27 +175,31 @@ DockSurf talks to Docker through the SDK (`docker-py`), not the CLI but with thr
 
 ## Docker contexts — local and remote
 
-DockSurf connects to whatever daemon your active Docker context points at (matching the `docker` CLI's precedence: `DOCKER_HOST` → active context → default socket). That doesn't have to be your local machine.
+DockSurf connects to whatever daemon your active Docker context points at (matching the `docker` CLI's precedence: `DOCKER_HOST` → active context → default socket). That doesn't have to be your local machine, and — since context switching now happens in-app — it doesn't require restarting DockSurf either.
+
+**Creating a context** is still a `docker` CLI step (DockSurf lists and switches contexts, it doesn't create them):
 
 ```bash
-# Create a context pointing at a remote server over SSH
+# A context pointing at a remote Linux host over SSH — any host with a
+# reachable Docker daemon and SSH access works: a cloud VM, a bare-metal
+# box, a Raspberry Pi, a home server.
 docker context create prod --docker "host=ssh://user@prod.example.com"
 
-# Switch to it
-docker context use prod
-
-# DockSurf now shows that server's containers, images, volumes, and networks
-docksurf-py
+# Or over plain TCP, if the daemon's API is exposed that way
+docker context create staging --docker "host=tcp://staging.example.com:2375"
 ```
 
-The active context name and endpoint are shown in the status bar at the bottom of the TUI. Switch contexts between runs to manage different environments from the same tool.
+**Switching contexts from inside DockSurf** — press `D` to list every context `docker context ls` knows about and pick one. This is in-app only: it never runs `docker context use`, so it doesn't touch `~/.docker/config.json` or repoint any other terminal's `docker`/`docker compose` — DockSurf just opens its own connection to the chosen context's daemon. The choice is remembered across restarts (`~/.local/share/docksurf-py/state.json`).
+
+**Auto-reconnect** — if the daemon your active context points at goes down mid-session (VM reboot, daemon restart, network blip), the status bar flags it immediately (`● <reason>`) and DockSurf retries on its own every couple of seconds, reconnecting and refreshing the moment it's back — no restart, no manual `r`.
 
 **Common use cases:**
-- Managing a VPS or cloud instance without keeping an SSH session open
+- Managing a Linux VM (cloud instance, on-prem box, home server) over SSH without keeping a shell session open
+- Switching between staging and production daemons from one tool, mid-session, with `D`
 - Inspecting a production server's containers without full shell access
-- Managing a Raspberry Pi or edge device from your laptop
+- Managing a Raspberry Pi or other edge device from your laptop
 
-Any runtime that registers a Docker context works — Docker Desktop, Colima, Rancher Desktop, or a plain daemon on a remote host.
+Any endpoint that speaks the **Docker Engine API** works this way — a plain Linux daemon, Docker Desktop, Colima, Rancher Desktop, or a remote host over SSH/TCP. Managed platforms that don't expose that API can't be reached this way, even with a custom context — **Azure Container Apps is the common trap**: it's Kubernetes-based under the hood with no Docker Engine endpoint at all, so `docker context`/DockSurf/`docker ps` have nothing to talk to. Azure Container Instances had a (now-deprecated) `docker context create aci` integration; Container Apps never did — manage those via `az containerapp`, the Azure Portal, or the Azure SDK instead.
 
 ## Logging
 

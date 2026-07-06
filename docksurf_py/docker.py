@@ -2,6 +2,7 @@
 docker.py — All system-level Docker execution lives here.
 """
 
+import json
 import logging
 import os
 import queue
@@ -13,6 +14,7 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Callable, Iterator
 
 import docker
@@ -34,6 +36,7 @@ from docksurf_py.models import (
     Container,
     ContainerStats,
     ContainerTop,
+    ContextInfo,
     DiskUsageEntry,
     DockerSnapshot,
     HealthProbe,
@@ -324,6 +327,9 @@ class EventStream:
         self._client = sdk_client
         self._active = False
         self._generator: Iterator[dict] | None = None
+        # Populated if iteration ends because of an unexpected error rather than
+        # a deliberate stop(), since this iterator never propagates exceptions.
+        self.error: Exception | None = None
 
     def __iter__(self) -> Iterator[dict]:
         if not self._client:
@@ -338,6 +344,7 @@ class EventStream:
                 yield event
         except Exception as e:
             logger.exception("Event stream error: %s", e)
+            self.error = e
         finally:
             self.stop()
 
@@ -570,6 +577,45 @@ def _parse_system_df(raw: dict) -> SystemDf:
 
 _DEFAULT_DOCKER_SOCK = "unix:///var/run/docker.sock"
 
+# Persist the context selected in DockSurf so it survives restarts.
+# Keep this separate from ~/.docker/config.json, whose current-context is
+# shared with the Docker CLI and other terminals.
+_STATE_FILE = Path.home() / ".local/share/docksurf-py/state.json"
+
+
+def _load_last_context() -> str | None:
+    try:
+        data = json.loads(_STATE_FILE.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    name = data.get("context")
+    return name if isinstance(name, str) and name else None
+
+
+def _save_last_context(name: str) -> None:
+    try:
+        _STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _STATE_FILE.write_text(json.dumps({"context": name}))
+    except OSError as e:
+        logger.warning("Could not persist context selection: %s", e)
+
+
+def _clear_last_context() -> None:
+    try:
+        _STATE_FILE.unlink()
+    except OSError:
+        pass
+
+
+def _build_sdk_client_for_context(ctx) -> "docker.DockerClient":
+    """Build an SDK client scoped to one `docker context` entry."""
+    if not ctx.Host or ctx.Host == _DEFAULT_DOCKER_SOCK:
+        return docker.from_env()
+    kwargs: dict = {"base_url": ctx.Host, "tls": ctx.TLSConfig or False}
+    if ctx.Host.startswith("ssh://"):
+        kwargs["use_ssh_client"] = True
+    return docker.DockerClient(**kwargs)
+
 
 def _create_sdk_client() -> "docker.DockerClient":
     """Create the SDK client, honoring the active `docker context`.
@@ -593,10 +639,7 @@ def _create_sdk_client() -> "docker.DockerClient":
         ctx = None
     if ctx is not None and ctx.Host and ctx.Host != _DEFAULT_DOCKER_SOCK:
         logger.info("Connecting via docker context %s → %s", ctx.Name, ctx.Host)
-        kwargs: dict = {"base_url": ctx.Host, "tls": ctx.TLSConfig or False}
-        if ctx.Host.startswith("ssh://"):
-            kwargs["use_ssh_client"] = True
-        return docker.DockerClient(**kwargs)
+        return _build_sdk_client_for_context(ctx)
     return docker.from_env()
 
 
@@ -795,11 +838,15 @@ class DockerClient:
     def __init__(self) -> None:
         self._sdk: docker.DockerClient | None = None
         self._fetcher: DockerResourceFetcher | None = None
+        # Context picked via the in-app switcher (see `switch_context`),
+        # persisted across restarts, takes precedence over the ambient
+        # `docker context` on every (re)connect while set.
+        self._context_override: str | None = _load_last_context()
         self.connection: ConnectionState = ConnectionState(
             status=ConnectionStatus.NOT_CONNECTED,
             message="Not yet connected",
             hint="",
-            context=_get_docker_context(),
+            context=self._context_override or _get_docker_context(),
             host=_get_docker_host(),
         )
 
@@ -817,10 +864,34 @@ class DockerClient:
         return self.connection
 
     def _connect(self) -> ConnectionState:
-        context = _get_docker_context()
-        host = _get_docker_host()
+        ctx = None
+        if self._context_override:
+            try:
+                from docker.context import ContextAPI
+
+                ctx = ContextAPI.get_context(self._context_override)
+            except Exception:
+                ctx = None
+            if ctx is None:
+                logger.warning(
+                    "Saved context %r no longer exists — using ambient default",
+                    self._context_override,
+                )
+                self._context_override = None
+                _clear_last_context()
+
+        context = ctx.Name if ctx is not None else _get_docker_context()
+        host = (
+            (ctx.Host or _DEFAULT_DOCKER_SOCK)
+            if ctx is not None
+            else _get_docker_host()
+        )
         try:
-            sdk = _create_sdk_client()
+            sdk = (
+                _build_sdk_client_for_context(ctx)
+                if ctx is not None
+                else _create_sdk_client()
+            )
             sdk.ping()  # real round-trip — surfaces connection errors at init time
             self._sdk = sdk
             self._fetcher = DockerResourceFetcher(sdk)
@@ -834,7 +905,7 @@ class DockerClient:
             )
         except DockerException as e:
             logger.exception("Docker connection failed: %s", e)
-            return _classify_docker_error(e)
+            return replace(_classify_docker_error(e), context=context, host=host)
         except FileNotFoundError as e:
             logger.exception("Docker executable not found: %s", e)
             return ConnectionState(
@@ -858,13 +929,41 @@ class DockerClient:
     def is_connected(self) -> bool:
         return self.connection.status == ConnectionStatus.CONNECTED
 
+    def mark_disconnected(self, exc: Exception) -> None:
+        """Flip connection state to disconnected after a live call fails.
+
+        `ensure_connected()` only reattempts `_connect()` while
+        `not self.is_connected` — without this, a daemon that dies mid-session
+        would leave `self.connection` stuck at `CONNECTED` forever (nothing
+        else ever un-sets it), so every later `ensure_connected()` call would
+        no-op and the app would never reconnect. Resetting `_sdk`/`_fetcher`
+        also ensures the *next* connect attempt builds a fresh client rather
+        than reusing a possibly-stale one. No-ops if already disconnected.
+        """
+        if not self.is_connected:
+            return
+        self._sdk = None
+        self._fetcher = None
+        classified = _classify_docker_error(exc)
+        # Preserve the context/host we were actually using — `_classify_docker_error`
+        # recomputes them from the ambient environment, which would be wrong
+        # once an in-app context override (see switch_context) is active.
+        self.connection = replace(
+            classified, context=self.connection.context, host=self.connection.host
+        )
+        logger.warning("Docker connection lost: %s", exc)
+
     # --- Reads ---
 
     def fetch_snapshot(self) -> DockerSnapshot:
         self.ensure_connected()
         if not self._fetcher:
             return DockerSnapshot([], [], [], [])
-        return self._fetcher.fetch_snapshot()
+        try:
+            return self._fetcher.fetch_snapshot()
+        except (DockerException, requests.exceptions.RequestException) as e:
+            self.mark_disconnected(e)
+            return DockerSnapshot([], [], [], [])
 
     def fetch_logs(self, container_id: str, tail: int = 500) -> str:
         if not self._sdk:
@@ -898,6 +997,31 @@ class DockerClient:
     def stream_pull(self, repository: str, tag: str = "latest") -> PullStream:
         """Progress stream for pulling one image (`docker pull repo:tag`)."""
         return PullStream(repository, tag, self._sdk)
+
+    def list_contexts(self) -> list[ContextInfo]:
+        """All configured `docker context`s — for the in-app context switcher.
+
+        `is_current` compares against `self.connection.context` (whatever
+        DockSurf is actually connected through right now, override or
+        ambient) rather than `ContextAPI.get_current_context()`, which only
+        reflects the OS-level ambient context. Works even while disconnected,
+        since listing contexts is local disk I/O, not a daemon round-trip.
+        """
+        try:
+            from docker.context import ContextAPI
+
+            contexts = ContextAPI.contexts()
+        except Exception as e:
+            logger.warning("Failed to list docker contexts: %s", e)
+            return []
+        return [
+            ContextInfo(
+                name=ctx.Name,
+                host=ctx.Host or _DEFAULT_DOCKER_SOCK,
+                is_current=(ctx.Name == self.connection.context),
+            )
+            for ctx in contexts
+        ]
 
     def image_history(self, image_id: str) -> list[ImageLayer] | None:
         """Layer history for one image (`docker history`) — `None` on error.
@@ -959,6 +1083,52 @@ class DockerClient:
         return _parse_system_df(raw)
 
     # --- Writes ---
+
+    def switch_context(self, name: str) -> CommandResult:
+        """Switch DockSurf's own Docker connection to another context.
+
+        In-app only: unlike `docker context use`, this never touches
+        `~/.docker/config.json`, so every other terminal keeps whatever
+        context it already had. Builds and pings a fresh client scoped to
+        the target context *before* touching `self._sdk`/`self.connection`,
+        so a failed switch (e.g. an unreachable remote host) leaves the
+        current working connection untouched. On success the choice is
+        persisted so it survives an app restart.
+        """
+        try:
+            from docker.context import ContextAPI
+
+            ctx = ContextAPI.get_context(name)
+        except Exception as e:
+            return CommandResult.failure(f"Could not load context '{name}': {e}")
+        if ctx is None:
+            return CommandResult.failure(
+                f"Context '{name}' not found", kind=CommandErrorKind.NOT_FOUND
+            )
+
+        try:
+            sdk = _build_sdk_client_for_context(ctx)
+            sdk.ping()
+        except Exception as e:
+            logger.warning("Switch to context %s failed: %s", name, e)
+            return CommandResult.failure(
+                f"Could not connect via context '{name}': {e}",
+                kind=CommandErrorKind.DAEMON_UNREACHABLE,
+            )
+
+        self._sdk = sdk
+        self._fetcher = DockerResourceFetcher(sdk)
+        self._context_override = name
+        self.connection = ConnectionState(
+            status=ConnectionStatus.CONNECTED,
+            message="Connected",
+            hint="",
+            context=ctx.Name,
+            host=ctx.Host or _DEFAULT_DOCKER_SOCK,
+        )
+        _save_last_context(name)
+        logger.info("Switched Docker context to %s (%s)", name, ctx.Host)
+        return CommandResult.success(f"Switched to context '{name}'")
 
     def stop_container(self, container_id: str) -> CommandResult:
         return self._run_management_command(
@@ -1308,6 +1478,7 @@ class DockerClient:
             return CommandResult.failure(str(e), kind=kind)
         except (DockerException, requests.exceptions.RequestException) as e:
             logger.warning("Docker daemon unreachable: %s", e)
+            self.mark_disconnected(e)
             return CommandResult.failure(
                 str(e), kind=CommandErrorKind.DAEMON_UNREACHABLE
             )

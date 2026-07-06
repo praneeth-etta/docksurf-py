@@ -242,6 +242,15 @@ class SystemDf:
 
 
 @dataclass(slots=True, frozen=True)
+class ContextInfo:
+    """One Docker CLI context (`docker context ls`)."""
+
+    name: str
+    host: str
+    is_current: bool
+
+
+@dataclass(slots=True, frozen=True)
 class ContainerTop:
     """Parsed `container.top()` result — one running-process snapshot.
 

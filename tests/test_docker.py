@@ -1,4 +1,8 @@
+import json
+import tempfile
 import unittest
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from docker.errors import APIError, DockerException, NotFound
@@ -65,6 +69,171 @@ class LazyConnectTests(unittest.TestCase):
         self.assertTrue(client.is_connected)
         self.assertEqual(second, DockerSnapshot([], [], [], []))
         self.assertEqual(from_env.call_count, 2)
+
+
+def _fake_context(name: str, host: str, tls=False) -> SimpleNamespace:
+    return SimpleNamespace(Name=name, Host=host, TLSConfig=tls)
+
+
+def _new_client() -> DockerClient:
+    """A `DockerClient()` that never picks up a real persisted context
+    override from this machine's `~/.local/share/docksurf-py/state.json`,
+    so these tests stay hermetic regardless of host state."""
+    with patch("docksurf_py.docker._load_last_context", return_value=None):
+        return DockerClient()
+
+
+class MarkDisconnectedTests(unittest.TestCase):
+    def test_flips_state_and_resets_client(self) -> None:
+        fake_sdk = _fake_sdk()
+        with patch("docksurf_py.docker.docker.from_env", return_value=fake_sdk):
+            client = _new_client()
+            client.fetch_snapshot()  # connects
+        self.assertTrue(client.is_connected)
+
+        client.mark_disconnected(ConnectionError("connection refused"))
+
+        self.assertFalse(client.is_connected)
+        self.assertIsNone(client._sdk)
+        self.assertIsNone(client._fetcher)
+
+    def test_preserves_context_and_host_over_ambient(self) -> None:
+        fake_sdk = _fake_sdk()
+        with patch("docksurf_py.docker.docker.from_env", return_value=fake_sdk):
+            client = _new_client()
+            client.fetch_snapshot()
+        client.connection.context = "custom-ctx"
+        client.connection.host = "ssh://example.com"
+
+        client.mark_disconnected(ConnectionError("boom"))
+
+        self.assertEqual(client.connection.context, "custom-ctx")
+        self.assertEqual(client.connection.host, "ssh://example.com")
+
+    def test_noop_if_already_disconnected(self) -> None:
+        client = _new_client()
+        self.assertFalse(client.is_connected)
+        client.mark_disconnected(ConnectionError("boom"))  # should not raise
+        self.assertFalse(client.is_connected)
+
+    def test_fetch_snapshot_marks_disconnected_on_daemon_death(self) -> None:
+        fake_sdk = _fake_sdk()
+        with patch("docksurf_py.docker.docker.from_env", return_value=fake_sdk):
+            client = _new_client()
+            client.fetch_snapshot()  # connects
+            self.assertTrue(client.is_connected)
+
+            fake_sdk.containers.list.side_effect = DockerException("daemon down")
+            snapshot = client.fetch_snapshot()
+
+        self.assertEqual(snapshot, DockerSnapshot([], [], [], []))
+        self.assertFalse(client.is_connected)
+
+
+class ContextPersistenceTests(unittest.TestCase):
+    def test_round_trips_last_context(self) -> None:
+        import docksurf_py.docker as dockmod
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state_file = Path(tmp) / "state.json"
+            with patch.object(dockmod, "_STATE_FILE", state_file):
+                self.assertIsNone(dockmod._load_last_context())
+
+                dockmod._save_last_context("remote")
+                self.assertEqual(dockmod._load_last_context(), "remote")
+                self.assertEqual(
+                    json.loads(state_file.read_text()), {"context": "remote"}
+                )
+
+                dockmod._clear_last_context()
+                self.assertIsNone(dockmod._load_last_context())
+
+    def test_load_tolerates_missing_or_corrupt_file(self) -> None:
+        import docksurf_py.docker as dockmod
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state_file = Path(tmp) / "nested" / "state.json"
+            with patch.object(dockmod, "_STATE_FILE", state_file):
+                self.assertIsNone(dockmod._load_last_context())  # missing dir/file
+
+                state_file.parent.mkdir(parents=True)
+                state_file.write_text("not json")
+                self.assertIsNone(dockmod._load_last_context())
+
+
+class SwitchContextTests(unittest.TestCase):
+    def test_switch_success_updates_connection_and_persists(self) -> None:
+        fake_sdk = _fake_sdk()
+        ctx = _fake_context("remote", "ssh://example.com")
+        client = _new_client()
+        with (
+            patch("docker.context.ContextAPI.get_context", return_value=ctx),
+            patch("docksurf_py.docker.docker.DockerClient", return_value=fake_sdk),
+            patch("docksurf_py.docker._save_last_context") as save,
+        ):
+            result = client.switch_context("remote")
+
+        self.assertTrue(result.ok)
+        self.assertTrue(client.is_connected)
+        self.assertEqual(client.connection.context, "remote")
+        self.assertEqual(client.connection.host, "ssh://example.com")
+        self.assertEqual(client._context_override, "remote")
+        save.assert_called_once_with("remote")
+
+    def test_switch_to_missing_context_fails(self) -> None:
+        client = _new_client()
+        with patch("docker.context.ContextAPI.get_context", return_value=None):
+            result = client.switch_context("nope")
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.kind, CommandErrorKind.NOT_FOUND)
+
+    def test_switch_leaves_current_connection_untouched_on_ping_failure(self) -> None:
+        fake_sdk = _fake_sdk()
+        with patch("docksurf_py.docker.docker.from_env", return_value=fake_sdk):
+            client = _new_client()
+            client.fetch_snapshot()  # connects via ambient default
+        self.assertTrue(client.is_connected)
+
+        unreachable_ctx = _fake_context("remote", "ssh://unreachable.example")
+        unreachable_sdk = MagicMock()
+        unreachable_sdk.ping.side_effect = DockerException("no route to host")
+        with (
+            patch(
+                "docker.context.ContextAPI.get_context", return_value=unreachable_ctx
+            ),
+            patch(
+                "docksurf_py.docker.docker.DockerClient", return_value=unreachable_sdk
+            ),
+        ):
+            result = client.switch_context("remote")
+
+        self.assertFalse(result.ok)
+        # The working connection from before the failed switch is untouched.
+        self.assertTrue(client.is_connected)
+        self.assertIs(client._sdk, fake_sdk)
+
+    def test_list_contexts_marks_current_by_active_connection(self) -> None:
+        fake_sdk = _fake_sdk()
+        with patch("docksurf_py.docker.docker.from_env", return_value=fake_sdk):
+            client = _new_client()
+            client.fetch_snapshot()  # connects, context becomes "default"
+
+        contexts = [
+            _fake_context("default", "unix:///var/run/docker.sock"),
+            _fake_context("remote", "ssh://example.com"),
+        ]
+        with patch("docker.context.ContextAPI.contexts", return_value=contexts):
+            infos = client.list_contexts()
+
+        by_name = {c.name: c for c in infos}
+        self.assertTrue(by_name["default"].is_current)
+        self.assertFalse(by_name["remote"].is_current)
+
+    def test_list_contexts_returns_empty_on_error(self) -> None:
+        client = _new_client()
+        with patch("docker.context.ContextAPI.contexts", side_effect=Exception("boom")):
+            self.assertEqual(client.list_contexts(), [])
 
 
 class ManagementCommandResultTests(unittest.TestCase):

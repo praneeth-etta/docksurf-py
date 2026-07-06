@@ -26,6 +26,7 @@ from textual.widgets import (
 from docksurf_py.actions import (
     ComposeActionHandler,
     ContainerActionHandler,
+    ContextActionHandler,
     DeletePlan,
     ImageActionHandler,
     InspectHandler,
@@ -204,6 +205,7 @@ class DockSurfApp(
     SelectionHandler,
     InspectHandler,
     PruneHandler,
+    ContextActionHandler,
     ImageActionHandler,
     VolumeActionHandler,
     NetworkActionHandler,
@@ -250,6 +252,7 @@ class DockSurfApp(
         ("space", "toggle_mark", "Mark / Collapse"),
         ("w", "system_df", "Disk usage"),
         ("P", "prune", "Prune"),
+        Binding("D", "switch_context", "Docker context", show=False),
         Binding("escape", "clear_marks", "Clear marks", show=False),
         # Image / Volume / Network tab actions (Roadmap §5). Tab-scoped: each
         # action guards its tab and notifies a hint elsewhere. show=False keeps

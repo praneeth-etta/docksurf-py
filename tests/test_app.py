@@ -31,6 +31,7 @@ from docksurf_py.connection import ConnectionState, ConnectionStatus
 from docksurf_py.constants import (
     DETAIL_PANE_ID,
     LOG_PANE_ID,
+    STATUS_BAR_ID,
     LogLine,
     LogOptions,
     TabID,
@@ -42,6 +43,7 @@ from docksurf_py.models import (
     ComposeProject,
     Container,
     ContainerTop,
+    ContextInfo,
     DockerSnapshot,
     Image,
     ImageLayer,
@@ -62,6 +64,7 @@ from docksurf_py.widgets import (
     PromptScreen,
     PruneScreen,
     PullProgressScreen,
+    StatusBar,
 )
 from tests.test_compose import make_container
 
@@ -110,13 +113,42 @@ class FakePullStream:
         self._active = False
 
 
+class FakeEventStream:
+    """A finite `EventStream`-shaped fake with a settable `.error`.
+
+    Yields nothing and ends immediately; `.error` lets a test simulate the
+    daemon dropping mid-stream (`start_event_listener` reads it to decide
+    whether to call `mark_disconnected`).
+    """
+
+    def __init__(self, error: Exception | None = None) -> None:
+        self.error = error
+
+    def __iter__(self):
+        return iter(())
+
+    def stop(self) -> None:
+        pass
+
+
 class MockDockerService:
     def __init__(self, fetch_fn: Callable[[], DockerSnapshot]) -> None:
         self._fetch_fn = fetch_fn
         self.connection = _CONNECTED_STATE
+        # Tests can flip this (and `connection`) to simulate a daemon drop —
+        # `ensure_connected()` below just returns whatever was set here.
+        self._connected = True
         # Recorded (method_name, *args) tuples for every write call — lets
         # bulk/prune tests assert who was actually invoked.
         self.calls: list[tuple] = []
+        # Contexts returned by list_contexts(); tests can override.
+        self.contexts: list[ContextInfo] = [
+            ContextInfo(
+                name="default", host="unix:///var/run/docker.sock", is_current=True
+            )
+        ]
+        # Result returned by switch_context(); tests can override.
+        self.switch_result: CommandResult = CommandResult.success("Switched")
         # Lines a log stream yields; tests can override before opening logs.
         self.log_lines: list[LogLine] = [
             LogLine(text="starting up", ts="2024-01-01T00:00:00Z"),
@@ -141,10 +173,33 @@ class MockDockerService:
 
     @property
     def is_connected(self) -> bool:
-        return True
+        return self._connected
+
+    def ensure_connected(self) -> ConnectionState:
+        self.calls.append(("ensure_connected",))
+        return self.connection
+
+    def mark_disconnected(self, exc: Exception) -> None:
+        self.calls.append(("mark_disconnected", str(exc)))
+        self._connected = False
+        self.connection = ConnectionState(
+            status=ConnectionStatus.DAEMON_UNAVAILABLE,
+            message="Docker daemon is not running",
+            hint="Start Docker Desktop, or run: sudo systemctl start docker",
+            context=self.connection.context,
+            host=self.connection.host,
+        )
 
     def fetch_snapshot(self) -> DockerSnapshot:
         return self._fetch_fn()
+
+    def list_contexts(self) -> list[ContextInfo]:
+        self.calls.append(("list_contexts",))
+        return self.contexts
+
+    def switch_context(self, name: str) -> CommandResult:
+        self.calls.append(("switch_context", name))
+        return self.switch_result
 
     def stream_logs(self, container_id, options=None):
         self.calls.append(("stream_logs", container_id, options))
@@ -1316,6 +1371,95 @@ class NetworkActionTests(unittest.IsolatedAsyncioTestCase):
             out = cap.get()
             self.assertIn("web", out)
             self.assertIn("172.18.0.2", out)
+
+
+class ContextSwitchTests(unittest.IsolatedAsyncioTestCase):
+    async def test_switch_context_picks_and_switches(self) -> None:
+        svc = MockDockerService(lambda: EMPTY_SNAPSHOT)
+        svc.contexts = [
+            ContextInfo(
+                name="default", host="unix:///var/run/docker.sock", is_current=True
+            ),
+            ContextInfo(name="remote", host="ssh://example.com", is_current=False),
+        ]
+        app = DockSurfApp(docker=svc)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.action_switch_context()
+            await wait_until(
+                lambda: any(
+                    isinstance(s, ContainerPickerScreen) for s in app.screen_stack
+                )
+            )
+            app.screen_stack[-1].dismiss("remote")
+            await wait_until(lambda: ("switch_context", "remote") in svc.calls)
+
+    async def test_switch_context_no_contexts_notifies(self) -> None:
+        svc = MockDockerService(lambda: EMPTY_SNAPSHOT)
+        svc.contexts = []
+        app = DockSurfApp(docker=svc)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.action_switch_context()
+            await pilot.pause()
+            self.assertFalse(
+                any(isinstance(s, ContainerPickerScreen) for s in app.screen_stack)
+            )
+            self.assertNotIn("switch_context", [c[0] for c in svc.calls])
+
+    async def test_switch_context_cancel_does_nothing(self) -> None:
+        svc = MockDockerService(lambda: EMPTY_SNAPSHOT)
+        app = DockSurfApp(docker=svc)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.action_switch_context()
+            await wait_until(
+                lambda: any(
+                    isinstance(s, ContainerPickerScreen) for s in app.screen_stack
+                )
+            )
+            app.screen_stack[-1].dismiss(None)
+            await pilot.pause()
+            self.assertNotIn("switch_context", [c[0] for c in svc.calls])
+
+
+class ReconnectTests(unittest.IsolatedAsyncioTestCase):
+    async def test_event_listener_recovers_after_daemon_drop(self) -> None:
+        svc = MockDockerService(lambda: EMPTY_SNAPSHOT)
+
+        stream_calls = {"n": 0}
+
+        def stream_events():
+            stream_calls["n"] += 1
+            if stream_calls["n"] == 1:
+                return FakeEventStream(error=ConnectionError("daemon down"))
+            return FakeEventStream()
+
+        svc.stream_events = stream_events  # type: ignore[method-assign]
+
+        def ensure_connected() -> ConnectionState:
+            svc.calls.append(("ensure_connected",))
+            svc._connected = True
+            svc.connection = _CONNECTED_STATE
+            return svc.connection
+
+        svc.ensure_connected = ensure_connected  # type: ignore[method-assign]
+
+        app = DockSurfApp(docker=svc)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            # The first stream_events() call errors out — mark_disconnected
+            # fires and the StatusBar should show the disconnected segment.
+            await wait_until(lambda: ("mark_disconnected", "daemon down") in svc.calls)
+            status_bar = app.query_one(f"#{STATUS_BAR_ID}", StatusBar)
+            await wait_until(lambda: bool(status_bar._conn_text))
+            self.assertIn("Docker daemon is not running", status_bar._conn_text)
+
+            # The 2s backoff then retries ensure_connected(), which our stub
+            # flips back to connected — a refresh should follow automatically,
+            # with no manual `r` press.
+            await wait_until(lambda: svc.is_connected, timeout=3.0)
+            await wait_until(lambda: not status_bar._conn_text, timeout=3.0)
 
 
 if __name__ == "__main__":

@@ -19,6 +19,7 @@ from docksurf_py.docker import (
 from docksurf_py.models import (
     CommandResult,
     ContainerTop,
+    ContextInfo,
     DockerSnapshot,
     ImageLayer,
     SystemDf,
@@ -32,7 +33,15 @@ class DockerService(Protocol):
     @property
     def is_connected(self) -> bool: ...
 
+    def ensure_connected(self) -> ConnectionState: ...
+
+    def mark_disconnected(self, exc: Exception) -> None: ...
+
     def fetch_snapshot(self) -> DockerSnapshot: ...
+
+    def list_contexts(self) -> list[ContextInfo]: ...
+
+    def switch_context(self, name: str) -> CommandResult: ...
 
     def stream_logs(
         self, container_id: str, options: LogOptions | None = None
