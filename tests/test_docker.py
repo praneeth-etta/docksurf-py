@@ -23,7 +23,7 @@ def _fake_sdk() -> MagicMock:
 
 class LazyConnectTests(unittest.TestCase):
     def test_constructor_does_not_touch_the_sdk(self) -> None:
-        with patch("docksurf_py.docker.docker.from_env") as from_env:
+        with patch("docksurf_py.docker.context.docker.from_env") as from_env:
             client = DockerClient()
 
         from_env.assert_not_called()
@@ -32,7 +32,7 @@ class LazyConnectTests(unittest.TestCase):
 
     def test_fetch_snapshot_connects_lazily(self) -> None:
         fake_sdk = _fake_sdk()
-        with patch("docksurf_py.docker.docker.from_env", return_value=fake_sdk):
+        with patch("docksurf_py.docker.context.docker.from_env", return_value=fake_sdk):
             client = DockerClient()
             self.assertFalse(client.is_connected)
 
@@ -45,7 +45,7 @@ class LazyConnectTests(unittest.TestCase):
     def test_fetch_snapshot_does_not_reping_once_connected(self) -> None:
         fake_sdk = _fake_sdk()
         with patch(
-            "docksurf_py.docker.docker.from_env", return_value=fake_sdk
+            "docksurf_py.docker.context.docker.from_env", return_value=fake_sdk
         ) as from_env:
             client = DockerClient()
             client.fetch_snapshot()
@@ -56,7 +56,7 @@ class LazyConnectTests(unittest.TestCase):
 
     def test_fetch_snapshot_retries_after_daemon_recovers(self) -> None:
         fake_sdk = _fake_sdk()
-        with patch("docksurf_py.docker.docker.from_env") as from_env:
+        with patch("docksurf_py.docker.context.docker.from_env") as from_env:
             from_env.side_effect = [DockerException("daemon down"), fake_sdk]
             client = DockerClient()
 
@@ -79,14 +79,14 @@ def _new_client() -> DockerClient:
     """A `DockerClient()` that never picks up a real persisted context
     override from this machine's `~/.local/share/docksurf-py/state.json`,
     so these tests stay hermetic regardless of host state."""
-    with patch("docksurf_py.docker._load_last_context", return_value=None):
+    with patch("docksurf_py.docker.client._load_last_context", return_value=None):
         return DockerClient()
 
 
 class MarkDisconnectedTests(unittest.TestCase):
     def test_flips_state_and_resets_client(self) -> None:
         fake_sdk = _fake_sdk()
-        with patch("docksurf_py.docker.docker.from_env", return_value=fake_sdk):
+        with patch("docksurf_py.docker.context.docker.from_env", return_value=fake_sdk):
             client = _new_client()
             client.fetch_snapshot()  # connects
         self.assertTrue(client.is_connected)
@@ -99,7 +99,7 @@ class MarkDisconnectedTests(unittest.TestCase):
 
     def test_preserves_context_and_host_over_ambient(self) -> None:
         fake_sdk = _fake_sdk()
-        with patch("docksurf_py.docker.docker.from_env", return_value=fake_sdk):
+        with patch("docksurf_py.docker.context.docker.from_env", return_value=fake_sdk):
             client = _new_client()
             client.fetch_snapshot()
         client.connection.context = "custom-ctx"
@@ -118,7 +118,7 @@ class MarkDisconnectedTests(unittest.TestCase):
 
     def test_fetch_snapshot_marks_disconnected_on_daemon_death(self) -> None:
         fake_sdk = _fake_sdk()
-        with patch("docksurf_py.docker.docker.from_env", return_value=fake_sdk):
+        with patch("docksurf_py.docker.context.docker.from_env", return_value=fake_sdk):
             client = _new_client()
             client.fetch_snapshot()  # connects
             self.assertTrue(client.is_connected)
@@ -132,7 +132,7 @@ class MarkDisconnectedTests(unittest.TestCase):
 
 class ContextPersistenceTests(unittest.TestCase):
     def test_round_trips_last_context(self) -> None:
-        import docksurf_py.docker as dockmod
+        import docksurf_py.docker.context as dockmod
 
         with tempfile.TemporaryDirectory() as tmp:
             state_file = Path(tmp) / "state.json"
@@ -149,7 +149,7 @@ class ContextPersistenceTests(unittest.TestCase):
                 self.assertIsNone(dockmod._load_last_context())
 
     def test_load_tolerates_missing_or_corrupt_file(self) -> None:
-        import docksurf_py.docker as dockmod
+        import docksurf_py.docker.context as dockmod
 
         with tempfile.TemporaryDirectory() as tmp:
             state_file = Path(tmp) / "nested" / "state.json"
@@ -168,8 +168,10 @@ class SwitchContextTests(unittest.TestCase):
         client = _new_client()
         with (
             patch("docker.context.ContextAPI.get_context", return_value=ctx),
-            patch("docksurf_py.docker.docker.DockerClient", return_value=fake_sdk),
-            patch("docksurf_py.docker._save_last_context") as save,
+            patch(
+                "docksurf_py.docker.context.docker.DockerClient", return_value=fake_sdk
+            ),
+            patch("docksurf_py.docker.client._save_last_context") as save,
         ):
             result = client.switch_context("remote")
 
@@ -190,7 +192,7 @@ class SwitchContextTests(unittest.TestCase):
 
     def test_switch_leaves_current_connection_untouched_on_ping_failure(self) -> None:
         fake_sdk = _fake_sdk()
-        with patch("docksurf_py.docker.docker.from_env", return_value=fake_sdk):
+        with patch("docksurf_py.docker.context.docker.from_env", return_value=fake_sdk):
             client = _new_client()
             client.fetch_snapshot()  # connects via ambient default
         self.assertTrue(client.is_connected)
@@ -203,7 +205,8 @@ class SwitchContextTests(unittest.TestCase):
                 "docker.context.ContextAPI.get_context", return_value=unreachable_ctx
             ),
             patch(
-                "docksurf_py.docker.docker.DockerClient", return_value=unreachable_sdk
+                "docksurf_py.docker.context.docker.DockerClient",
+                return_value=unreachable_sdk,
             ),
         ):
             result = client.switch_context("remote")
@@ -215,7 +218,7 @@ class SwitchContextTests(unittest.TestCase):
 
     def test_list_contexts_marks_current_by_active_connection(self) -> None:
         fake_sdk = _fake_sdk()
-        with patch("docksurf_py.docker.docker.from_env", return_value=fake_sdk):
+        with patch("docksurf_py.docker.context.docker.from_env", return_value=fake_sdk):
             client = _new_client()
             client.fetch_snapshot()  # connects, context becomes "default"
 
@@ -522,8 +525,10 @@ class ContainerCpTests(unittest.TestCase):
     def test_builds_cp_argv_and_succeeds(self) -> None:
         client = self._client()
         with (
-            patch("docksurf_py.docker.shutil.which", return_value="/usr/bin/docker"),
-            patch("docksurf_py.docker.subprocess.run") as run,
+            patch(
+                "docksurf_py.docker.client.shutil.which", return_value="/usr/bin/docker"
+            ),
+            patch("docksurf_py.docker.client.subprocess.run") as run,
         ):
             run.return_value = MagicMock(returncode=0, stdout="", stderr="")
             result = client.container_cp("mycontainer:/etc/hosts", "./hosts")
@@ -533,7 +538,7 @@ class ContainerCpTests(unittest.TestCase):
 
     def test_missing_docker_cli_is_daemon_unreachable(self) -> None:
         client = self._client()
-        with patch("docksurf_py.docker.shutil.which", return_value=None):
+        with patch("docksurf_py.docker.client.shutil.which", return_value=None):
             result = client.container_cp("a", "b")
         self.assertFalse(result.ok)
         self.assertEqual(result.kind, CommandErrorKind.DAEMON_UNREACHABLE)
@@ -541,8 +546,10 @@ class ContainerCpTests(unittest.TestCase):
     def test_nonzero_exit_reports_failure_with_stderr(self) -> None:
         client = self._client()
         with (
-            patch("docksurf_py.docker.shutil.which", return_value="/usr/bin/docker"),
-            patch("docksurf_py.docker.subprocess.run") as run,
+            patch(
+                "docksurf_py.docker.client.shutil.which", return_value="/usr/bin/docker"
+            ),
+            patch("docksurf_py.docker.client.subprocess.run") as run,
         ):
             run.return_value = MagicMock(
                 returncode=1, stdout="", stderr="no such file or directory"

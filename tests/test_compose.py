@@ -159,8 +159,10 @@ class ComposeActionCommandTests(unittest.TestCase):
     def test_up_uses_config_files_and_working_dir(self) -> None:
         client = self._client()
         with (
-            patch("docksurf_py.docker.shutil.which", return_value="/usr/bin/docker"),
-            patch("docksurf_py.docker.subprocess.run") as run,
+            patch(
+                "docksurf_py.docker.client.shutil.which", return_value="/usr/bin/docker"
+            ),
+            patch("docksurf_py.docker.client.subprocess.run") as run,
         ):
             run.return_value = MagicMock(returncode=0, stdout="", stderr="")
             result = client.compose_action(
@@ -191,8 +193,10 @@ class ComposeActionCommandTests(unittest.TestCase):
     def test_stop_uses_project_name_only(self) -> None:
         client = self._client()
         with (
-            patch("docksurf_py.docker.shutil.which", return_value="/usr/bin/docker"),
-            patch("docksurf_py.docker.subprocess.run") as run,
+            patch(
+                "docksurf_py.docker.client.shutil.which", return_value="/usr/bin/docker"
+            ),
+            patch("docksurf_py.docker.client.subprocess.run") as run,
         ):
             run.return_value = MagicMock(returncode=0, stdout="", stderr="")
             client.compose_action("myapp", "stop")
@@ -202,7 +206,7 @@ class ComposeActionCommandTests(unittest.TestCase):
 
     def test_missing_docker_cli_is_daemon_unreachable(self) -> None:
         client = self._client()
-        with patch("docksurf_py.docker.shutil.which", return_value=None):
+        with patch("docksurf_py.docker.client.shutil.which", return_value=None):
             result = client.compose_action("myapp", "down")
         self.assertFalse(result.ok)
         self.assertEqual(result.kind, CommandErrorKind.DAEMON_UNREACHABLE)
@@ -210,8 +214,10 @@ class ComposeActionCommandTests(unittest.TestCase):
     def test_nonzero_exit_reports_failure_with_stderr(self) -> None:
         client = self._client()
         with (
-            patch("docksurf_py.docker.shutil.which", return_value="/usr/bin/docker"),
-            patch("docksurf_py.docker.subprocess.run") as run,
+            patch(
+                "docksurf_py.docker.client.shutil.which", return_value="/usr/bin/docker"
+            ),
+            patch("docksurf_py.docker.client.subprocess.run") as run,
         ):
             run.return_value = MagicMock(
                 returncode=1, stdout="", stderr="no such project"

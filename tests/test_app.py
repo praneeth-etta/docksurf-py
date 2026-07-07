@@ -1173,7 +1173,7 @@ class LogViewerTests(unittest.IsolatedAsyncioTestCase):
         async with app.run_test() as pilot:
             await pilot.pause()
             await self._open_logs(app, pilot)
-            with patch("docksurf_py.actions._write_log_export") as writer:
+            with patch("docksurf_py.actions.container._write_log_export") as writer:
                 writer.return_value = "/tmp/web-x.log"
                 app.action_export_logs()
             self.assertTrue(writer.called)
@@ -1868,13 +1868,13 @@ class OpenInBrowserTests(unittest.TestCase):
 
     def test_wsl_with_explorer_shells_to_explorer_exe(self) -> None:
         with (
-            patch("docksurf_py.actions._is_wsl", return_value=True),
+            patch("docksurf_py.actions.container._is_wsl", return_value=True),
             patch(
-                "docksurf_py.actions.shutil.which",
+                "docksurf_py.actions.container.shutil.which",
                 return_value="/mnt/c/Windows/explorer.exe",
             ),
-            patch("docksurf_py.actions.subprocess.run") as run,
-            patch("docksurf_py.actions.webbrowser.open") as browser_open,
+            patch("docksurf_py.actions.container.subprocess.run") as run,
+            patch("docksurf_py.actions.container.webbrowser.open") as browser_open,
         ):
             result = _open_in_browser("http://localhost:8080")
         self.assertTrue(result)
@@ -1885,10 +1885,10 @@ class OpenInBrowserTests(unittest.TestCase):
 
     def test_non_wsl_falls_back_to_webbrowser(self) -> None:
         with (
-            patch("docksurf_py.actions._is_wsl", return_value=False),
-            patch("docksurf_py.actions.subprocess.run") as run,
+            patch("docksurf_py.actions.container._is_wsl", return_value=False),
+            patch("docksurf_py.actions.container.subprocess.run") as run,
             patch(
-                "docksurf_py.actions.webbrowser.open", return_value=True
+                "docksurf_py.actions.container.webbrowser.open", return_value=True
             ) as browser_open,
         ):
             result = _open_in_browser("http://localhost:8080")
@@ -1898,10 +1898,10 @@ class OpenInBrowserTests(unittest.TestCase):
 
     def test_wsl_without_explorer_falls_back_to_webbrowser(self) -> None:
         with (
-            patch("docksurf_py.actions._is_wsl", return_value=True),
-            patch("docksurf_py.actions.shutil.which", return_value=None),
+            patch("docksurf_py.actions.container._is_wsl", return_value=True),
+            patch("docksurf_py.actions.container.shutil.which", return_value=None),
             patch(
-                "docksurf_py.actions.webbrowser.open", return_value=True
+                "docksurf_py.actions.container.webbrowser.open", return_value=True
             ) as browser_open,
         ):
             result = _open_in_browser("http://localhost:8080")
@@ -1910,13 +1910,13 @@ class OpenInBrowserTests(unittest.TestCase):
 
     def test_explorer_launch_failure_returns_false(self) -> None:
         with (
-            patch("docksurf_py.actions._is_wsl", return_value=True),
+            patch("docksurf_py.actions.container._is_wsl", return_value=True),
             patch(
-                "docksurf_py.actions.shutil.which",
+                "docksurf_py.actions.container.shutil.which",
                 return_value="/mnt/c/Windows/explorer.exe",
             ),
             patch(
-                "docksurf_py.actions.subprocess.run",
+                "docksurf_py.actions.container.subprocess.run",
                 side_effect=OSError("no such file"),
             ),
         ):
@@ -1986,7 +1986,7 @@ class ClipboardAndPortTests(unittest.IsolatedAsyncioTestCase):
             app.query_one(f"#{TableID.CONTAINERS}", DataTable).move_cursor(row=0)
 
             with patch(
-                "docksurf_py.actions._open_in_browser", return_value=True
+                "docksurf_py.actions.container._open_in_browser", return_value=True
             ) as browser_open:
                 app.action_open_port()
                 await wait_until(lambda: browser_open.called)
@@ -2005,7 +2005,7 @@ class ClipboardAndPortTests(unittest.IsolatedAsyncioTestCase):
             app.query_one(f"#{TableID.CONTAINERS}", DataTable).move_cursor(row=0)
 
             with patch(
-                "docksurf_py.actions._open_in_browser", return_value=True
+                "docksurf_py.actions.container._open_in_browser", return_value=True
             ) as browser_open:
                 app.action_open_port()
                 await wait_until(
