@@ -25,6 +25,7 @@ from textual.timer import Timer
 from textual.widget import Widget
 from textual.widgets import (
     Button,
+    Checkbox,
     Collapsible,
     DataTable,
     Input,
@@ -49,6 +50,7 @@ from docksurf_py.constants import (
     BTN_PROMPT_OK_ID,
     BTN_PRUNE_CANCEL_ID,
     BTN_PULL_PROGRESS_CLOSE_ID,
+    CONFIRM_FORCE_CHECKBOX_ID,
     INSPECT_SEARCH_ID,
     INSPECT_VIEW_ID,
     LOG_OPTIONS_SINCE_ID,
@@ -94,8 +96,8 @@ class ContainerTable(DataTable):
         Binding("G", "log_bottom", "Log bottom", show=False),
         Binding("X", "export_logs", "Export logs", show=False),
         Binding("d", "delete", "Delete"),
-        Binding("u", "compose_up", "Compose Up"),
-        Binding("k", "compose_down", "Compose Down"),
+        Binding("ctrl+u", "compose_up", "Compose Up"),
+        Binding("ctrl+k", "compose_down", "Compose Down"),
         Binding("t", "container_top", "Top"),
         Binding("space", "toggle_mark", "Mark / Collapse", show=False),
     ]
@@ -198,26 +200,46 @@ class DetailPane(VerticalScroll):
 
 
 class ConfirmDialog(ModalScreen):
-    """A modal confirmation dialog that dismisses with True or False."""
+    """A modal confirmation dialog.
 
-    def __init__(self, message: str) -> None:
+    Dismisses with a plain `bool` when `force_default` is left `None` — the
+    behavior every existing caller (Compose down, bulk-delete preview,
+    prune, etc.) still gets. Passing a `bool` for `force_default` adds a
+    "Force" checkbox (pre-checked to that default) and the dialog instead
+    dismisses with `(confirmed, force)`.
+    """
+
+    def __init__(self, message: str, force_default: bool | None = None) -> None:
         super().__init__()
         self._message = message
+        self._force_default = force_default
 
     def compose(self) -> ComposeResult:
         with Vertical():
             yield Label(self._message)
+            if self._force_default is not None:
+                yield Checkbox(
+                    "Force",
+                    value=self._force_default,
+                    id=CONFIRM_FORCE_CHECKBOX_ID,
+                )
             with Horizontal():
                 yield Button("Confirm", variant="error", id=BTN_CONFIRM_ID)
                 yield Button("Cancel", variant="default", id=BTN_CANCEL_ID)
 
+    def _result(self, confirmed: bool) -> bool | tuple[bool, bool]:
+        if self._force_default is None:
+            return confirmed
+        force = self.query_one(f"#{CONFIRM_FORCE_CHECKBOX_ID}", Checkbox).value
+        return (confirmed, force)
+
     @on(Button.Pressed, f"#{BTN_CONFIRM_ID}")
     def _confirm(self) -> None:
-        self.dismiss(True)
+        self.dismiss(self._result(True))
 
     @on(Button.Pressed, f"#{BTN_CANCEL_ID}")
     def _cancel(self) -> None:
-        self.dismiss(False)
+        self.dismiss(self._result(False))
 
 
 def _highlight_match(line: str, term: str) -> str:

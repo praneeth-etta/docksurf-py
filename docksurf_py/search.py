@@ -6,7 +6,6 @@ ResourceSearchController is a mixin class that composes into DockSurfApp.
 
 from typing import TYPE_CHECKING
 
-from textual import on
 from textual.widgets import DataTable, Input, TabbedContent
 
 from docksurf_py.constants import SEARCH_BAR_ID
@@ -39,18 +38,25 @@ def _matches_network(n: Network, q: str) -> bool:
 
 
 class ResourceSearchController(_Base):
-    """Opens, closes, and applies the live filter bar across all resource tabs."""
+    """Opens, closes, and applies the live filter bar across all resource tabs.
+
+    `on_search_changed`/`on_search_escape` are plain methods, not `@on`-
+    decorated, even though they look like Textual message handlers: this
+    class runs with a plain `object` base at runtime, and `@on` only wires
+    into Textual's dispatch table for methods defined on a real message-pump
+    class. The real dispatch entry points are
+    `DockSurfApp._on_search_input_changed`/`_on_search_input_submitted` in
+    app.py, which just forward here.
+    """
 
     def action_open_search(self) -> None:
         search_bar = self.query_one(f"#{SEARCH_BAR_ID}", Input)
         search_bar.display = True
         search_bar.focus()
 
-    @on(Input.Changed, f"#{SEARCH_BAR_ID}")
     def on_search_changed(self, event: Input.Changed) -> None:
         self._apply_filter(event.value)
 
-    @on(Input.Submitted, f"#{SEARCH_BAR_ID}")
     def on_search_escape(self, event: Input.Submitted) -> None:
         self._close_search()
 
@@ -72,6 +78,8 @@ class ResourceSearchController(_Base):
 
         items = entry.snapshot_items(self.snapshot)
         filtered = [item for item in items if entry.matches(item, q)]
+        filtered = self._sort_items(active, entry, filtered)
         table = self.query_one(f"#{entry.table_id}", DataTable)
         table.clear(columns=False)
         entry.populate(table, filtered)
+        self._update_empty_state(active, entry, filtered, query)

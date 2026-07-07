@@ -44,6 +44,28 @@ TabbedContent {
     padding: 0 1;
 }
 
+.empty-state {
+    display: none;
+    height: 100%;
+    width: 100%;
+    content-align: center middle;
+    color: $text-muted;
+    text-align: center;
+    padding: 2;
+}
+
+#connection-banner {
+    display: none;
+    dock: top;
+    margin-top: 1; /* Leaves room for the built-in Header */
+    width: 100%;
+    height: auto;
+    background: $error;
+    color: $text;
+    text-align: center;
+    padding: 0 1;
+}
+
 
 ConfirmDialog {
     align: center middle;
@@ -66,6 +88,13 @@ ConfirmDialog Label {
 ConfirmDialog Horizontal {
     align: center middle;
     height: auto;
+}
+
+ConfirmDialog Checkbox {
+    align: center middle;
+    width: 100%;
+    content-align: center middle;
+    margin-bottom: 1;
 }
 
 ConfirmDialog Button {

@@ -8,22 +8,26 @@ key bindings, and wires the on_mount / action_refresh entry points.
 import logging
 import os
 from dataclasses import dataclass
-from typing import Any, Callable, Protocol
+from typing import Any, Callable, Iterable, Protocol
 
 from textual import on
-from textual.app import App, ComposeResult
+from textual.app import App, ComposeResult, SystemCommand
 from textual.binding import Binding
 from textual.containers import Horizontal
+from textual.screen import Screen
 from textual.widgets import (
     DataTable,
     Footer,
     Header,
+    Input,
     LoadingIndicator,
+    Static,
     TabbedContent,
     TabPane,
 )
 
 from docksurf_py.actions import (
+    ClipboardHandler,
     ComposeActionHandler,
     ContainerActionHandler,
     ContextActionHandler,
@@ -37,7 +41,9 @@ from docksurf_py.actions import (
     VolumeActionHandler,
 )
 from docksurf_py.constants import (
+    CONNECTION_BANNER_ID,
     DETAIL_PANE_ID,
+    EMPTY_STATE_IDS,
     LOG_PANE_ID,
     MAIN_CONTAINER_ID,
     REFRESH_LOADING_ID,
@@ -132,6 +138,7 @@ class ResourceEntry:
     show_details: Callable[[DetailPane, int], None]
     matches: Callable[[Any, str], bool]
     plan_delete: Callable[[Any], DeletePlan | None]
+    sort_keys: dict[str, Callable[[Any], Any]]
 
 
 class AppContext(Protocol):
@@ -154,6 +161,7 @@ class AppContext(Protocol):
     _collapsed_projects: set[str]
     _marked: dict[TabID, set[tuple[str, str]]]
     _volume_sizes: dict[str, int]
+    _sort_state: dict[TabID, tuple[str, bool] | None]
     is_running: bool  # really a textual.app.App property
 
     def start_refresh(self) -> None: ...
@@ -161,6 +169,10 @@ class AppContext(Protocol):
     def _apply_filter(self, query: str) -> None: ...
     def _rerender_containers(self) -> None: ...
     def _rerender_active_table(self) -> None: ...
+    def _update_empty_state(
+        self, tab_id: TabID, entry: ResourceEntry, items: list, query: str = ""
+    ) -> None: ...
+    def _sort_items(self, tab_id: TabID, entry: ResourceEntry, items: list) -> list: ...
     def _sync_stats(self) -> None: ...
     def _sync_top(self) -> None: ...
     def _get_focused_container(self) -> Container | None: ...
@@ -192,6 +204,7 @@ class AppContext(Protocol):
     def push_screen(self, *args: Any, **kwargs: Any) -> Any: ...
     def suspend(self, *args: Any, **kwargs: Any) -> Any: ...
     def set_timer(self, *args: Any, **kwargs: Any) -> Any: ...
+    def copy_to_clipboard(self, *args: Any, **kwargs: Any) -> Any: ...
 
 
 class DockSurfApp(
@@ -202,6 +215,7 @@ class DockSurfApp(
     ContainerActionHandler,
     ComposeActionHandler,
     ResourceDeletionHandler,
+    ClipboardHandler,
     SelectionHandler,
     InspectHandler,
     PruneHandler,
@@ -246,14 +260,22 @@ class DockSurfApp(
         Binding("g", "log_top", "Jump to log top", show=False),
         Binding("G", "log_bottom", "Jump to log bottom", show=False),
         Binding("X", "export_logs", "Export logs", show=False),
-        ("u", "compose_up", "Compose Up"),
-        ("k", "compose_down", "Compose Down"),
+        Binding("ctrl+u", "compose_up", "Compose Up"),
+        Binding("ctrl+k", "compose_down", "Compose Down"),
         ("t", "container_top", "Top"),
         ("space", "toggle_mark", "Mark / Collapse"),
         ("w", "system_df", "Disk usage"),
         ("P", "prune", "Prune"),
         Binding("D", "switch_context", "Docker context", show=False),
         Binding("escape", "clear_marks", "Clear marks", show=False),
+        Binding("Y", "yank", "Copy to clipboard", show=False),
+        Binding("O", "open_port", "Open port in browser", show=False),
+        Binding("1", "switch_tab_1", "Containers tab", show=False),
+        Binding("2", "switch_tab_2", "Images tab", show=False),
+        Binding("3", "switch_tab_3", "Volumes tab", show=False),
+        Binding("4", "switch_tab_4", "Networks tab", show=False),
+        Binding("[", "prev_tab", "Previous tab", show=False),
+        Binding("]", "next_tab", "Next tab", show=False),
         # Image / Volume / Network tab actions (Roadmap §5). Tab-scoped: each
         # action guards its tab and notifies a hint elsewhere. show=False keeps
         # the footer uncluttered; all are documented in the `?` help screen.
@@ -280,6 +302,13 @@ class DockSurfApp(
                 show_details=self._show_container_details,
                 matches=_matches_container,
                 plan_delete=self._plan_container_delete,
+                sort_keys={
+                    "Name": lambda c: c.name.lower(),
+                    "Image": lambda c: c.image_name.lower(),
+                    "Status": lambda c: (not c.running, c.status.lower()),
+                    "Health": lambda c: c.health.lower(),
+                    "Uptime": lambda c: c.started_at,
+                },
             ),
             TabID.IMAGES: ResourceEntry(
                 table_id=TableID.IMAGES,
@@ -290,6 +319,11 @@ class DockSurfApp(
                 show_details=self._show_image_details,
                 matches=_matches_image,
                 plan_delete=self._plan_image_delete,
+                sort_keys={
+                    "Repository": lambda i: i.repository.lower(),
+                    "Tag": lambda i: i.tag.lower(),
+                    "Size": lambda i: i.size_bytes,
+                },
             ),
             TabID.VOLUMES: ResourceEntry(
                 table_id=TableID.VOLUMES,
@@ -300,6 +334,10 @@ class DockSurfApp(
                 show_details=self._show_volume_details,
                 matches=_matches_volume,
                 plan_delete=self._plan_volume_delete,
+                sort_keys={
+                    "Name": lambda v: v.name.lower(),
+                    "Status": lambda v: bool(v.used_by),
+                },
             ),
             TabID.NETWORKS: ResourceEntry(
                 table_id=TableID.NETWORKS,
@@ -309,22 +347,40 @@ class DockSurfApp(
                 populate=self._populate_network_table,
                 show_details=self._show_network_details,
                 matches=_matches_network,
+                sort_keys={
+                    "Name": lambda n: n.name.lower(),
+                    "Driver": lambda n: n.driver.lower(),
+                    "Scope": lambda n: n.scope.lower(),
+                },
                 plan_delete=self._plan_network_delete,
             ),
         }
 
     def compose(self) -> ComposeResult:
         yield Header()
+        yield Static("", id=CONNECTION_BANNER_ID)
         with Horizontal(id=MAIN_CONTAINER_ID):
             with TabbedContent():
                 with TabPane("Containers", id=TabID.CONTAINERS):
                     yield ContainerTable(id=TableID.CONTAINERS)
+                    yield Static(
+                        "", id=EMPTY_STATE_IDS[TabID.CONTAINERS], classes="empty-state"
+                    )
                 with TabPane("Images", id=TabID.IMAGES):
                     yield DataTable(id=TableID.IMAGES)
+                    yield Static(
+                        "", id=EMPTY_STATE_IDS[TabID.IMAGES], classes="empty-state"
+                    )
                 with TabPane("Volumes", id=TabID.VOLUMES):
                     yield DataTable(id=TableID.VOLUMES)
+                    yield Static(
+                        "", id=EMPTY_STATE_IDS[TabID.VOLUMES], classes="empty-state"
+                    )
                 with TabPane("Networks", id=TabID.NETWORKS):
                     yield DataTable(id=TableID.NETWORKS)
+                    yield Static(
+                        "", id=EMPTY_STATE_IDS[TabID.NETWORKS], classes="empty-state"
+                    )
             yield DetailPane(id=DETAIL_PANE_ID)
             yield LogPane(id=LOG_PANE_ID)
         yield LoadingIndicator(id=REFRESH_LOADING_ID)
@@ -350,6 +406,31 @@ class DockSurfApp(
 
     def action_refresh(self) -> None:
         self.start_refresh()
+
+    def _switch_tab(self, tab_id: TabID) -> None:
+        self.query_one(TabbedContent).active = tab_id
+
+    def action_switch_tab_1(self) -> None:
+        self._switch_tab(TabID.CONTAINERS)
+
+    def action_switch_tab_2(self) -> None:
+        self._switch_tab(TabID.IMAGES)
+
+    def action_switch_tab_3(self) -> None:
+        self._switch_tab(TabID.VOLUMES)
+
+    def action_switch_tab_4(self) -> None:
+        self._switch_tab(TabID.NETWORKS)
+
+    def action_next_tab(self) -> None:
+        tabs = list(TabID)
+        idx = tabs.index(TabID(self.query_one(TabbedContent).active))
+        self._switch_tab(tabs[(idx + 1) % len(tabs)])
+
+    def action_prev_tab(self) -> None:
+        tabs = list(TabID)
+        idx = tabs.index(TabID(self.query_one(TabbedContent).active))
+        self._switch_tab(tabs[(idx - 1) % len(tabs)])
 
     def _auto_select_first(self) -> None:
         if not self.snapshot:
@@ -400,6 +481,27 @@ class DockSurfApp(
     def clear_on_tab_switch(self) -> None:
         self._auto_select_first()
 
+    @on(DataTable.HeaderSelected)
+    def _on_data_table_header_selected(self, event: DataTable.HeaderSelected) -> None:
+        # Must live here, not on the TableRenderer mixin: `@on` only wires up
+        # through Textual's metaclass for methods on a real message-pump
+        # class, and the mixins run with a plain `object` base at runtime.
+        self._on_header_selected(event)
+
+    @on(Input.Changed, f"#{SEARCH_BAR_ID}")
+    def _on_search_input_changed(self, event: Input.Changed) -> None:
+        # Same reason as _on_data_table_header_selected above — the real
+        # logic lives on ResourceSearchController (search.py), a mixin.
+        self.on_search_changed(event)
+
+    @on(Input.Submitted, f"#{SEARCH_BAR_ID}")
+    def _on_search_input_submitted(self, event: Input.Submitted) -> None:
+        self.on_search_escape(event)
+
+    @on(LogPane.ToggleExpand)
+    def _on_log_pane_toggle_expand(self) -> None:
+        self.action_toggle_log_expand()
+
     def action_new_resource(self) -> None:
         """`+`: create/pull on whichever non-container tab is active."""
         active = self.query_one(TabbedContent).active
@@ -411,6 +513,37 @@ class DockSurfApp(
             self.action_create_network()
         else:
             self.notify("Nothing to create on this tab", severity="information")
+
+    def get_system_commands(self, screen: Screen) -> Iterable[SystemCommand]:
+        """Surface every bound action in the command palette (`ctrl+p`).
+
+        Textual's default only offers Theme/Quit/Keys/Screenshot/Maximize.
+        Reflecting over `BINDINGS` — the same source `?`'s help screen reads
+        from — makes every DockSurf action discoverable, including the
+        `show=False` ones hidden from the footer (that's the point: hidden
+        from the footer, not from the palette).
+        """
+        yield from super().get_system_commands(screen)
+        seen_actions: set[str] = set()
+        for binding in self.BINDINGS:
+            if isinstance(binding, Binding):
+                key, action, description = (
+                    binding.key,
+                    binding.action,
+                    binding.description,
+                )
+            elif len(binding) == 3:
+                key, action, description = binding
+            else:
+                key, action = binding
+                description = ""
+            if not description or action in seen_actions:
+                continue
+            seen_actions.add(action)
+            method = getattr(self, f"action_{action}", None)
+            if method is None:
+                continue
+            yield SystemCommand(description, f"Key: {key}", method)
 
     def action_help(self) -> None:
         self.push_screen(

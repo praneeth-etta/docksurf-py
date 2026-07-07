@@ -8,10 +8,12 @@ that compose into DockSurfApp via Python MRO.
 import asyncio
 import json
 import logging
+import platform
 import re
 import shlex
 import shutil
 import subprocess
+import webbrowser
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -19,7 +21,7 @@ from typing import TYPE_CHECKING, Any, Callable
 
 from rich.markup import escape
 from rich.table import Table
-from textual import on, work
+from textual import work
 from textual.coordinate import Coordinate
 from textual.widgets import DataTable, TabbedContent
 
@@ -30,7 +32,7 @@ from docksurf_py.constants import (
     LogOptions,
     TabID,
 )
-from docksurf_py.docker import format_size
+from docksurf_py.docker import format_ports, format_size
 from docksurf_py.models import (
     CommandErrorKind,
     CommandResult,
@@ -39,6 +41,7 @@ from docksurf_py.models import (
     Image,
     ImageLayer,
     Network,
+    PortBinding,
     Volume,
 )
 from docksurf_py.widgets import (
@@ -142,6 +145,33 @@ def build_cp_paths(c: Container, src: str, dst: str) -> tuple[str, str] | None:
     else:
         dst = f"{c.id}:{dst[len(prefix) :]}"
     return src, dst
+
+
+def _is_wsl() -> bool:
+    try:
+        return "microsoft" in platform.uname().release.lower()
+    except OSError:
+        return False
+
+
+def _open_in_browser(url: str) -> bool:
+    """Best-effort browser launch — stdlib `webbrowser`, not a Docker call.
+
+    `webbrowser.open()` can report success even when nothing actually opened
+    (e.g. on Linux it shells out to `gio`/`xdg-open` and doesn't check their
+    exit status), and WSL in particular has neither by default. On WSL, shell
+    to `explorer.exe` (the standard way to reach the Windows host browser)
+    first; fall back to `webbrowser.open()` everywhere else.
+    """
+    if _is_wsl() and shutil.which("explorer.exe"):
+        try:
+            # explorer.exe exits non-zero even on success when given a URL —
+            # only a launch failure (e.g. missing binary) is a real error.
+            subprocess.run(["explorer.exe", url], check=False)
+            return True
+        except OSError:
+            return False
+    return webbrowser.open(url)
 
 
 class ContainerActionHandler(_Base):
@@ -599,13 +629,47 @@ class ContainerActionHandler(_Base):
 
         self.push_screen(LogOptionsScreen(log_pane.options), _apply)
 
-    @on(LogPane.ToggleExpand)
-    def on_log_pane_toggle_expand(self) -> None:
-        self.action_toggle_log_expand()
-
     def _set_log_expanded(self, log_pane: LogPane, expanded: bool) -> None:
         self.query_one(TabbedContent).display = not expanded
         log_pane.set_expanded(expanded)
+
+    @work
+    async def action_open_port(self) -> None:
+        c = self._get_focused_container()
+        if c is None:
+            self.notify(self._CONTAINER_TAB_HINT, severity="warning")
+            return
+        published = [p for p in c.ports if p.host_port]
+        if not published:
+            self.notify(f"{escape(c.name)} has no published ports", severity="warning")
+            return
+        if len(published) == 1:
+            self._open_port_url(published[0])
+            return
+        # Keyed by index, not host_port — two entries can publish the same
+        # host port (e.g. one TCP, one UDP), and OptionList requires unique
+        # option ids.
+        options = [
+            (str(i), f"{p.host_port} → {p.container_port}")
+            for i, p in enumerate(published)
+        ]
+        chosen = await self.push_screen_wait(
+            ContainerPickerScreen(f"Open port — {escape(c.name)}", options)
+        )
+        if chosen is not None:
+            self._open_port_url(published[int(chosen)])
+
+    def _open_port_url(self, port: PortBinding) -> None:
+        host = "localhost" if port.host_ip in ("", "0.0.0.0", "::") else port.host_ip
+        url = f"http://{host}:{port.host_port}"
+        if _open_in_browser(url):
+            self.notify(f"Opening {url}")
+        else:
+            self.notify(
+                f"Couldn't launch a browser — copy this URL: {url}",
+                severity="warning",
+                timeout=10,
+            )
 
 
 class ComposeActionHandler(_Base):
@@ -692,11 +756,25 @@ class ComposeActionHandler(_Base):
 
 @dataclass(frozen=True)
 class DeletePlan:
-    """What to confirm and run to delete one focused resource."""
+    """What to confirm and run to delete one focused resource.
+
+    `force_default=None` renders a plain Confirm/Cancel dialog and `command`
+    is always called with `force=False`. A `bool` shows a "Force" checkbox
+    pre-checked to that default; `command` is then called with whatever the
+    user leaves the checkbox at. Bulk delete (no interactive checkbox per
+    row) always calls `command` with the plan's own `force_default`.
+    """
 
     confirm_message: str
-    command: Callable[[], CommandResult]
+    command: Callable[[bool], CommandResult]
     success_message: str
+    force_default: bool | None = None
+
+
+def _bind_delete_command(plan: DeletePlan, force: bool) -> Callable[[], CommandResult]:
+    """Bind a `DeletePlan.command` to a fixed `force`, for non-interactive
+    (bulk) delete jobs that can't show a per-row checkbox."""
+    return lambda: plan.command(force)
 
 
 class ResourceDeletionHandler(_Base):
@@ -711,13 +789,14 @@ class ResourceDeletionHandler(_Base):
     def _apply_if_confirmed(
         self,
         confirmed: bool,
-        command_fn: Callable[[], CommandResult],
+        force: bool,
+        command_fn: Callable[[bool], CommandResult],
         success_msg: str,
     ) -> None:
         if not confirmed:
             logger.debug("Deletion cancelled by user")
             return
-        result = command_fn()
+        result = command_fn(force)
         if result.ok:
             logger.info("%s", success_msg)
             self.notify(success_msg)
@@ -738,8 +817,9 @@ class ResourceDeletionHandler(_Base):
         )
         return DeletePlan(
             confirm_message=msg,
-            command=lambda: self.docker.remove_container(c.id, force=is_running),
+            command=lambda force: self.docker.remove_container(c.id, force=force),
             success_message=f"Removed container: {escape(c.name)}",
+            force_default=is_running,
         )
 
     def _plan_image_delete(self, img: Image) -> DeletePlan | None:
@@ -752,20 +832,26 @@ class ResourceDeletionHandler(_Base):
         )
         return DeletePlan(
             confirm_message=msg,
-            command=lambda: self.docker.remove_image(img.id, force=in_use),
+            command=lambda force: self.docker.remove_image(img.id, force=force),
             success_message=f"Removed image {img_label}",
+            force_default=in_use,
         )
 
     def _plan_volume_delete(self, vol: Volume) -> DeletePlan | None:
         if vol.used_by:
+            # Docker's volume-remove `force` only suppresses a "not found"
+            # error — it does not override an in-use guard, so there's no
+            # honest "Force" checkbox to offer here. Name the blockers instead.
+            blockers = ", ".join(escape(name) for name in vol.used_by)
             self.notify(
-                f"Volume '{escape(vol.name)}' is in use — stop containers first",
+                f"Volume '{escape(vol.name)}' is in use by {blockers} — "
+                "stop them first",
                 severity="warning",
             )
             return None
         return DeletePlan(
             confirm_message=f"Remove volume '{escape(vol.name)}'?",
-            command=lambda: self.docker.remove_volume(vol.name),
+            command=lambda force: self.docker.remove_volume(vol.name),
             success_message=f"Removed volume {escape(vol.name)}",
         )
 
@@ -776,10 +862,27 @@ class ResourceDeletionHandler(_Base):
                 severity="warning",
             )
             return None
+
+        def _remove(force: bool) -> CommandResult:
+            # The Docker API has no real "force remove" for networks — every
+            # attached endpoint must be disconnected first.
+            if force:
+                for endpoint in net.endpoints:
+                    self.docker.disconnect_container(net.name, endpoint.container_name)
+            return self.docker.remove_network(net.name)
+
+        has_endpoints = bool(net.endpoints)
+        msg = (
+            f"Force-remove network '{escape(net.name)}'? This disconnects "
+            f"{len(net.endpoints)} attached container(s) first."
+            if has_endpoints
+            else f"Remove network '{escape(net.name)}'?"
+        )
         return DeletePlan(
-            confirm_message=f"Remove network '{escape(net.name)}'?",
-            command=lambda: self.docker.remove_network(net.name),
+            confirm_message=msg,
+            command=_remove,
             success_message=f"Removed network {escape(net.name)}",
+            force_default=True if has_endpoints else None,
         )
 
     @work
@@ -804,8 +907,14 @@ class ResourceDeletionHandler(_Base):
         if plan is None:
             return
 
-        confirmed = await self.push_screen_wait(ConfirmDialog(plan.confirm_message))
-        self._apply_if_confirmed(confirmed, plan.command, plan.success_message)
+        if plan.force_default is None:
+            confirmed = await self.push_screen_wait(ConfirmDialog(plan.confirm_message))
+            force = False
+        else:
+            confirmed, force = await self.push_screen_wait(
+                ConfirmDialog(plan.confirm_message, force_default=plan.force_default)
+            )
+        self._apply_if_confirmed(confirmed, force, plan.command, plan.success_message)
 
     async def _bulk_delete(self, tab_id: TabID) -> None:
         """Delete every marked resource on `tab_id` behind one confirm dialog.
@@ -824,7 +933,8 @@ class ResourceDeletionHandler(_Base):
             if key is None or plan is None:
                 continue
             name = _display_name(item)
-            jobs.append((key, name, plan.command))
+            force = plan.force_default if plan.force_default is not None else False
+            jobs.append((key, name, _bind_delete_command(plan, force)))
             names.append(name)
 
         if not jobs:
@@ -852,6 +962,61 @@ def _display_name(item: Any) -> str:
     if isinstance(item, Image):
         return f"{item.repository}:{item.tag}"
     return getattr(item, "name", str(item))
+
+
+def _yank_fields(item: Any) -> list[tuple[str, str]]:
+    """`(label, value)` pairs a resource can be copied to the clipboard as."""
+    if isinstance(item, Container):
+        fields = [("ID", item.id), ("Name", item.name)]
+        if any(p.host_port for p in item.ports):
+            fields.append(("Port mapping", format_ports(item.ports)))
+        return fields
+    if isinstance(item, ComposeProject):
+        return [("Name", item.name)]
+    if isinstance(item, Image):
+        return [("ID", item.id), ("Repository:Tag", f"{item.repository}:{item.tag}")]
+    if isinstance(item, Volume):
+        return [("Name", item.name)]
+    if isinstance(item, Network):
+        return [("ID", item.id), ("Name", item.name)]
+    return []
+
+
+class ClipboardHandler(_Base):
+    """`Y`: copy the focused resource's ID/name/port-mapping to the clipboard."""
+
+    def action_yank(self) -> None:
+        active = self.query_one(TabbedContent).active
+        item = self._get_focused_resource(active)
+        if item is None:
+            self.notify("Nothing selected to copy", severity="warning")
+            return
+        fields = _yank_fields(item)
+        if not fields:
+            self.notify("Nothing to copy for this item", severity="warning")
+            return
+        if len(fields) == 1:
+            self._yank(fields[0][1])
+            return
+        self._pick_yank_field(fields)
+
+    @work
+    async def _pick_yank_field(self, fields: list[tuple[str, str]]) -> None:
+        # Keyed by label, not value — two fields (e.g. ID/Name) can share the
+        # same value, and OptionList requires unique option ids.
+        options = [(label, f"{label}: {value}") for label, value in fields]
+        chosen_label = await self.push_screen_wait(
+            ContainerPickerScreen("Copy to clipboard", options)
+        )
+        if chosen_label is None:
+            return
+        value = next((v for label, v in fields if label == chosen_label), None)
+        if value is not None:
+            self._yank(value)
+
+    def _yank(self, value: str) -> None:
+        self.copy_to_clipboard(value)
+        self.notify(f"Copied: {value}")
 
 
 def _parse_labels(raw: str) -> dict[str, str]:

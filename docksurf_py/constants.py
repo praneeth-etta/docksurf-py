@@ -69,6 +69,31 @@ REFRESH_LOADING_ID = "refresh-loading"
 # Confirm-dialog button IDs
 BTN_CONFIRM_ID = "confirm"
 BTN_CANCEL_ID = "cancel"
+CONFIRM_FORCE_CHECKBOX_ID = "confirm-force"
+
+# Empty-state placeholder IDs — one per resource table, shown instead of the
+# table itself whenever it has zero rows (see TableRenderer._update_empty_state).
+EMPTY_STATE_IDS: dict[TabID, str] = {
+    TabID.CONTAINERS: "empty-containers",
+    TabID.IMAGES: "empty-images",
+    TabID.VOLUMES: "empty-volumes",
+    TabID.NETWORKS: "empty-networks",
+}
+
+# Shown when a tab's table is genuinely empty (no active search, Docker
+# connected) — a nudge toward the command that would populate it.
+EMPTY_STATE_HINTS: dict[TabID, str] = {
+    TabID.CONTAINERS: "No containers — try `docker run hello-world`",
+    TabID.IMAGES: "No images — try `docker pull nginx`",
+    TabID.VOLUMES: "No volumes — try `docker volume create my-volume`",
+    TabID.NETWORKS: "No networks — try `docker network create my-network`",
+}
+
+# Persistent "Docker unreachable" banner, docked under the Header for as long
+# as the connection stays down (the StatusBar segment + toast already exist
+# but the toast expires after 12s — see
+# SnapshotManager._maybe_notify_connection_change).
+CONNECTION_BANNER_ID = "connection-banner"
 
 # PromptScreen button IDs
 BTN_PROMPT_OK_ID = "prompt-ok"

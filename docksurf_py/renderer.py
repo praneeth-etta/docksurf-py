@@ -9,16 +9,19 @@ import logging
 import os
 import threading
 from collections import defaultdict
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 from rich.markup import escape
 from textual import work
 from textual.timer import Timer
-from textual.widgets import DataTable, Input, LoadingIndicator, TabbedContent
+from textual.widgets import DataTable, Input, LoadingIndicator, Static, TabbedContent
 
 from docksurf_py.connection import ConnectionState, ConnectionStatus
 from docksurf_py.constants import (
+    CONNECTION_BANNER_ID,
     DETAIL_PANE_ID,
+    EMPTY_STATE_HINTS,
+    EMPTY_STATE_IDS,
     MARK_GLYPH,
     REFRESH_LOADING_ID,
     SEARCH_BAR_ID,
@@ -49,7 +52,7 @@ from docksurf_py.models import (
 from docksurf_py.widgets import DetailPane, StatusBar
 
 if TYPE_CHECKING:
-    from docksurf_py.app import AppContext
+    from docksurf_py.app import AppContext, ResourceEntry
 
     _Base = AppContext
 else:
@@ -117,12 +120,16 @@ def _format_health_log(log: list[HealthProbe], limit: int = 5) -> str | None:
 
 def _group_by_project(
     containers: list[Container],
+    key: Callable[[Container], Any] | None = None,
+    reverse: bool = False,
 ) -> tuple[list[ComposeProject], list[Container]]:
     """Split containers into Compose projects (sorted) and standalone ones.
 
-    Services within a project are sorted by service name; a project's
-    config-file/working-dir come from its first service (they're identical
-    across a project's containers).
+    Project ordering is always alphabetical (a header isn't a sortable data
+    row). Services within a project are sorted by `key`/`reverse` when a
+    column sort is active, else by service name (the original default). A
+    project's config-file/working-dir come from its first service (they're
+    identical across a project's containers).
     """
     grouped: dict[str, list[Container]] = defaultdict(list)
     standalone: list[Container] = []
@@ -134,7 +141,10 @@ def _group_by_project(
 
     projects: list[ComposeProject] = []
     for name in sorted(grouped):
-        members = sorted(grouped[name], key=lambda c: c.compose_service)
+        if key is not None:
+            members = sorted(grouped[name], key=key, reverse=reverse)
+        else:
+            members = sorted(grouped[name], key=lambda c: c.compose_service)
         first = members[0]
         projects.append(
             ComposeProject(
@@ -172,14 +182,65 @@ class TableRenderer(_Base):
         # On-demand per-volume disk sizes (populated by the `b` size action),
         # keyed by volume name; read by `_show_volume_details`.
         self._volume_sizes: dict[str, int] = {}
+        # Active column sort per tab: (column name, reverse) or None for the
+        # unsorted (fetch/insertion order) default. Set by `_on_header_selected`.
+        self._sort_state: dict[TabID, tuple[str, bool] | None] = {
+            tab_id: None for tab_id in self._resource_registry
+        }
 
-        for entry in self._resource_registry.values():
+        for tab_id, entry in self._resource_registry.items():
             table = self.query_one(f"#{entry.table_id}", DataTable)
-            # Leading mark column, added separately (not part of ResourceEntry.
-            # columns) so every populate method just prepends one cell per row.
-            table.add_column("", width=2)
-            table.add_columns(*entry.columns)
+            self._add_table_columns(table, tab_id, entry)
             table.cursor_type = "row"
+
+    def _add_table_columns(
+        self, table: DataTable, tab_id: TabID, entry: "ResourceEntry"
+    ) -> None:
+        """(Re)build a table's columns, marking the active sort column.
+
+        Called at initial setup and again whenever the sort column/direction
+        changes (`_on_header_selected`), since Textual has no API to relabel
+        an existing column in place.
+        """
+        # Leading mark column, added separately (not part of ResourceEntry.
+        # columns) so every populate method just prepends one cell per row.
+        table.add_column("", width=2)
+        sort_state = self._sort_state.get(tab_id)
+        for col in entry.columns:
+            label = col
+            if sort_state is not None and sort_state[0] == col:
+                label = f"{col} {'▼' if sort_state[1] else '▲'}"
+            table.add_column(label)
+
+    def _on_header_selected(self, event: DataTable.HeaderSelected) -> None:
+        """Handle a header click and toggle that column's sort.
+
+        Not `@on`-decorated here: this class is a plain mixin (`_Base` is
+        `object` at runtime — see the module docstring), so Textual's
+        `_MessagePumpMeta` never processes it and any `@on` decorator on a
+        mixin method is silently inert. The real dispatch entry point is
+        `DockSurfApp._on_data_table_header_selected` in app.py, which is a
+        real method on the App class and just forwards here.
+        """
+        active = self.query_one(TabbedContent).active
+        entry = self._resource_registry.get(active)
+        if entry is None or event.data_table.id != entry.table_id:
+            return
+        # Column 0 is the leading mark-glyph column — not sortable.
+        if event.column_index == 0:
+            return
+        col_name = entry.columns[event.column_index - 1]
+        if col_name not in entry.sort_keys:
+            return
+
+        current = self._sort_state.get(active)
+        reverse = not current[1] if current and current[0] == col_name else False
+        self._sort_state[active] = (col_name, reverse)
+
+        table = event.data_table
+        table.clear(columns=True)
+        self._add_table_columns(table, active, entry)
+        self._rerender_active_table()
 
     def _populate_container_table(
         self, table: DataTable, items: list[Container] | None = None
@@ -188,7 +249,14 @@ class TableRenderer(_Base):
             assert self.snapshot is not None, "populate with no items needs a snapshot"
             items = self.snapshot.containers
 
-        projects, standalone = _group_by_project(items)
+        sort_state = self._sort_state.get(TabID.CONTAINERS)
+        sort_key = None
+        reverse = False
+        if sort_state is not None:
+            col_name, reverse = sort_state
+            sort_key = self._resource_registry[TabID.CONTAINERS].sort_keys.get(col_name)
+
+        projects, standalone = _group_by_project(items, key=sort_key, reverse=reverse)
         marked = self._marked[TabID.CONTAINERS]
 
         # `_current` is the row-backing list: each row index maps to either a
@@ -303,6 +371,56 @@ class TableRenderer(_Base):
                 table, _mark_cell(marked, self._row_key(n)), n.name, n.driver, n.scope
             )
 
+    def _sort_items(self, tab_id: TabID, entry: "ResourceEntry", items: list) -> list:
+        """Apply the active column sort (if any) to a snapshot/filtered list.
+
+        Used by both `SnapshotManager._apply_snapshot` (plain refresh) and
+        `ResourceSearchController._apply_filter` (search active), so a sort
+        survives both a live `docker events` refresh and search filtering
+        instead of only applying while the search bar happens to be open.
+        """
+        sort_state = self._sort_state.get(tab_id)
+        if sort_state is None:
+            return items
+        col_name, reverse = sort_state
+        sort_key = entry.sort_keys.get(col_name)
+        if sort_key is None:
+            return items
+        return sorted(items, key=sort_key, reverse=reverse)
+
+    def _update_empty_state(
+        self,
+        tab_id: TabID,
+        entry: "ResourceEntry",
+        items: list,
+        query: str = "",
+    ) -> None:
+        """Swap the table for a placeholder message when `items` is empty.
+
+        Distinguishes three causes so the message actually helps: an active
+        search with no matches, a disconnected daemon (reusing the same
+        classified `ConnectionState` the status bar shows), or genuinely zero
+        resources of that type.
+        """
+        table = self.query_one(f"#{entry.table_id}", DataTable)
+        empty = self.query_one(f"#{EMPTY_STATE_IDS[tab_id]}", Static)
+        if items:
+            table.display = True
+            empty.display = False
+            return
+        table.display = False
+        empty.display = True
+        if query:
+            message = f"No {entry.label}s match {query!r}"
+        elif not self.docker.is_connected:
+            state = self.docker.connection
+            message = state.message
+            if state.hint:
+                message += f"\n{state.hint}"
+        else:
+            message = EMPTY_STATE_HINTS.get(tab_id, f"No {entry.label}s found")
+        empty.update(escape(message))
+
 
 class SnapshotManager(_Base):
     """Fetches Docker state in a background thread and commits it to the UI."""
@@ -394,10 +512,12 @@ class SnapshotManager(_Base):
             }
             self._marked[tab_id] &= live_keys
 
-        for entry in self._resource_registry.values():
+        for tab_id, entry in self._resource_registry.items():
             table = self.query_one(f"#{entry.table_id}", DataTable)
             table.clear(columns=False)
-            entry.populate(table)
+            items = self._sort_items(tab_id, entry, entry.snapshot_items(snapshot))
+            entry.populate(table, items)
+            self._update_empty_state(tab_id, entry, items)
 
         status_bar = self.query_one(f"#{STATUS_BAR_ID}", StatusBar)
         status_bar.update_stats(
@@ -476,10 +596,17 @@ class SnapshotManager(_Base):
         connected = state.status == ConnectionStatus.CONNECTED
         status_bar = self.query_one(f"#{STATUS_BAR_ID}", StatusBar)
         status_bar.set_connection_state(connected, "" if connected else state.message)
+        banner = self.query_one(f"#{CONNECTION_BANNER_ID}", Static)
         if connected:
+            banner.display = False
             if was_down:
                 self.notify("Reconnected to Docker")
         else:
+            banner_text = state.message
+            if state.hint:
+                banner_text += f"  —  {state.hint}"
+            banner.update(escape(banner_text))
+            banner.display = True
             self.notify(f"{state.message}\n{state.hint}", severity="error", timeout=12)
 
     def _finish_refresh(
