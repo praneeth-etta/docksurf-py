@@ -175,7 +175,7 @@ class CreateSdkClientContextTests(unittest.TestCase):
     """docker.from_env() ignores `docker context`; _create_sdk_client fixes that."""
 
     def test_docker_host_env_takes_precedence(self) -> None:
-        from docksurf_py import docker as dockmod
+        from docksurf_py.docker import context as dockmod
 
         with (
             patch.dict(os.environ, {"DOCKER_HOST": "tcp://1.2.3.4:2375"}),
@@ -185,7 +185,7 @@ class CreateSdkClientContextTests(unittest.TestCase):
         from_env.assert_called_once()
 
     def test_non_default_context_uses_its_endpoint(self) -> None:
-        from docksurf_py import docker as dockmod
+        from docksurf_py.docker import context as dockmod
 
         fake_ctx = MagicMock(Name="colima", Host="unix:///home/u/.colima/docker.sock")
         fake_ctx.TLSConfig = None
@@ -205,7 +205,7 @@ class CreateSdkClientContextTests(unittest.TestCase):
         from_env.assert_not_called()
 
     def test_default_context_falls_back_to_from_env(self) -> None:
-        from docksurf_py import docker as dockmod
+        from docksurf_py.docker import context as dockmod
 
         fake_ctx = MagicMock(Name="default", Host="unix:///var/run/docker.sock")
         with (
