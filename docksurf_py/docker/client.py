@@ -24,6 +24,7 @@ from docksurf_py.constants import LogOptions
 from docksurf_py.docker.context import (
     _DEFAULT_DOCKER_SOCK,
     _build_sdk_client_for_context,
+    _build_sdk_client_for_host,
     _clear_last_context,
     _create_sdk_client,
     _load_last_context,
@@ -59,19 +60,30 @@ class DockerClient:
     and handles all write/management commands directly.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        context_override: str | None = None,
+        host_override: str | None = None,
+    ) -> None:
         self._sdk: docker.DockerClient | None = None
         self._fetcher: DockerResourceFetcher | None = None
-        # Context picked via the in-app switcher (see `switch_context`),
-        # persisted across restarts, takes precedence over the ambient
-        # `docker context` on every (re)connect while set.
-        self._context_override: str | None = _load_last_context()
+        # `--host` (highest precedence, like DOCKER_HOST) bypasses context
+        # resolution entirely — see `_connect`.
+        self._host_override = host_override
+        # Context picked via `--context` (this run only, never persisted) or
+        # the in-app switcher (see `switch_context`, persisted across
+        # restarts) — takes precedence over the ambient `docker context` on
+        # every (re)connect while set. `_context_from_cli` distinguishes the
+        # two so a bad `--context` never clobbers a good persisted one (see
+        # `_connect`).
+        self._context_from_cli = context_override is not None
+        self._context_override: str | None = context_override or _load_last_context()
         self.connection: ConnectionState = ConnectionState(
             status=ConnectionStatus.NOT_CONNECTED,
             message="Not yet connected",
             hint="",
             context=self._context_override or _get_docker_context(),
-            host=_get_docker_host(),
+            host=host_override or _get_docker_host(),
         )
 
     def ensure_connected(self) -> ConnectionState:
@@ -88,34 +100,50 @@ class DockerClient:
         return self.connection
 
     def _connect(self) -> ConnectionState:
-        ctx = None
-        if self._context_override:
-            try:
-                from docker.context import ContextAPI
+        build: Callable[[], "docker.DockerClient"]
+        if self._host_override:
+            host_override = self._host_override
 
-                ctx = ContextAPI.get_context(self._context_override)
-            except Exception:
-                ctx = None
-            if ctx is None:
-                logger.warning(
-                    "Saved context %r no longer exists — using ambient default",
-                    self._context_override,
-                )
-                self._context_override = None
-                _clear_last_context()
+            def build() -> "docker.DockerClient":
+                return _build_sdk_client_for_host(host_override)
 
-        context = ctx.Name if ctx is not None else _get_docker_context()
-        host = (
-            (ctx.Host or _DEFAULT_DOCKER_SOCK)
-            if ctx is not None
-            else _get_docker_host()
-        )
-        try:
-            sdk = (
-                _build_sdk_client_for_context(ctx)
+            context = "(--host override)"
+            host = host_override
+        else:
+            ctx = None
+            if self._context_override:
+                try:
+                    from docker.context import ContextAPI
+
+                    ctx = ContextAPI.get_context(self._context_override)
+                except Exception:
+                    ctx = None
+                if ctx is None:
+                    logger.warning(
+                        "Context %r not found — using ambient default",
+                        self._context_override,
+                    )
+                    self._context_override = None
+                    # Only clear the persisted choice if it was the source —
+                    # a bad one-off `--context` flag shouldn't wipe out a
+                    # previously saved good context.
+                    if not self._context_from_cli:
+                        _clear_last_context()
+
+            context = ctx.Name if ctx is not None else _get_docker_context()
+            host = (
+                (ctx.Host or _DEFAULT_DOCKER_SOCK)
                 if ctx is not None
-                else _create_sdk_client()
+                else _get_docker_host()
             )
+            build = (
+                (lambda: _build_sdk_client_for_context(ctx))
+                if ctx is not None
+                else _create_sdk_client
+            )
+
+        try:
+            sdk = build()
             sdk.ping()  # real round-trip — surfaces connection errors at init time
             self._sdk = sdk
             self._fetcher = DockerResourceFetcher(sdk)

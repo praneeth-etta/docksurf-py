@@ -37,10 +37,11 @@ class PruneHandler(_Base):
             return
 
         confirm_message, method_name = _PRUNE_SPECS[target]
-        confirmed = await self.push_screen_wait(ConfirmDialog(confirm_message))
-        if not confirmed:
-            logger.debug("Prune cancelled by user")
-            return
+        if self.config.confirm_prune:
+            confirmed = await self.push_screen_wait(ConfirmDialog(confirm_message))
+            if not confirmed:
+                logger.debug("Prune cancelled by user")
+                return
 
         self.notify("Pruning…")
         self._execute_prune(method_name)

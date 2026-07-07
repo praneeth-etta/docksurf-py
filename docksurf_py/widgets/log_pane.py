@@ -92,7 +92,7 @@ class LogPane(Widget):
     class ToggleExpand(Message):
         """Posted when the user clicks the expand/collapse button."""
 
-    def __init__(self, **kwargs) -> None:
+    def __init__(self, default_options: LogOptions | None = None, **kwargs) -> None:
         super().__init__(**kwargs)
         self._container_id: str = ""
         self._container_name: str = ""
@@ -105,7 +105,7 @@ class LogPane(Widget):
         self._line_buffer: list[LogLine] = []
         self._filter: str = ""
         self._filter_timer: Timer | None = None
-        self._options = LogOptions()
+        self._options = default_options or LogOptions()
         self._show_timestamps = False
         self._wrap = False
         # When a filter is active every visible line is a match, so the k-th

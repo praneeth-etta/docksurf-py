@@ -28,6 +28,7 @@ from docksurf_py.models import (
     Volume,
 )
 from docksurf_py.renderer.common import _Base
+from docksurf_py.session import save_session
 
 if TYPE_CHECKING:
     from docksurf_py.app import ResourceEntry
@@ -156,9 +157,12 @@ class TableRenderer(_Base):
         self._volume_sizes: dict[str, int] = {}
         # Active column sort per tab: (column name, reverse) or None for the
         # unsorted (fetch/insertion order) default. Set by `_on_header_selected`.
-        self._sort_state: dict[TabID, tuple[str, bool] | None] = dict.fromkeys(
-            self._resource_registry
-        )
+        # Seeded from the restored session, if any — an unknown/stale column
+        # name is harmless: `_sort_items` no-ops when it can't find a match.
+        self._sort_state: dict[TabID, tuple[str, bool] | None] = {
+            tab_id: self._session.sort_state.get(tab_id.value)
+            for tab_id in self._resource_registry
+        }
 
         for tab_id, entry in self._resource_registry.items():
             table = self.query_one(f"#{entry.table_id}", DataTable)
@@ -208,6 +212,9 @@ class TableRenderer(_Base):
         current = self._sort_state.get(active)
         reverse = not current[1] if current and current[0] == col_name else False
         self._sort_state[active] = (col_name, reverse)
+        if self._persist_session:
+            self._session.sort_state[active.value] = (col_name, reverse)
+            save_session(self._session)
 
         table = event.data_table
         table.clear(columns=True)

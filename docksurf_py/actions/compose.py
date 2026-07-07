@@ -72,15 +72,16 @@ class ComposeActionHandler(_Base):
         if project is None:
             self.notify(_PROJECT_HINT, severity="warning")
             return
-        confirmed = await self.push_screen_wait(
-            ConfirmDialog(
-                f"Compose down '{escape(project.name)}'? This stops and removes "
-                f"all {project.total_count} container(s) in the project."
+        if self.config.confirm_compose_down:
+            confirmed = await self.push_screen_wait(
+                ConfirmDialog(
+                    f"Compose down '{escape(project.name)}'? This stops and removes "
+                    f"all {project.total_count} container(s) in the project."
+                )
             )
-        )
-        if not confirmed:
-            logger.debug("Compose down cancelled by user")
-            return
+            if not confirmed:
+                logger.debug("Compose down cancelled by user")
+                return
         self.notify(f"Bringing down project {escape(project.name)}…")
         self._execute_compose_action(project, "down")
 

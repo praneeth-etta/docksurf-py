@@ -75,12 +75,16 @@ def _fake_context(name: str, host: str, tls=False) -> SimpleNamespace:
     return SimpleNamespace(Name=name, Host=host, TLSConfig=tls)
 
 
-def _new_client() -> DockerClient:
+def _new_client(
+    context_override: str | None = None, host_override: str | None = None
+) -> DockerClient:
     """A `DockerClient()` that never picks up a real persisted context
     override from this machine's `~/.local/share/docksurf-py/state.json`,
     so these tests stay hermetic regardless of host state."""
     with patch("docksurf_py.docker.client._load_last_context", return_value=None):
-        return DockerClient()
+        return DockerClient(
+            context_override=context_override, host_override=host_override
+        )
 
 
 class MarkDisconnectedTests(unittest.TestCase):
@@ -237,6 +241,75 @@ class SwitchContextTests(unittest.TestCase):
         client = _new_client()
         with patch("docker.context.ContextAPI.contexts", side_effect=Exception("boom")):
             self.assertEqual(client.list_contexts(), [])
+
+
+class HostContextOverrideTests(unittest.TestCase):
+    """`--host`/`--context` CLI overrides, honored by `DockerClient.__init__`."""
+
+    def test_host_override_bypasses_context_resolution(self) -> None:
+        fake_sdk = _fake_sdk()
+        with patch(
+            "docksurf_py.docker.client._build_sdk_client_for_host",
+            return_value=fake_sdk,
+        ) as build_for_host:
+            client = _new_client(host_override="tcp://remote:2375")
+            client.fetch_snapshot()
+
+        build_for_host.assert_called_once_with("tcp://remote:2375")
+        self.assertTrue(client.is_connected)
+        self.assertEqual(client.connection.host, "tcp://remote:2375")
+        self.assertEqual(client.connection.context, "(--host override)")
+
+    def test_context_override_from_cli_takes_precedence_over_persisted(self) -> None:
+        ctx = _fake_context("remote", "ssh://example.com")
+        fake_sdk = _fake_sdk()
+        with (
+            patch("docker.context.ContextAPI.get_context", return_value=ctx),
+            patch(
+                "docksurf_py.docker.context.docker.DockerClient", return_value=fake_sdk
+            ),
+            patch(
+                "docksurf_py.docker.client._load_last_context",
+                return_value="some-other-persisted-context",
+            ),
+        ):
+            client = DockerClient(context_override="remote")
+            client.fetch_snapshot()
+
+        self.assertTrue(client.is_connected)
+        self.assertEqual(client.connection.context, "remote")
+
+    def test_bad_cli_context_does_not_clobber_persisted_context(self) -> None:
+        fake_sdk = _fake_sdk()
+        with (
+            patch("docker.context.ContextAPI.get_context", return_value=None),
+            patch("docksurf_py.docker.context.docker.from_env", return_value=fake_sdk),
+            patch(
+                "docksurf_py.docker.client._load_last_context",
+                return_value="good-persisted-context",
+            ),
+            patch("docksurf_py.docker.client._clear_last_context") as clear,
+        ):
+            client = DockerClient(context_override="nonexistent")
+            client.fetch_snapshot()
+
+        clear.assert_not_called()
+
+    def test_bad_persisted_context_is_cleared(self) -> None:
+        fake_sdk = _fake_sdk()
+        with (
+            patch("docker.context.ContextAPI.get_context", return_value=None),
+            patch("docksurf_py.docker.context.docker.from_env", return_value=fake_sdk),
+            patch(
+                "docksurf_py.docker.client._load_last_context",
+                return_value="stale-persisted-context",
+            ),
+            patch("docksurf_py.docker.client._clear_last_context") as clear,
+        ):
+            client = DockerClient()  # no CLI override — the override is persisted
+            client.fetch_snapshot()
+
+        clear.assert_called_once()
 
 
 class ManagementCommandResultTests(unittest.TestCase):

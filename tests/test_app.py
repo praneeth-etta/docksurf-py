@@ -29,6 +29,7 @@ from docksurf_py.app import (
     _container_only_actions,
     _tab_actions,
 )
+from docksurf_py.config import Config
 from docksurf_py.connection import ConnectionState, ConnectionStatus
 from docksurf_py.constants import (
     BTN_EXPAND_ID,
@@ -60,6 +61,7 @@ from docksurf_py.models import (
     SystemDf,
     Volume,
 )
+from docksurf_py.session import SessionState
 from docksurf_py.widgets import (
     ConfirmDialog,
     ContainerPickerScreen,
@@ -923,6 +925,132 @@ class PruneActionTests(unittest.IsolatedAsyncioTestCase):
 
                     await wait_until(lambda: (method_name,) in svc.calls)
                     self.assertIn((method_name,), svc.calls)
+
+
+class ConfirmToggleTests(unittest.IsolatedAsyncioTestCase):
+    """`Config`'s confirm_* toggles skip their `ConfirmDialog` when False."""
+
+    async def test_confirm_delete_false_skips_dialog(self) -> None:
+        snapshot = _standalone_snapshot(running=False)
+        svc = MockDockerService(lambda: snapshot)
+        app = DockSurfApp(docker=svc, config=Config(confirm_delete=False))
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await wait_until(lambda: bool(app._current.get(TabID.CONTAINERS)))
+            app.query_one(f"#{TableID.CONTAINERS}", DataTable).move_cursor(row=0)
+
+            app.action_delete()
+            await wait_until(lambda: ("remove_container", "web", False) in svc.calls)
+            self.assertFalse(
+                any(isinstance(s, ConfirmDialog) for s in app.screen_stack)
+            )
+
+    async def test_confirm_delete_false_skips_dialog_for_bulk_delete(self) -> None:
+        snapshot = _standalone_snapshot(running=False)
+        svc = MockDockerService(lambda: snapshot)
+        app = DockSurfApp(docker=svc, config=Config(confirm_delete=False))
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await wait_until(lambda: bool(app._current.get(TabID.CONTAINERS)))
+            table = app.query_one(f"#{TableID.CONTAINERS}", DataTable)
+            table.focus()
+            table.move_cursor(row=0)
+            await pilot.press("space")  # mark the row
+
+            app.action_delete()
+            await wait_until(lambda: ("remove_container", "web", False) in svc.calls)
+            self.assertFalse(
+                any(isinstance(s, ConfirmDialog) for s in app.screen_stack)
+            )
+
+    async def test_confirm_compose_down_false_skips_dialog(self) -> None:
+        svc = MockDockerService(_compose_snapshot)
+        app = DockSurfApp(docker=svc, config=Config(confirm_compose_down=False))
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await wait_until(lambda: bool(app._current.get(TabID.CONTAINERS)))
+            table = app.query_one(f"#{TableID.CONTAINERS}", DataTable)
+            table.focus()
+            table.move_cursor(row=0)
+            await pilot.press("ctrl+k")
+            await wait_until(lambda: ("compose_action", "myapp", "down") in svc.calls)
+            self.assertFalse(
+                any(isinstance(s, ConfirmDialog) for s in app.screen_stack)
+            )
+
+    async def test_confirm_prune_false_skips_dialog(self) -> None:
+        svc = MockDockerService(lambda: EMPTY_SNAPSHOT)
+        app = DockSurfApp(docker=svc, config=Config(confirm_prune=False))
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.action_prune()
+            await wait_until(
+                lambda: any(isinstance(s, PruneScreen) for s in app.screen_stack)
+            )
+            app.screen_stack[-1].dismiss("containers")
+            await wait_until(lambda: ("prune_containers",) in svc.calls)
+            self.assertFalse(
+                any(isinstance(s, ConfirmDialog) for s in app.screen_stack)
+            )
+
+
+class SessionRestoreTests(unittest.IsolatedAsyncioTestCase):
+    """`DockSurfApp` restores active tab / sort order from an injected
+    `SessionState` — never touching the real filesystem (see `session.py`'s
+    module docstring on why persistence is constructor-injected)."""
+
+    async def test_restores_active_tab(self) -> None:
+        svc = MockDockerService(lambda: EMPTY_SNAPSHOT)
+        app = DockSurfApp(
+            docker=svc, session=SessionState(active_tab=TabID.IMAGES.value)
+        )
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            self.assertEqual(app.query_one(TabbedContent).active, TabID.IMAGES)
+
+    async def test_invalid_active_tab_falls_back_to_default(self) -> None:
+        svc = MockDockerService(lambda: EMPTY_SNAPSHOT)
+        app = DockSurfApp(docker=svc, session=SessionState(active_tab="not-a-tab"))
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            self.assertEqual(app.query_one(TabbedContent).active, TabID.CONTAINERS)
+
+    async def test_restores_sort_state_and_renders_column_arrow(self) -> None:
+        snapshot = _standalone_snapshot(running=False)
+        svc = MockDockerService(lambda: snapshot)
+        app = DockSurfApp(
+            docker=svc,
+            session=SessionState(sort_state={TabID.CONTAINERS.value: ("Name", True)}),
+        )
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            self.assertEqual(app._sort_state[TabID.CONTAINERS], ("Name", True))
+            table = app.query_one(f"#{TableID.CONTAINERS}", DataTable)
+            labels = [str(col.label) for col in table.columns.values()]
+            self.assertTrue(any("Name" in label and "▼" in label for label in labels))
+
+    async def test_default_construction_does_not_persist(self) -> None:
+        """Without `persist_session=True` (the default), switching tabs never
+        touches disk — guards the test-hermeticity fix from the plan."""
+        svc = MockDockerService(lambda: EMPTY_SNAPSHOT)
+        app = DockSurfApp(docker=svc)
+        with patch("docksurf_py.app.save_session") as save:
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                app.query_one(TabbedContent).active = TabID.IMAGES
+                await pilot.pause()
+        save.assert_not_called()
+
+    async def test_persist_session_true_saves_on_tab_switch(self) -> None:
+        svc = MockDockerService(lambda: EMPTY_SNAPSHOT)
+        app = DockSurfApp(docker=svc, persist_session=True)
+        with patch("docksurf_py.app.save_session") as save:
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                app.query_one(TabbedContent).active = TabID.IMAGES
+                await pilot.pause()
+        save.assert_called()
+        self.assertEqual(app._session.active_tab, TabID.IMAGES)
 
 
 class ExecCustomActionTests(unittest.IsolatedAsyncioTestCase):

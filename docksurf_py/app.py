@@ -5,9 +5,11 @@ Assembles the seven mixin classes into DockSurfApp, defines layout and
 key bindings, and wires the on_mount / action_refresh entry points.
 """
 
+import argparse
 import logging
 import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable, Iterable, Protocol
 
 from textual import on
@@ -40,6 +42,7 @@ from docksurf_py.actions import (
     SelectionHandler,
     VolumeActionHandler,
 )
+from docksurf_py.config import Config, load_config
 from docksurf_py.constants import (
     CONNECTION_BANNER_ID,
     DETAIL_PANE_ID,
@@ -49,6 +52,7 @@ from docksurf_py.constants import (
     REFRESH_LOADING_ID,
     SEARCH_BAR_ID,
     STATUS_BAR_ID,
+    LogOptions,
     TabID,
     TableID,
 )
@@ -68,6 +72,7 @@ from docksurf_py.search import (
     _matches_volume,
 )
 from docksurf_py.service import DockerService
+from docksurf_py.session import SessionState, load_session, save_session
 from docksurf_py.widgets import (
     ContainerTable,
     DetailPane,
@@ -156,6 +161,9 @@ class AppContext(Protocol):
 
     snapshot: DockerSnapshot | None
     docker: DockerService
+    config: Config
+    _session: SessionState
+    _persist_session: bool
     _current: dict[TabID, list]
     _resource_registry: dict[TabID, ResourceEntry]
     _collapsed_projects: set[str]
@@ -230,6 +238,7 @@ class DockSurfApp(
     snapshot: DockerSnapshot | None = None
 
     docker: DockerService
+    config: Config
 
     _resource_registry: dict[TabID, ResourceEntry]
 
@@ -289,9 +298,19 @@ class DockSurfApp(
     ]
     CSS_PATH = "app.tcss"
 
-    def __init__(self, docker: DockerService, **kwargs) -> None:
+    def __init__(
+        self,
+        docker: DockerService,
+        config: Config | None = None,
+        session: SessionState | None = None,
+        persist_session: bool = False,
+        **kwargs,
+    ) -> None:
         super().__init__(**kwargs)
         self._injected_docker = docker
+        self.config = config or Config()
+        self._session = session or SessionState()
+        self._persist_session = persist_session
         self._resource_registry = {
             TabID.CONTAINERS: ResourceEntry(
                 table_id=TableID.CONTAINERS,
@@ -382,7 +401,13 @@ class DockSurfApp(
                         "", id=EMPTY_STATE_IDS[TabID.NETWORKS], classes="empty-state"
                     )
             yield DetailPane(id=DETAIL_PANE_ID)
-            yield LogPane(id=LOG_PANE_ID)
+            yield LogPane(
+                id=LOG_PANE_ID,
+                default_options=LogOptions(
+                    tail=self.config.default_log_tail,
+                    since_seconds=self.config.default_log_since_seconds,
+                ),
+            )
         yield LoadingIndicator(id=REFRESH_LOADING_ID)
         yield SearchBar(placeholder="🔍 Filter...", id=SEARCH_BAR_ID)
         yield StatusBar(id=STATUS_BAR_ID)
@@ -390,6 +415,11 @@ class DockSurfApp(
 
     def on_mount(self) -> None:
         self.docker = self._injected_docker
+        if self._session.active_tab:
+            try:
+                self.query_one(TabbedContent).active = TabID(self._session.active_tab)
+            except ValueError:
+                pass
         # DockerClient connects lazily on the first fetch_snapshot() call
         # (inside start_refresh()'s background worker), not here — so the
         # UI never blocks on the daemon round-trip before its first paint.
@@ -480,6 +510,9 @@ class DockSurfApp(
     @on(TabbedContent.TabActivated)
     def clear_on_tab_switch(self) -> None:
         self._auto_select_first()
+        if self._persist_session:
+            self._session.active_tab = self.query_one(TabbedContent).active
+            save_session(self._session)
 
     @on(DataTable.HeaderSelected)
     def _on_data_table_header_selected(self, event: DataTable.HeaderSelected) -> None:
@@ -560,8 +593,28 @@ class DockSurfApp(
         )
 
 
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="docksurf", description="Terminal UI for Docker resources"
+    )
+    parser.add_argument(
+        "--host", help="Docker daemon endpoint to connect to (e.g. tcp://host:2375)"
+    )
+    parser.add_argument(
+        "--context", help="Docker context to connect through (this run only)"
+    )
+    parser.add_argument(
+        "--config",
+        type=Path,
+        help="Path to config.toml (default: ~/.config/docksurf/config.toml)",
+    )
+    return parser.parse_args(argv)
+
+
 def main():
     from docksurf_py.docker import DockerClient
+
+    args = _parse_args()
 
     log_dir = os.path.expanduser("~/.local/share/docksurf-py")
     os.makedirs(log_dir, exist_ok=True)
@@ -573,7 +626,12 @@ def main():
         handlers=[logging.FileHandler(log_file)],
     )
     logger.info("DockSurf starting — log file: %s", log_file)
-    DockSurfApp(docker=DockerClient()).run()
+    DockSurfApp(
+        docker=DockerClient(context_override=args.context, host_override=args.host),
+        config=load_config(args.config),
+        session=load_session(),
+        persist_session=True,
+    ).run()
     logger.info("DockSurf exiting")
 
 

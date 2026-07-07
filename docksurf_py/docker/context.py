@@ -53,6 +53,20 @@ def _build_sdk_client_for_context(ctx) -> "docker.DockerClient":
     return docker.DockerClient(**kwargs)
 
 
+def _build_sdk_client_for_host(host: str) -> "docker.DockerClient":
+    """Build an SDK client for an explicit `--host` override.
+
+    Mirrors `_build_sdk_client_for_context` but there's no context entry to
+    pull TLS config from — a raw host string carries none.
+    """
+    if not host or host == _DEFAULT_DOCKER_SOCK:
+        return docker.from_env()
+    kwargs: dict = {"base_url": host}
+    if host.startswith("ssh://"):
+        kwargs["use_ssh_client"] = True
+    return docker.DockerClient(**kwargs)
+
+
 def _create_sdk_client() -> "docker.DockerClient":
     """Create the SDK client, honoring the active `docker context`.
 

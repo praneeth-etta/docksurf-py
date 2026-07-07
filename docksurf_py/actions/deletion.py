@@ -176,7 +176,10 @@ class ResourceDeletionHandler(_Base):
         if plan is None:
             return
 
-        if plan.force_default is None:
+        if not self.config.confirm_delete:
+            confirmed = True
+            force = plan.force_default if plan.force_default is not None else False
+        elif plan.force_default is None:
             confirmed = await self.push_screen_wait(ConfirmDialog(plan.confirm_message))
             force = False
         else:
@@ -214,13 +217,14 @@ class ResourceDeletionHandler(_Base):
             self._rerender_active_table()
             return
 
-        preview = ", ".join(escape(n) for n in names[:8])
-        if len(names) > 8:
-            preview += f", and {len(names) - 8} more"
-        confirmed = await self.push_screen_wait(
-            ConfirmDialog(f"Delete {len(names)} {entry.label}(s)? {preview}")
-        )
-        if not confirmed:
-            logger.debug("Bulk delete cancelled by user")
-            return
+        if self.config.confirm_delete:
+            preview = ", ".join(escape(n) for n in names[:8])
+            if len(names) > 8:
+                preview += f", and {len(names) - 8} more"
+            confirmed = await self.push_screen_wait(
+                ConfirmDialog(f"Delete {len(names)} {entry.label}(s)? {preview}")
+            )
+            if not confirmed:
+                logger.debug("Bulk delete cancelled by user")
+                return
         self._run_bulk(tab_id, "Deleted", jobs)
