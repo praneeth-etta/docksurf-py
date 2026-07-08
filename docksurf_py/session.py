@@ -12,13 +12,13 @@ flag) — this module only knows how to read/write the file.
 import json
 import logging
 from dataclasses import dataclass, field
-from pathlib import Path
 
 from docksurf_py.constants import TabID
+from docksurf_py.paths import DATA_DIR
 
 logger = logging.getLogger(__name__)
 
-_SESSION_FILE = Path.home() / ".local/share/docksurf-py/session.json"
+_SESSION_FILE = DATA_DIR / "session.json"
 
 
 @dataclass(slots=True)

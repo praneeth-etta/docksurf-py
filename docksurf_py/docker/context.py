@@ -8,15 +8,24 @@ the Docker CLI and other terminals.
 import json
 import logging
 import os
-from pathlib import Path
+import sys
 
 import docker
 
+from docksurf_py.paths import DATA_DIR
+
 logger = logging.getLogger(__name__)
 
-_DEFAULT_DOCKER_SOCK = "unix:///var/run/docker.sock"
+# Docker SDK's default host when no DOCKER_HOST is configured.
+# Used only to detect whether a context is using the default connection,
+# so we can use `docker.from_env()` instead of constructing a client.
+_DEFAULT_DOCKER_SOCK = (
+    "npipe:////./pipe/docker_engine"
+    if sys.platform == "win32"
+    else "unix:///var/run/docker.sock"
+)
 
-_STATE_FILE = Path.home() / ".local/share/docksurf-py/state.json"
+_STATE_FILE = DATA_DIR / "state.json"
 
 # Docker SDK timeout. Prevents a hung daemon from blocking snapshot refreshes
 # for docker-py's 60s default timeout. 30s is long enough for slower remote

@@ -1,7 +1,6 @@
-"""config.py — user-editable settings loaded from ~/.config/docksurf/config.toml.
-
-Leaf module (stdlib only, like models.py): nothing here imports from another
-project module, so anything can depend on this without a layering cycle.
+"""config.py — user-editable settings loaded from the OS config directory
+(e.g. ~/.config/docksurf/config.toml on Linux — see paths.py for the other
+platforms).
 """
 
 import logging
@@ -9,9 +8,11 @@ import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 
+from docksurf_py.paths import CONFIG_DIR
+
 logger = logging.getLogger(__name__)
 
-DEFAULT_CONFIG_PATH = Path.home() / ".config/docksurf/config.toml"
+DEFAULT_CONFIG_PATH = CONFIG_DIR / "config.toml"
 
 _DEFAULT_TEMPLATE = """\
 # DockSurf configuration.

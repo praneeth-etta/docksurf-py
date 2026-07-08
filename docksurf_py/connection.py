@@ -1,6 +1,17 @@
 import os
+import platform
+import sys
 from dataclasses import dataclass
 from enum import Enum
+
+# Docker SDK's default host. Duplicated instead of imported to preserve the
+# module dependency direction. Used only as a fallback display value if
+# context lookup fails.
+_DEFAULT_DOCKER_SOCK = (
+    "npipe:////./pipe/docker_engine"
+    if sys.platform == "win32"
+    else "unix:///var/run/docker.sock"
+)
 
 
 class ConnectionStatus(Enum):
@@ -46,7 +57,51 @@ def _get_docker_host() -> str:
             return ctx.Host
     except Exception:
         pass
-    return "unix:///var/run/docker.sock"
+    return _DEFAULT_DOCKER_SOCK
+
+
+def _is_wsl() -> bool:
+    try:
+        return "microsoft" in platform.uname().release.lower()
+    except OSError:
+        return False
+
+
+def _permission_denied_hint() -> str:
+    """Docker Desktop (Windows/macOS/WSL) has no user/group model for socket
+    access — the fixes below are all Linux-daemon-specific and don't apply
+    there."""
+    if sys.platform == "win32":
+        return (
+            "Add your Windows user to the 'docker-users' group, then sign "
+            "out and back in"
+        )
+    if sys.platform == "darwin":
+        return "Make sure Docker Desktop is fully started, then try again"
+    if _is_wsl():
+        return (
+            "Enable WSL integration for this distro: Docker Desktop → "
+            "Settings → Resources → WSL Integration"
+        )
+    return "Run: sudo usermod -aG docker $USER  (then log out and back in)"
+
+
+def _daemon_unavailable_hint() -> str:
+    """`systemctl`/`journalctl` only make sense against a systemd-managed
+    dockerd — Docker Desktop (Windows/macOS/WSL) manages the daemon itself."""
+    if sys.platform == "win32":
+        return "Start Docker Desktop"
+    if sys.platform == "darwin":
+        return "Start Docker Desktop"
+    if _is_wsl():
+        return "Start Docker Desktop on Windows (with WSL integration enabled)"
+    return "Start Docker Desktop, or run: sudo systemctl start docker"
+
+
+def _api_error_hint() -> str:
+    if sys.platform in ("win32", "darwin") or _is_wsl():
+        return "Check Docker Desktop's logs, or run: docker info"
+    return "Check daemon logs: journalctl -u docker  or  docker info"
 
 
 def _classify_docker_error(exc: Exception) -> ConnectionState:
@@ -58,7 +113,7 @@ def _classify_docker_error(exc: Exception) -> ConnectionState:
         return ConnectionState(
             status=ConnectionStatus.PERMISSION_DENIED,
             message="Permission denied — cannot access Docker socket",
-            hint="Run: sudo usermod -aG docker $USER  (then log out and back in)",
+            hint=_permission_denied_hint(),
             context=context,
             host=host,
         )
@@ -67,14 +122,14 @@ def _classify_docker_error(exc: Exception) -> ConnectionState:
         return ConnectionState(
             status=ConnectionStatus.DAEMON_UNAVAILABLE,
             message="Docker daemon is not running",
-            hint="Start Docker Desktop, or run: sudo systemctl start docker",
+            hint=_daemon_unavailable_hint(),
             context=context,
             host=host,
         )
     return ConnectionState(
         status=ConnectionStatus.API_ERROR,
         message=f"Docker API error: {exc}",
-        hint="Check daemon logs: journalctl -u docker  or  docker info",
+        hint=_api_error_hint(),
         context=context,
         host=host,
     )

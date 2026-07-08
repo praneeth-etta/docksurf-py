@@ -19,6 +19,7 @@ from textual.widgets import DataTable, TabbedContent
 from docksurf_py.actions.common import _PROJECT_HINT, _Base
 from docksurf_py.constants import DETAIL_PANE_ID, LOG_PANE_ID, LogOptions, TabID
 from docksurf_py.models import CommandErrorKind, CommandResult, Container, PortBinding
+from docksurf_py.paths import DATA_DIR
 from docksurf_py.widgets import (
     ContainerPickerScreen,
     DetailPane,
@@ -34,8 +35,8 @@ EXEC_SHELL_CANDIDATES = ("bash", "sh")
 
 
 def _write_log_export(name: str, text: str) -> Path:
-    """Write a log buffer to ~/.local/share/docksurf-py/exports and return the path."""
-    export_dir = Path.home() / ".local/share/docksurf-py/exports"
+    """Write a log buffer to the exports subdir of DATA_DIR and return the path."""
+    export_dir = DATA_DIR / "exports"
     export_dir.mkdir(parents=True, exist_ok=True)
     safe = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("_") or "logs"
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")

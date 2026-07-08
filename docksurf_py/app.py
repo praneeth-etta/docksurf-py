@@ -7,7 +7,6 @@ key bindings, and wires the on_mount / action_refresh entry points.
 
 import argparse
 import logging
-import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable, Protocol
@@ -42,7 +41,7 @@ from docksurf_py.actions import (
     SelectionHandler,
     VolumeActionHandler,
 )
-from docksurf_py.config import Config, load_config
+from docksurf_py.config import DEFAULT_CONFIG_PATH, Config, load_config
 from docksurf_py.constants import (
     CONNECTION_BANNER_ID,
     DETAIL_PANE_ID,
@@ -58,6 +57,7 @@ from docksurf_py.constants import (
 )
 from docksurf_py.models import CommandResult, Container, DockerSnapshot
 from docksurf_py.observability import LiveStatsController
+from docksurf_py.paths import DATA_DIR
 from docksurf_py.renderer import (
     DetailPaneRenderer,
     ResourceFocusResolver,
@@ -614,7 +614,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--config",
         type=Path,
-        help="Path to config.toml (default: ~/.config/docksurf/config.toml)",
+        help=f"Path to config.toml (default: {DEFAULT_CONFIG_PATH})",
     )
     return parser.parse_args(argv)
 
@@ -624,9 +624,8 @@ def main():
 
     args = _parse_args()
 
-    log_dir = os.path.expanduser("~/.local/share/docksurf-py")
-    os.makedirs(log_dir, exist_ok=True)
-    log_file = os.path.join(log_dir, "docksurf.log")
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    log_file = DATA_DIR / "docksurf.log"
 
     logging.basicConfig(
         level=logging.INFO,
