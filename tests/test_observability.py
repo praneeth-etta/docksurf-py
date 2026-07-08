@@ -210,7 +210,7 @@ class CreateSdkClientContextTests(unittest.TestCase):
     def test_default_context_falls_back_to_from_env(self) -> None:
         from docksurf_py.docker import context as dockmod
 
-        fake_ctx = MagicMock(Name="default", Host="unix:///var/run/docker.sock")
+        fake_ctx = MagicMock(Name="default", Host=dockmod._DEFAULT_DOCKER_SOCK)
         with (
             patch.dict(os.environ, {}, clear=True),
             patch(

@@ -25,6 +25,7 @@ _SESSION_FILE = DATA_DIR / "session.json"
 class SessionState:
     active_tab: str | None = None
     sort_state: dict[str, tuple[str, bool]] = field(default_factory=dict)
+    theme: str | None = None
 
 
 def _valid_tab(value: object) -> str | None:
@@ -66,14 +67,24 @@ def load_session() -> SessionState:
             if valid_entry is not None:
                 sort_state[tab_value] = valid_entry
 
-    return SessionState(active_tab=active_tab, sort_state=sort_state)
+    theme = data.get("theme")
+    if not isinstance(theme, str):
+        theme = None
+
+    return SessionState(active_tab=active_tab, sort_state=sort_state, theme=theme)
 
 
 def save_session(state: SessionState) -> None:
     try:
         _SESSION_FILE.parent.mkdir(parents=True, exist_ok=True)
         _SESSION_FILE.write_text(
-            json.dumps({"active_tab": state.active_tab, "sort_state": state.sort_state})
+            json.dumps(
+                {
+                    "active_tab": state.active_tab,
+                    "sort_state": state.sort_state,
+                    "theme": state.theme,
+                }
+            )
         )
     except OSError as e:
         logger.warning("Could not persist session state: %s", e)

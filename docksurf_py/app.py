@@ -73,6 +73,7 @@ from docksurf_py.search import (
 )
 from docksurf_py.service import DockerService
 from docksurf_py.session import SessionState, load_session, save_session
+from docksurf_py.themes import CUSTOM_THEMES, DEFAULT_THEME_NAME
 from docksurf_py.widgets import (
     ContainerTable,
     DetailPane,
@@ -299,6 +300,7 @@ class DockSurfApp(
         Binding("b", "volume_size", "Volume size on disk", show=False),
         Binding("v", "network_connect", "Connect to network", show=False),
         Binding("m", "network_disconnect", "Disconnect from network", show=False),
+        Binding("M", "cycle_theme", "Theme", show=True),
     ]
     CSS_PATH = "app.tcss"
 
@@ -419,6 +421,13 @@ class DockSurfApp(
 
     def on_mount(self) -> None:
         self.docker = self._injected_docker
+        for theme in CUSTOM_THEMES:
+            self.register_theme(theme)
+        self.theme = (
+            self._session.theme
+            if self._session.theme in self.available_themes
+            else DEFAULT_THEME_NAME
+        )
         if self._session.active_tab:
             try:
                 self.query_one(TabbedContent).active = TabID(self._session.active_tab)
@@ -554,6 +563,17 @@ class DockSurfApp(
             self.action_create_network()
         else:
             self.notify("Nothing to create on this tab", severity="information")
+
+    def action_cycle_theme(self) -> None:
+        """`M`: cycle through just the 3 curated DockSurf themes."""
+        names = [t.name for t in CUSTOM_THEMES]
+        idx = names.index(self.theme) if self.theme in names else -1
+        next_name = names[(idx + 1) % len(names)]
+        self.theme = next_name
+        self._session.theme = next_name
+        if self._persist_session:
+            save_session(self._session)
+        self.notify(f"Theme: {next_name}")
 
     def get_system_commands(self, screen: Screen) -> Iterable[SystemCommand]:
         """Surface every bound action in the command palette (`ctrl+p`).

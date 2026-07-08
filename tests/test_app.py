@@ -1061,16 +1061,50 @@ class SessionRestoreTests(unittest.IsolatedAsyncioTestCase):
         save.assert_called()
         self.assertEqual(app._session.active_tab, TabID.IMAGES)
 
+    async def test_restores_theme(self) -> None:
+        svc = MockDockerService(lambda: EMPTY_SNAPSHOT)
+        app = DockSurfApp(docker=svc, session=SessionState(theme="docksurf-nightcity"))
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            self.assertEqual(app.theme, "docksurf-nightcity")
+
+    async def test_invalid_theme_falls_back_to_default(self) -> None:
+        svc = MockDockerService(lambda: EMPTY_SNAPSHOT)
+        app = DockSurfApp(docker=svc, session=SessionState(theme="not-a-theme"))
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            self.assertEqual(app.theme, "docksurf-ocean")
+
+    async def test_cycle_theme_key_cycles_and_persists(self) -> None:
+        svc = MockDockerService(lambda: EMPTY_SNAPSHOT)
+        app = DockSurfApp(docker=svc, persist_session=True)
+        with patch("docksurf_py.app.save_session") as save:
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                # Key-press tests need explicit focus on the container table —
+                # see TabNavigationTests/LogViewerTests._open_logs.
+                app.query_one(f"#{TableID.CONTAINERS}", DataTable).focus()
+                self.assertEqual(app.theme, "docksurf-ocean")
+                await pilot.press("M")
+                await pilot.pause()
+                self.assertEqual(app.theme, "docksurf-nightcity")
+                self.assertEqual(app._session.theme, "docksurf-nightcity")
+        save.assert_called()
+
 
 class ExecCustomActionTests(unittest.IsolatedAsyncioTestCase):
     """Exercises the guard/prompt/cancel paths of `E` without ever reaching
     the real `subprocess.run`/`self.suspend()` interactive-exec tail — the
     shell-detection probe (`_container_has_shell`) is patched out since it
-    shells out to `docker exec ... which <shell>` for real."""
+    shells out to `docker exec ... which <shell>` for real. `shutil.which`
+    is also patched out: `_exec_preflight`'s real PATH check would otherwise
+    make these tests depend on the `docker` CLI being installed on the
+    machine running them, which isn't true on the macOS/Windows CI runners."""
 
     _HAS_SHELL_PATCH_TARGET = (
         "docksurf_py.actions.ContainerActionHandler._container_has_shell"
     )
+    _WHICH_PATCH_TARGET = "docksurf_py.actions.container.shutil.which"
 
     async def _select_first_row(self, app: DockSurfApp) -> None:
         await wait_until(lambda: bool(app._current.get(TabID.CONTAINERS)))
@@ -1084,7 +1118,10 @@ class ExecCustomActionTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             await self._select_first_row(app)
 
-            with patch(self._HAS_SHELL_PATCH_TARGET, return_value=True):
+            with (
+                patch(self._HAS_SHELL_PATCH_TARGET, return_value=True),
+                patch(self._WHICH_PATCH_TARGET, return_value="/usr/bin/docker"),
+            ):
                 app.action_exec_custom()
                 await wait_until(
                     lambda: any(isinstance(s, PromptScreen) for s in app.screen_stack)
@@ -1102,7 +1139,10 @@ class ExecCustomActionTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             await self._select_first_row(app)
 
-            with patch(self._HAS_SHELL_PATCH_TARGET, return_value=False):
+            with (
+                patch(self._HAS_SHELL_PATCH_TARGET, return_value=False),
+                patch(self._WHICH_PATCH_TARGET, return_value="/usr/bin/docker"),
+            ):
                 app.action_exec_custom()
                 await wait_until(
                     lambda: any(isinstance(s, PromptScreen) for s in app.screen_stack)
@@ -1129,7 +1169,10 @@ class ExecCustomActionTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             await self._select_first_row(app)
 
-            with patch(self._HAS_SHELL_PATCH_TARGET, return_value=True):
+            with (
+                patch(self._HAS_SHELL_PATCH_TARGET, return_value=True),
+                patch(self._WHICH_PATCH_TARGET, return_value="/usr/bin/docker"),
+            ):
                 app.action_exec_custom()
                 await wait_until(
                     lambda: any(isinstance(s, PromptScreen) for s in app.screen_stack)
@@ -1147,7 +1190,10 @@ class ExecCustomActionTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             await self._select_first_row(app)
 
-            with patch(self._HAS_SHELL_PATCH_TARGET, return_value=True):
+            with (
+                patch(self._HAS_SHELL_PATCH_TARGET, return_value=True),
+                patch(self._WHICH_PATCH_TARGET, return_value="/usr/bin/docker"),
+            ):
                 app.action_exec_custom()
                 await wait_until(
                     lambda: any(isinstance(s, PromptScreen) for s in app.screen_stack)

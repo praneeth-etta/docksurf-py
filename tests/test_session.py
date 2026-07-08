@@ -39,6 +39,7 @@ class SessionPersistenceTests(unittest.TestCase):
                     {
                         "active_tab": "tab-images",
                         "sort_state": {"tab-containers": ["Name", False]},
+                        "theme": None,
                     },
                 )
 
@@ -66,6 +67,32 @@ class SessionPersistenceTests(unittest.TestCase):
             with patch("docksurf_py.session._SESSION_FILE", session_file):
                 loaded = load_session()
                 self.assertEqual(loaded.sort_state, {"tab-containers": ("Name", False)})
+
+    def test_round_trips_theme(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            session_file = Path(tmp) / "session.json"
+            with patch("docksurf_py.session._SESSION_FILE", session_file):
+                save_session(SessionState(theme="docksurf-nightcity"))
+
+                loaded = load_session()
+                self.assertEqual(loaded.theme, "docksurf-nightcity")
+                self.assertEqual(
+                    json.loads(session_file.read_text())["theme"], "docksurf-nightcity"
+                )
+
+    def test_missing_theme_key_defaults_to_none(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            session_file = Path(tmp) / "session.json"
+            session_file.write_text(json.dumps({"active_tab": "tab-images"}))
+            with patch("docksurf_py.session._SESSION_FILE", session_file):
+                self.assertIsNone(load_session().theme)
+
+    def test_non_string_theme_is_dropped(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            session_file = Path(tmp) / "session.json"
+            session_file.write_text(json.dumps({"theme": 42}))
+            with patch("docksurf_py.session._SESSION_FILE", session_file):
+                self.assertIsNone(load_session().theme)
 
     def test_save_tolerates_unwritable_directory(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

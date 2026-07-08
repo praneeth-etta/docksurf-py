@@ -369,7 +369,7 @@ class SdkClientTimeoutTests(unittest.TestCase):
             patch("docker.context.ContextAPI.get_current_context", return_value=None),
         ):
             context._build_sdk_client_for_context(
-                _fake_context("default", "unix:///var/run/docker.sock")
+                _fake_context("default", context._DEFAULT_DOCKER_SOCK)
             )
             context._build_sdk_client_for_host("")
             context._create_sdk_client()
