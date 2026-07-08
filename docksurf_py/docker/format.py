@@ -1,8 +1,17 @@
 """Display-string formatting for Docker resource fields."""
 
+import re
 from datetime import datetime, timezone
 
 from docksurf_py.models import DiskUsageEntry, PortBinding, SystemDf
+
+# Matches an env var key that looks like it holds a secret. Deliberately a
+# broad substring match. A false positive (e.g. KEYVAULT ,KEYBOARD_LAYOUT)
+# just masks an harmless value, while a false negative would
+# leak a real secret onto a screen that gets shared.
+_SECRET_KEY_RE = re.compile(
+    r"(PASSWORD|SECRET|TOKEN|KEY|PASS|CREDENTIAL)", re.IGNORECASE
+)
 
 _AGE_UNITS = (
     (60, 1, "s"),
@@ -98,6 +107,24 @@ def format_ports(ports: list[PortBinding]) -> str:
 
 def format_labels(labels: dict[str, str]) -> str:
     return ", ".join(f"{k}={v}" for k, v in labels.items())
+
+
+def format_env(env: list[str], reveal: bool = False) -> str:
+    """Render `KEY=VALUE` env entries, one per line.
+
+    Masks the value of any entry whose key matches `_SECRET_KEY_RE` unless
+    `reveal` is set, env vars are shown in plaintext in the detail pane
+    """
+    if reveal:
+        return "\n".join(env)
+    lines = []
+    for entry in env:
+        key, sep, _value = entry.partition("=")
+        if sep and _SECRET_KEY_RE.search(key):
+            lines.append(f"{key}=••••••••")
+        else:
+            lines.append(entry)
+    return "\n".join(lines)
 
 
 def _parse_system_df(raw: dict) -> SystemDf:

@@ -155,6 +155,13 @@ class TableRenderer(_Base):
         # On-demand per-volume disk sizes (populated by the `b` size action),
         # keyed by volume name; read by `_show_volume_details`.
         self._volume_sizes: dict[str, int] = {}
+        # On-demand per-image Architecture, keyed by image id;
+        # lazily fetched on row-select by ImageActionHandler and read by
+        # `_show_image_details`.
+        self._image_architectures: dict[str, str] = {}
+        # Whether the detail pane shows real env-var values or masks anything
+        # that looks like a secret — toggled by `R` (action_toggle_secrets).
+        self._reveal_secrets: bool = False
         # Active column sort per tab: (column name, reverse) or None for the
         # unsorted (fetch/insertion order) default. Set by `_on_header_selected`.
         # Seeded from the restored session, if any — an unknown/stale column
@@ -221,6 +228,7 @@ class TableRenderer(_Base):
         self._add_table_columns(table, active, entry)
         self._rerender_active_table()
 
+    # TODO: Refactor to reduce complexity.
     def _populate_container_table(
         self, table: DataTable, items: list[Container] | None = None
     ) -> None:

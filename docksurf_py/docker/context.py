@@ -18,6 +18,11 @@ _DEFAULT_DOCKER_SOCK = "unix:///var/run/docker.sock"
 
 _STATE_FILE = Path.home() / ".local/share/docksurf-py/state.json"
 
+# Docker SDK timeout. Prevents a hung daemon from blocking snapshot refreshes
+# for docker-py's 60s default timeout. 30s is long enough for slower remote
+# and SSH contexts while still allowing refreshes to recover promptly.
+_SDK_TIMEOUT_SECONDS = 30
+
 
 def _load_last_context() -> str | None:
     try:
@@ -46,8 +51,12 @@ def _clear_last_context() -> None:
 def _build_sdk_client_for_context(ctx) -> "docker.DockerClient":
     """Build an SDK client scoped to one `docker context` entry."""
     if not ctx.Host or ctx.Host == _DEFAULT_DOCKER_SOCK:
-        return docker.from_env()
-    kwargs: dict = {"base_url": ctx.Host, "tls": ctx.TLSConfig or False}
+        return docker.from_env(timeout=_SDK_TIMEOUT_SECONDS)
+    kwargs: dict = {
+        "base_url": ctx.Host,
+        "tls": ctx.TLSConfig or False,
+        "timeout": _SDK_TIMEOUT_SECONDS,
+    }
     if ctx.Host.startswith("ssh://"):
         kwargs["use_ssh_client"] = True
     return docker.DockerClient(**kwargs)
@@ -60,8 +69,8 @@ def _build_sdk_client_for_host(host: str) -> "docker.DockerClient":
     pull TLS config from — a raw host string carries none.
     """
     if not host or host == _DEFAULT_DOCKER_SOCK:
-        return docker.from_env()
-    kwargs: dict = {"base_url": host}
+        return docker.from_env(timeout=_SDK_TIMEOUT_SECONDS)
+    kwargs: dict = {"base_url": host, "timeout": _SDK_TIMEOUT_SECONDS}
     if host.startswith("ssh://"):
         kwargs["use_ssh_client"] = True
     return docker.DockerClient(**kwargs)
@@ -80,7 +89,7 @@ def _create_sdk_client() -> "docker.DockerClient":
     `from_env()`, so existing setups (and its TLS-env handling) are unchanged.
     """
     if os.environ.get("DOCKER_HOST"):
-        return docker.from_env()
+        return docker.from_env(timeout=_SDK_TIMEOUT_SECONDS)
     try:
         from docker.context import ContextAPI
 
@@ -90,4 +99,4 @@ def _create_sdk_client() -> "docker.DockerClient":
     if ctx is not None and ctx.Host and ctx.Host != _DEFAULT_DOCKER_SOCK:
         logger.info("Connecting via docker context %s → %s", ctx.Name, ctx.Host)
         return _build_sdk_client_for_context(ctx)
-    return docker.from_env()
+    return docker.from_env(timeout=_SDK_TIMEOUT_SECONDS)

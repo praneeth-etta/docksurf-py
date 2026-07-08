@@ -14,8 +14,11 @@ from docksurf_py.models import CommandErrorKind, ContainerTop, DockerSnapshot
 
 def _fake_sdk() -> MagicMock:
     sdk = MagicMock()
-    sdk.containers.list.return_value = []
-    sdk.images.list.return_value = []
+    # get_containers()/get_images() (docker/fetcher.py) call the low-level API
+    # directly (raw list + parallel inspect) rather than the high-level
+    # containers.list()/images.list() wrappers — see ROBUSTNESS_PERF_P2_PLAN.md §1.
+    sdk.api.containers.return_value = []
+    sdk.api.images.return_value = []
     sdk.volumes.list.return_value = []
     sdk.networks.list.return_value = []
     return sdk
@@ -120,18 +123,60 @@ class MarkDisconnectedTests(unittest.TestCase):
         client.mark_disconnected(ConnectionError("boom"))  # should not raise
         self.assertFalse(client.is_connected)
 
-    def test_fetch_snapshot_marks_disconnected_on_daemon_death(self) -> None:
+    def test_fetch_snapshot_marks_disconnected_when_every_category_fails(self) -> None:
+        # A real daemon death takes down every concurrent fetch at once, not
+        # just one — that's what should still be treated as a full
+        # disconnect (see the partial-failure tests below for the "one
+        # category flaked" case, which now degrades gracefully instead).
         fake_sdk = _fake_sdk()
         with patch("docksurf_py.docker.context.docker.from_env", return_value=fake_sdk):
             client = _new_client()
             client.fetch_snapshot()  # connects
             self.assertTrue(client.is_connected)
 
-            fake_sdk.containers.list.side_effect = DockerException("daemon down")
+            fake_sdk.api.containers.side_effect = DockerException("daemon down")
+            fake_sdk.api.images.side_effect = DockerException("daemon down")
+            fake_sdk.volumes.list.side_effect = DockerException("daemon down")
+            fake_sdk.networks.list.side_effect = DockerException("daemon down")
             snapshot = client.fetch_snapshot()
 
         self.assertEqual(snapshot, DockerSnapshot([], [], [], []))
         self.assertFalse(client.is_connected)
+        self.assertEqual(client.last_fetch_errors, [])
+
+    def test_fetch_snapshot_substitutes_stale_data_for_failed_category(self) -> None:
+        fake_sdk = _fake_sdk()
+        net = MagicMock()
+        net.short_id = "net1"
+        net.name = "bridge"
+        net.attrs = {"Driver": "bridge", "Scope": "local", "IPAM": {"Config": []}}
+        fake_sdk.networks.list.return_value = [net]
+
+        with patch("docksurf_py.docker.context.docker.from_env", return_value=fake_sdk):
+            client = _new_client()
+            first = client.fetch_snapshot()
+            self.assertEqual(len(first.networks), 1)
+            self.assertEqual(client.last_fetch_errors, [])
+
+            fake_sdk.networks.list.side_effect = APIError("transient blip")
+            second = client.fetch_snapshot()
+
+        self.assertTrue(client.is_connected)
+        self.assertEqual(client.last_fetch_errors, ["networks"])
+        self.assertEqual(len(second.networks), 1)
+        self.assertEqual(second.networks[0].name, "bridge")
+
+    def test_fetch_snapshot_partial_failure_on_first_fetch_is_not_fatal(self) -> None:
+        fake_sdk = _fake_sdk()
+        fake_sdk.networks.list.side_effect = APIError("blip")
+        with patch("docksurf_py.docker.context.docker.from_env", return_value=fake_sdk):
+            client = _new_client()
+            snapshot = client.fetch_snapshot()
+
+        self.assertTrue(client.is_connected)
+        self.assertEqual(client.last_fetch_errors, ["networks"])
+        self.assertEqual(snapshot.networks, [])
+        self.assertEqual(snapshot.containers, [])
 
 
 class ContextPersistenceTests(unittest.TestCase):
@@ -310,6 +355,65 @@ class HostContextOverrideTests(unittest.TestCase):
             client.fetch_snapshot()
 
         clear.assert_called_once()
+
+
+class SdkClientTimeoutTests(unittest.TestCase):
+    """Every SDK client builder in context.py bounds its call timeout — a
+    wedged daemon should fail one request, not stall refreshing forever."""
+
+    def test_default_socket_path_passes_timeout_to_from_env(self) -> None:
+        from docksurf_py.docker import context
+
+        with (
+            patch("docksurf_py.docker.context.docker.from_env") as from_env,
+            patch("docker.context.ContextAPI.get_current_context", return_value=None),
+        ):
+            context._build_sdk_client_for_context(
+                _fake_context("default", "unix:///var/run/docker.sock")
+            )
+            context._build_sdk_client_for_host("")
+            context._create_sdk_client()
+
+        self.assertEqual(from_env.call_count, 3)
+        for call in from_env.call_args_list:
+            self.assertEqual(call.kwargs.get("timeout"), context._SDK_TIMEOUT_SECONDS)
+
+    def test_context_with_custom_host_passes_timeout(self) -> None:
+        from docksurf_py.docker import context
+
+        with patch("docksurf_py.docker.context.docker.DockerClient") as sdk_ctor:
+            context._build_sdk_client_for_context(
+                _fake_context("remote", "tcp://remote:2375")
+            )
+
+        sdk_ctor.assert_called_once()
+        self.assertEqual(
+            sdk_ctor.call_args.kwargs.get("timeout"), context._SDK_TIMEOUT_SECONDS
+        )
+
+    def test_host_override_with_custom_host_passes_timeout(self) -> None:
+        from docksurf_py.docker import context
+
+        with patch("docksurf_py.docker.context.docker.DockerClient") as sdk_ctor:
+            context._build_sdk_client_for_host("tcp://remote:2375")
+
+        sdk_ctor.assert_called_once()
+        self.assertEqual(
+            sdk_ctor.call_args.kwargs.get("timeout"), context._SDK_TIMEOUT_SECONDS
+        )
+
+    def test_ssh_host_still_passes_timeout_alongside_use_ssh_client(self) -> None:
+        from docksurf_py.docker import context
+
+        with patch("docksurf_py.docker.context.docker.DockerClient") as sdk_ctor:
+            context._build_sdk_client_for_context(
+                _fake_context("remote", "ssh://example.com")
+            )
+
+        self.assertTrue(sdk_ctor.call_args.kwargs.get("use_ssh_client"))
+        self.assertEqual(
+            sdk_ctor.call_args.kwargs.get("timeout"), context._SDK_TIMEOUT_SECONDS
+        )
 
 
 class ManagementCommandResultTests(unittest.TestCase):
@@ -684,6 +788,21 @@ class ImageWriteTests(unittest.TestCase):
     def test_image_history_not_connected_returns_none(self) -> None:
         client = DockerClient()
         self.assertIsNone(client.image_history("sha256:x"))
+
+    def test_image_architecture_reads_attrs(self) -> None:
+        client = self._client()
+        client._sdk.images.get.return_value.attrs = {"Architecture": "arm64"}
+        self.assertEqual(client.image_architecture("sha256:x"), "arm64")
+        client._sdk.images.get.assert_called_once_with("sha256:x")
+
+    def test_image_architecture_not_found_returns_none(self) -> None:
+        client = self._client()
+        client._sdk.images.get.side_effect = NotFound("no such image")
+        self.assertIsNone(client.image_architecture("sha256:x"))
+
+    def test_image_architecture_not_connected_returns_none(self) -> None:
+        client = DockerClient()
+        self.assertIsNone(client.image_architecture("sha256:x"))
 
 
 class VolumeWriteTests(unittest.TestCase):

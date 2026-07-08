@@ -227,6 +227,14 @@ class SnapshotManager(_Base):
             if snapshot is not None:
                 self._apply_snapshot(snapshot)
                 logger.info("Refresh complete")
+                failed = self.docker.last_fetch_errors
+                if failed:
+                    logger.warning("Partial fetch failure: %s", ", ".join(failed))
+                    self.notify(
+                        f"Could not refresh {', '.join(failed)} — "
+                        "showing last known state",
+                        severity="warning",
+                    )
             elif error:
                 logger.warning("Refresh failed: %s", error)
                 self.notify(f"Refresh failed: {error}", severity="error")
@@ -240,6 +248,7 @@ class SnapshotManager(_Base):
 
     # --- Event-driven auto-refresh ---
 
+    # TODO: Refactor to reduce complexity.
     @work(thread=True)
     def start_event_listener(self) -> None:
         """Watch `docker events` and keep the UI in sync.

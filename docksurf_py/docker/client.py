@@ -51,6 +51,23 @@ from docksurf_py.models import (
 
 logger = logging.getLogger(__name__)
 
+# The four independently fetched categories in a DockerSnapshot, matching the
+# keys DockerResourceFetcher.fetch_snapshot()'s `errors` dict uses.
+_SNAPSHOT_CATEGORIES = ("containers", "images", "volumes", "networks")
+
+
+def _merge_with_stale(
+    partial: DockerSnapshot, errors: dict[str, Exception], stale: DockerSnapshot
+) -> DockerSnapshot:
+    """Fill in a failed category from `stale` instead of leaving it blank."""
+
+    return DockerSnapshot(
+        containers=(stale.containers if "containers" in errors else partial.containers),
+        images=stale.images if "images" in errors else partial.images,
+        volumes=stale.volumes if "volumes" in errors else partial.volumes,
+        networks=stale.networks if "networks" in errors else partial.networks,
+    )
+
 
 class DockerClient:
     """
@@ -85,6 +102,14 @@ class DockerClient:
             context=self._context_override or _get_docker_context(),
             host=host_override or _get_docker_host(),
         )
+        # Last snapshot where each of the four categories fetched cleanly at
+        # least once, a category that fails on a later fetch is filled in
+        # from here instead of going blank (see fetch_snapshot()).
+        self._last_snapshot = DockerSnapshot([], [], [], [])
+        # Categories that failed on the most recent fetch_snapshot() call
+        # (empty on a fully clean fetch) read by SnapshotManager to notify
+        # the user without blanking the tabs that did fetch fine.
+        self.last_fetch_errors: list[str] = []
 
     def ensure_connected(self) -> ConnectionState:
         """(Re)attempt to connect if not already connected.
@@ -99,6 +124,7 @@ class DockerClient:
             self.connection = self._connect()
         return self.connection
 
+    # TODO: Refactor to reduce complexity.
     def _connect(self) -> ConnectionState:
         build: Callable[[], "docker.DockerClient"]
         if self._host_override:
@@ -208,14 +234,37 @@ class DockerClient:
     # --- Reads ---
 
     def fetch_snapshot(self) -> DockerSnapshot:
+        """Fetch the current state, degrading gracefully on a partial failure.
+
+        A single category failing (e.g. a transient error listing networks)
+        no longer blanks every tab, it's filled in from `_last_snapshot`
+        while the other three categories show their fresh data, and
+        `last_fetch_errors` records what failed so `SnapshotManager` can
+        notify without touching the connection banner. Only when *every*
+        category fails is this treated as the daemon itself being
+        unreachable (`mark_disconnected`), matching the pre-existing
+        behavior for a genuine connection loss.
+        """
         self.ensure_connected()
         if not self._fetcher:
             return DockerSnapshot([], [], [], [])
         try:
-            return self._fetcher.fetch_snapshot()
+            partial, errors = self._fetcher.fetch_snapshot()
         except (DockerException, requests.exceptions.RequestException) as e:
             self.mark_disconnected(e)
-            return DockerSnapshot([], [], [], [])
+            self.last_fetch_errors = []
+            self._last_snapshot = DockerSnapshot([], [], [], [])
+            return self._last_snapshot
+
+        if errors and len(errors) == len(_SNAPSHOT_CATEGORIES):
+            self.mark_disconnected(next(iter(errors.values())))
+            self.last_fetch_errors = []
+            self._last_snapshot = DockerSnapshot([], [], [], [])
+            return self._last_snapshot
+
+        self.last_fetch_errors = sorted(errors)
+        self._last_snapshot = _merge_with_stale(partial, errors, self._last_snapshot)
+        return self._last_snapshot
 
     def fetch_logs(self, container_id: str, tail: int = 500) -> str:
         if not self._sdk:
@@ -301,6 +350,25 @@ class DockerClient:
                 )
             )
         return layers
+
+    def image_architecture(self, image_id: str) -> str | None:
+        """One image's `Architecture` — `None` on error.
+
+        `get_images()` no longer inspects every image eagerly (see
+        `fetcher.py`), so this is the on-demand replacement, fetched lazily
+        when an image's detail pane is shown. Mirrors `container_top`'s
+        try/except shape.
+        """
+        if not self._sdk:
+            return None
+        try:
+            return self._sdk.images.get(image_id).attrs.get("Architecture")
+        except NotFound:
+            logger.warning("Architecture: image %s not found", image_id)
+            return None
+        except (APIError, DockerException, requests.exceptions.RequestException) as e:
+            logger.warning("Architecture lookup failed for %s: %s", image_id, e)
+            return None
 
     def volume_sizes(self) -> dict[str, int]:
         """Per-volume on-disk size, keyed by volume name (`docker system df -v`).

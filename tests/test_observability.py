@@ -106,13 +106,10 @@ class ParseSystemDfTests(unittest.TestCase):
 
 class GetContainersFieldsTests(unittest.TestCase):
     def test_maps_started_at_restart_count_and_health_log(self) -> None:
-        c = MagicMock()
-        c.short_id = "abc123"
-        c.name = "web"
-        c.status = "running"
-        c.image.id = "sha256:deadbeef"
-        c.image.tags = ["nginx:latest"]
-        c.attrs = {
+        attrs = {
+            "Id": "abc123" + "0" * 58,
+            "Name": "/web",
+            "Image": "sha256:deadbeef",
             "Created": "2026-07-01T00:00:00Z",
             "RestartCount": 3,
             "State": {
@@ -136,10 +133,16 @@ class GetContainersFieldsTests(unittest.TestCase):
             "Mounts": [],
         }
         sdk = MagicMock()
-        sdk.containers.list.return_value = [c]
+        sdk.api.containers.return_value = [{"Id": attrs["Id"]}]
+        sdk.api.inspect_container.return_value = attrs
+        sdk.api.images.return_value = [
+            {"Id": "sha256:deadbeef", "RepoTags": ["nginx:latest"]}
+        ]
         containers = DockerResourceFetcher(sdk).get_containers()
         self.assertEqual(len(containers), 1)
         got = containers[0]
+        self.assertEqual(got.name, "web")
+        self.assertEqual(got.image_name, "nginx:latest")
         self.assertEqual(got.started_at, "2026-07-02T09:00:00Z")
         self.assertEqual(got.restart_count, 3)
         self.assertEqual(got.health, "unhealthy")

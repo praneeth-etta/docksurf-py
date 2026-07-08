@@ -2,6 +2,7 @@
 
 from docksurf_py.constants import TabID, markup_green, markup_red, markup_yellow
 from docksurf_py.docker import (
+    format_env,
     format_labels,
     format_ports,
     format_relative_time,
@@ -55,7 +56,8 @@ class DetailPaneRenderer(_Base):
         pane.update_details(
             f"Container: {c.name}",
             details,
-            env_vars=c.env,
+            env_text=format_env(c.env, reveal=self._reveal_secrets),
+            env_masked=not self._reveal_secrets,
             health_log=_format_health_log(c.health_log),
         )
 
@@ -85,11 +87,15 @@ class DetailPaneRenderer(_Base):
         else:
             status = markup_yellow("Unused (not referenced by any container)")
 
+        # Fetched lazily on row-select and cached by
+        # ImageActionHandler._sync_image_architecture; "…" until it resolves.
+        architecture = self._image_architectures.get(image.id, "…")
+
         details = {
             "ID": image.id.removeprefix("sha256:")[:12] if image.id else "N/A",
             "Size": format_size(image.size_bytes),
             "Created": format_relative_time(image.created),
-            "Architecture": image.architecture or "N/A",
+            "Architecture": architecture,
             "Used By": "\n".join(image.used_by) if image.used_by else "None",
             "Status": status,
         }

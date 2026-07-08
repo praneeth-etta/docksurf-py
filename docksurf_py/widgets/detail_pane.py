@@ -53,7 +53,8 @@ class DetailPane(VerticalScroll):
         self,
         title: str,
         data: dict,
-        env_vars: list[str] | None = None,
+        env_text: str | None = None,
+        env_masked: bool = True,
         health_log: str | None = None,
     ) -> None:
         safe_title = title if isinstance(title, SafeMarkup) else escape(title)
@@ -78,11 +79,14 @@ class DetailPane(VerticalScroll):
             self._health_collapsible.remove()
             self._health_collapsible = None
 
-        if env_vars:
-            env_static = Static(escape("\n".join(env_vars)))
+        if env_text:
+            env_static = Static(escape(env_text), id="env-content")
             env_static.styles.padding = (1, 2)
+            suffix = "masked — R to reveal" if env_masked else "revealed — R to mask"
             self._env_collapsible = Collapsible(
-                env_static, title="Environment Variables", collapsed=True
+                env_static,
+                title=f"Environment Variables ({suffix})",
+                collapsed=True,
             )
             self.mount(self._env_collapsible)
 

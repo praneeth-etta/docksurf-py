@@ -115,7 +115,6 @@ class Image:
     is_dangling: bool
     used_by: list[str]
     created: str
-    architecture: str
 
 
 @dataclass(slots=True, frozen=True)

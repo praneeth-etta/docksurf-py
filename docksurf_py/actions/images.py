@@ -5,13 +5,14 @@ import logging
 from rich.markup import escape
 from rich.table import Table
 from textual import work
-from textual.widgets import TabbedContent
+from textual.widgets import DataTable, TabbedContent
 
 from docksurf_py.actions.common import _Base, _display_name
-from docksurf_py.constants import TabID
+from docksurf_py.constants import DETAIL_PANE_ID, TabID
 from docksurf_py.docker import format_size
 from docksurf_py.models import CommandResult, Image, ImageLayer
 from docksurf_py.widgets import (
+    DetailPane,
     LayerHistoryScreen,
     PromptField,
     PromptScreen,
@@ -61,6 +62,9 @@ class ImageActionHandler(_Base):
     """
 
     _IMAGE_TAB_HINT = "Switch to the Images tab and select an image"
+    # Image id whose Architecture lookup is currently in flight, if any — see
+    # _sync_image_architecture.
+    _architecture_target: str | None = None
 
     def _on_images_tab(self) -> bool:
         return self.query_one(TabbedContent).active == TabID.IMAGES
@@ -68,6 +72,49 @@ class ImageActionHandler(_Base):
     def _get_focused_image(self) -> Image | None:
         item = self._get_focused_resource(TabID.IMAGES)
         return item if isinstance(item, Image) else None
+
+    def _sync_image_architecture(self) -> None:
+        """Lazily fetch and cache the focused image's Architecture.
+
+        `get_images()` (`docker/fetcher.py`) no longer inspects every image
+        eagerly. Architecture is detail-pane only, so it's fetched once per
+        image id here instead. Idempotent like
+        `LiveStatsController._sync_stats`: no-ops once cached, and dedupes
+        against a fetch already in flight for the same image.
+        """
+        image = self._get_focused_image()
+        target = image.id if image is not None else None
+
+        if target is None or target in self._image_architectures:
+            return
+        if target == self._architecture_target:
+            return
+        self._architecture_target = target
+        self._fetch_image_architecture(target)
+
+    @work(thread=True)
+    def _fetch_image_architecture(self, image_id: str) -> None:
+        architecture = self.docker.image_architecture(image_id)
+        self.call_from_thread(self._apply_image_architecture, image_id, architecture)
+
+    def _apply_image_architecture(
+        self, image_id: str, architecture: str | None
+    ) -> None:
+        self._image_architectures[image_id] = architecture or "unknown"
+        if self._architecture_target == image_id:
+            self._architecture_target = None
+        if not self._on_images_tab():
+            return
+        entry = self._resource_registry[TabID.IMAGES]
+        table = self.query_one(f"#{entry.table_id}", DataTable)
+        row = table.cursor_row
+        if row is None:
+            return
+        pane = self.query_one(f"#{DETAIL_PANE_ID}", DetailPane)
+        try:
+            entry.show_details(pane, row)
+        except IndexError:
+            pass
 
     def _handle_write_result(self, result: CommandResult) -> None:
         """Shared success/failure handling for the simple create/tag/connect
@@ -103,6 +150,7 @@ class ImageActionHandler(_Base):
         self.push_screen(screen)
         self._execute_pull(screen, repository, tag)
 
+    # TODO: Refactor to reduce complexity.
     @work(thread=True)
     def _execute_pull(
         self, screen: PullProgressScreen, repository: str, tag: str

@@ -169,6 +169,8 @@ class AppContext(Protocol):
     _collapsed_projects: set[str]
     _marked: dict[TabID, set[tuple[str, str]]]
     _volume_sizes: dict[str, int]
+    _image_architectures: dict[str, str]
+    _reveal_secrets: bool
     _sort_state: dict[TabID, tuple[str, bool] | None]
     is_running: bool  # really a textual.app.App property
 
@@ -183,6 +185,7 @@ class AppContext(Protocol):
     def _sort_items(self, tab_id: TabID, entry: ResourceEntry, items: list) -> list: ...
     def _sync_stats(self) -> None: ...
     def _sync_top(self) -> None: ...
+    def _sync_image_architecture(self) -> None: ...
     def _get_focused_container(self) -> Container | None: ...
     def _get_focused_resource(self, tab_id: TabID) -> Any: ...
     def _get_focused_project(self) -> Any: ...
@@ -279,6 +282,7 @@ class DockSurfApp(
         Binding("escape", "clear_marks", "Clear marks", show=False),
         Binding("Y", "yank", "Copy to clipboard", show=False),
         Binding("O", "open_port", "Open port in browser", show=False),
+        Binding("R", "toggle_secrets", "Reveal/mask secret env vars", show=False),
         Binding("1", "switch_tab_1", "Containers tab", show=False),
         Binding("2", "switch_tab_2", "Images tab", show=False),
         Binding("3", "switch_tab_3", "Volumes tab", show=False),
@@ -472,12 +476,14 @@ class DockSurfApp(
             pane.clear_details()
             self._sync_stats()
             self._sync_top()
+            self._sync_image_architecture()
             return
         current = self._current.get(active, [])
         if not current:
             pane.clear_details()
             self._sync_stats()
             self._sync_top()
+            self._sync_image_architecture()
             return
         self.query_one(f"#{entry.table_id}", DataTable).move_cursor(row=0)
         try:
@@ -486,6 +492,7 @@ class DockSurfApp(
             pane.clear_details()
         self._sync_stats()
         self._sync_top()
+        self._sync_image_architecture()
 
     @on(DataTable.RowHighlighted)
     def update_details(self, event: DataTable.RowHighlighted) -> None:
@@ -506,6 +513,7 @@ class DockSurfApp(
             pane.clear_details()
         self._sync_stats()
         self._sync_top()
+        self._sync_image_architecture()
 
     @on(TabbedContent.TabActivated)
     def clear_on_tab_switch(self) -> None:

@@ -2,7 +2,8 @@
 
 import re
 import threading
-from typing import Callable, Iterator, Protocol
+from collections import deque
+from typing import Callable, Iterable, Iterator, Protocol
 
 from rich.markup import escape
 from textual import on
@@ -28,6 +29,11 @@ from docksurf_py.constants import (
     LogOptions,
     SafeMarkup,
 )
+
+# Caps LogPane._line_buffer so tailing a noisy container indefinitely can't
+# grow memory without bound. Oldest lines drop silently once full — export
+# past this point only covers the most recent _LOG_BUFFER_MAXLEN lines.
+_LOG_BUFFER_MAXLEN = 20_000
 
 
 def _highlight_match(line: str, term: str) -> str:
@@ -59,7 +65,7 @@ def _render_log_line(line: LogLine, term: str, show_ts: bool) -> str:
     return f"{prefix}{ts}{body}"
 
 
-def _buffer_to_text(lines: list[LogLine], show_ts: bool = True) -> str:
+def _buffer_to_text(lines: Iterable[LogLine], show_ts: bool = True) -> str:
     """Flatten a log buffer to plain text for export (timestamps + markers)."""
     out = []
     for line in lines:
@@ -102,7 +108,7 @@ class LogPane(Widget):
         self._log_stream: LogSource | None = None
         self._expanded = False
         self._stream_factory: Callable[[str, LogOptions], LogSource] | None = None
-        self._line_buffer: list[LogLine] = []
+        self._line_buffer: deque[LogLine] = deque(maxlen=_LOG_BUFFER_MAXLEN)
         self._filter: str = ""
         self._filter_timer: Timer | None = None
         self._options = default_options or LogOptions()
@@ -153,7 +159,7 @@ class LogPane(Widget):
         self._container_id = container_id
         self._container_name = container_name
         self._stream_factory = stream_factory
-        self._line_buffer = []
+        self._line_buffer.clear()
         self._filter = ""
         self._match_count = 0
         self._match_cursor = -1
@@ -196,7 +202,7 @@ class LogPane(Widget):
         self._update_header()
 
     def clear_log(self) -> None:
-        self._line_buffer = []
+        self._line_buffer.clear()
         self.query_one(f"#{LOG_PANE_VIEW_ID}", RichLog).clear()
 
     def toggle_search(self) -> None:
@@ -310,7 +316,7 @@ class LogPane(Widget):
         """Apply new tail/since options — re-subscribes the stream from scratch."""
         self._options = options
         self.stop_follow()
-        self._line_buffer = []
+        self._line_buffer.clear()
         self._match_cursor = -1
         self._match_count = 0
         self.query_one(f"#{LOG_PANE_VIEW_ID}", RichLog).clear()

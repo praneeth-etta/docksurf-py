@@ -148,6 +148,9 @@ class MockDockerService:
         # Tests can flip this (and `connection`) to simulate a daemon drop —
         # `ensure_connected()` below just returns whatever was set here.
         self._connected = True
+        # Categories that failed on the last fetch_snapshot() call; tests can
+        # override to exercise SnapshotManager's partial-failure notice.
+        self.last_fetch_errors: list[str] = []
         # Recorded (method_name, *args) tuples for every write call — lets
         # bulk/prune tests assert who was actually invoked.
         self.calls: list[tuple] = []
@@ -180,6 +183,9 @@ class MockDockerService:
                 created_by="/bin/sh -c apk add curl", size_bytes=1024, created="0"
             ),
         ]
+        # Per-image Architecture returned by image_architecture(); tests can
+        # override. Keyed by image id, default "amd64" for anything unlisted.
+        self.architecture_map: dict[str, str] = {}
 
     @property
     def is_connected(self) -> bool:
@@ -235,6 +241,10 @@ class MockDockerService:
     def image_history(self, image_id: str):
         self.calls.append(("image_history", image_id))
         return self.history_layers
+
+    def image_architecture(self, image_id: str) -> str | None:
+        self.calls.append(("image_architecture", image_id))
+        return self.architecture_map.get(image_id, "amd64")
 
     def volume_sizes(self) -> dict[str, int]:
         self.calls.append(("volume_sizes",))
@@ -805,7 +815,6 @@ class InspectActionTests(unittest.IsolatedAsyncioTestCase):
             is_dangling=False,
             used_by=[],
             created="",
-            architecture="amd64",
         )
         snapshot = DockerSnapshot(containers=[], images=[img], volumes=[], networks=[])
         svc = MockDockerService(lambda: snapshot)
@@ -1357,7 +1366,6 @@ def _image(repo="alpine", tag="latest", dangling=False, image_id="sha256:img1"):
         is_dangling=dangling,
         used_by=[],
         created="",
-        architecture="amd64",
     )
 
 
@@ -2235,6 +2243,90 @@ class EmptyStateTests(unittest.IsolatedAsyncioTestCase):
             svc.connection = _CONNECTED_STATE
             app.start_refresh()
             await wait_until(lambda: not banner.display)
+
+
+class PartialFetchFailureTests(unittest.IsolatedAsyncioTestCase):
+    """DockerClient.fetch_snapshot degrading gracefully (ROBUSTNESS_PERF_P2_PLAN.md
+    §2) should surface as one warning toast, not a wiped tab — see
+    DockerService.last_fetch_errors."""
+
+    async def test_notifies_without_wiping_other_tabs(self) -> None:
+        snapshot = DockerSnapshot([make_container("c1")], [], [], [])
+        svc = MockDockerService(lambda: snapshot)
+        app = DockSurfApp(docker=svc)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await wait_until(lambda: bool(app._current.get(TabID.CONTAINERS)))
+
+            svc.last_fetch_errors = ["networks"]
+            with patch.object(app, "notify") as notify:
+                app.start_refresh()
+                await wait_until(lambda: notify.called)
+                notify.assert_called_once()
+                self.assertEqual(notify.call_args.kwargs.get("severity"), "warning")
+                self.assertIn("networks", notify.call_args[0][0])
+
+            # A networks-only failure must not blank the tabs that fetched
+            # fine — containers should still show its fresh data.
+            self.assertEqual(len(app._current[TabID.CONTAINERS]), 1)
+
+    async def test_no_notification_on_clean_fetch(self) -> None:
+        snapshot = DockerSnapshot([make_container("c1")], [], [], [])
+        svc = MockDockerService(lambda: snapshot)
+        app = DockSurfApp(docker=svc)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await wait_until(lambda: bool(app._current.get(TabID.CONTAINERS)))
+
+            with patch.object(app, "notify") as notify:
+                app.start_refresh()
+                await wait_until(lambda: not app._refresh_in_progress)
+                await pilot.pause()
+                notify.assert_not_called()
+
+
+class SecretMaskingTests(unittest.IsolatedAsyncioTestCase):
+    """Env vars mask by default in the detail pane; `R` reveals/re-masks —
+    see ROBUSTNESS_PERF_P2_PLAN.md §4."""
+
+    @staticmethod
+    def _env_text(pane: DetailPane) -> str:
+        assert pane._env_collapsible is not None
+        static = pane._env_collapsible.query_one("#env-content", Static)
+        console = Console(width=200, no_color=True)
+        with console.capture() as cap:
+            console.print(static.content, highlight=False)
+        return cap.get()
+
+    async def test_reveal_toggle_is_idempotent_and_updates_the_title(self) -> None:
+        c = make_container("web")
+        c.env = ["DB_PASSWORD=supersecret", "PATH=/usr/bin"]
+        snapshot = DockerSnapshot([c], [], [], [])
+        app = DockSurfApp(docker=MockDockerService(lambda: snapshot))
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await wait_until(lambda: bool(app._current.get(TabID.CONTAINERS)))
+            app.query_one(f"#{TableID.CONTAINERS}", DataTable).move_cursor(row=0)
+            await pilot.pause()
+
+            pane = app.query_one(f"#{DETAIL_PANE_ID}", DetailPane)
+            assert pane._env_collapsible is not None
+            masked_text = self._env_text(pane)
+            self.assertIn("DB_PASSWORD=••••••••", masked_text)
+            self.assertIn("PATH=/usr/bin", masked_text)
+            self.assertIn("masked", str(pane._env_collapsible.title))
+
+            app.action_toggle_secrets()
+            await pilot.pause()
+            revealed_text = self._env_text(pane)
+            self.assertIn("DB_PASSWORD=supersecret", revealed_text)
+            self.assertIn("revealed", str(pane._env_collapsible.title))
+
+            app.action_toggle_secrets()
+            await pilot.pause()
+            remasked_text = self._env_text(pane)
+            self.assertEqual(remasked_text, masked_text)
+            self.assertIn("masked", str(pane._env_collapsible.title))
 
 
 if __name__ == "__main__":

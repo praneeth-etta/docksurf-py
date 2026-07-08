@@ -14,7 +14,7 @@ from typing import Callable
 
 from rich.markup import escape
 from textual import work
-from textual.widgets import TabbedContent
+from textual.widgets import DataTable, TabbedContent
 
 from docksurf_py.actions.common import _PROJECT_HINT, _Base
 from docksurf_py.constants import DETAIL_PANE_ID, LOG_PANE_ID, LogOptions, TabID
@@ -629,3 +629,19 @@ class ContainerActionHandler(_Base):
                 severity="warning",
                 timeout=10,
             )
+
+    def action_toggle_secrets(self) -> None:
+        """`R` — reveal or re-mask secret-looking env var values."""
+        self._reveal_secrets: bool = not self._reveal_secrets
+        if self.query_one(TabbedContent).active != TabID.CONTAINERS:
+            return
+        entry = self._resource_registry[TabID.CONTAINERS]
+        table = self.query_one(f"#{entry.table_id}", DataTable)
+        row = table.cursor_row
+        if row is None:
+            return
+        pane = self.query_one(f"#{DETAIL_PANE_ID}", DetailPane)
+        try:
+            entry.show_details(pane, row)
+        except IndexError:
+            pass

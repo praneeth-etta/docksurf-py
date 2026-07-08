@@ -8,6 +8,7 @@ from docksurf_py.docker.client import DockerClient
 from docksurf_py.docker.fetcher import DockerResourceFetcher
 from docksurf_py.docker.format import (
     _parse_system_df,
+    format_env,
     format_labels,
     format_ports,
     format_relative_time,
@@ -38,6 +39,7 @@ __all__ = [
     "format_size",
     "format_ports",
     "format_labels",
+    "format_env",
     "_split_timestamp",
     "_assign_service_colors",
     "_parse_stats",
