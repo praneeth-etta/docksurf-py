@@ -35,6 +35,7 @@ from docksurf_py.constants import (
     BTN_EXPAND_ID,
     CONFIRM_FORCE_CHECKBOX_ID,
     CONNECTION_BANNER_ID,
+    CONNECTION_INDICATOR_ID,
     DETAIL_PANE_ID,
     EMPTY_STATE_IDS,
     LOG_PANE_ID,
@@ -64,6 +65,7 @@ from docksurf_py.models import (
 from docksurf_py.session import SessionState
 from docksurf_py.widgets import (
     ConfirmDialog,
+    ConnectionIndicator,
     ContainerPickerScreen,
     DetailPane,
     HelpScreen,
@@ -2278,17 +2280,24 @@ class EmptyStateTests(unittest.IsolatedAsyncioTestCase):
         async with app.run_test() as pilot:
             await pilot.pause()
             banner = app.query_one(f"#{CONNECTION_BANNER_ID}", Static)
+            indicator = app.query_one(
+                f"#{CONNECTION_INDICATOR_ID}", ConnectionIndicator
+            )
             self.assertFalse(banner.display)
 
             svc.mark_disconnected(RuntimeError("daemon down"))
             app.start_refresh()
             await wait_until(lambda: banner.display)
             self.assertIn("Docker daemon is not running", str(banner.content))
+            self.assertIn("Disconnected", str(indicator.content))
 
             svc._connected = True
             svc.connection = _CONNECTED_STATE
             app.start_refresh()
             await wait_until(lambda: not banner.display)
+            # "Connected" is a substring of "Disconnected" too, so assert the
+            # negative to actually prove the flip back happened.
+            self.assertNotIn("Disconnected", str(indicator.content))
 
 
 class PartialFetchFailureTests(unittest.IsolatedAsyncioTestCase):

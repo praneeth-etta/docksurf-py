@@ -26,12 +26,20 @@ from docksurf_py.widgets.log_pane import (
 from docksurf_py.widgets.prune_screen import PruneScreen
 from docksurf_py.widgets.pull_progress_screen import PullProgressScreen
 from docksurf_py.widgets.search_bar import SearchBar
-from docksurf_py.widgets.status_bar import StatusBar
+from docksurf_py.widgets.status_bar import ConnectionIndicator, StatusBar
 from docksurf_py.widgets.system_df_screen import SystemDfScreen
-from docksurf_py.widgets.tables import ContainerTable
+from docksurf_py.widgets.tables import (
+    ContainerTable,
+    ImageTable,
+    NetworkTable,
+    VolumeTable,
+)
 
 __all__ = [
     "ContainerTable",
+    "ImageTable",
+    "VolumeTable",
+    "NetworkTable",
     "DetailPane",
     "ConfirmDialog",
     "PromptField",
@@ -48,6 +56,7 @@ __all__ = [
     "ContainerPickerScreen",
     "SearchBar",
     "StatusBar",
+    "ConnectionIndicator",
     "_highlight_match",
     "_render_log_line",
     "_buffer_to_text",

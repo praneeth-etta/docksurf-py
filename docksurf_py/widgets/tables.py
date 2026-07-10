@@ -1,4 +1,12 @@
-"""ContainerTable — a DataTable subclass with container-specific key bindings."""
+"""DataTable subclasses carrying per-tab key bindings.
+
+Textual's `Footer` shows a widget's own `BINDINGS` only while that widget
+has focus, so declaring a tab's actions here (rather than only on
+`DockSurfApp.BINDINGS`) is what makes the footer show `Stop`/`History`/`Size`
+etc. only on the tab they apply to. The matching App-level entries stay
+`show=False` and exist purely so the `?` help screen and command palette
+(both of which only read `App.BINDINGS`) still surface every action.
+"""
 
 from textual.binding import Binding
 from textual.widgets import DataTable
@@ -18,6 +26,7 @@ class ContainerTable(DataTable):
         Binding("C", "copy_files", "Copy files", show=False),
         Binding("l", "view_logs", "Logs (toggle)"),
         Binding("f", "follow_logs", "Follow"),
+        Binding("c", "clear_logs", "Clear", show=False),
         Binding("z", "toggle_log_expand", "Expand Logs", show=False),
         # Log-viewer controls, active while the pane is open (the handlers
         # no-op when it isn't). Mirrored here — like l/f/z above — so they fire
@@ -36,4 +45,31 @@ class ContainerTable(DataTable):
         Binding("ctrl+k", "compose_down", "Compose Down"),
         Binding("t", "container_top", "Top"),
         Binding("space", "toggle_mark", "Mark / Collapse", show=False),
+    ]
+
+
+class ImageTable(DataTable):
+    """A Table specifically for Images with context-aware bindings."""
+
+    BINDINGS = [
+        Binding("h", "image_history", "History"),
+        Binding("y", "tag_image", "Tag"),
+        Binding("a", "mark_all_dangling", "Mark dangling"),
+    ]
+
+
+class VolumeTable(DataTable):
+    """A Table specifically for Volumes with context-aware bindings."""
+
+    BINDINGS = [
+        Binding("b", "volume_size", "Size"),
+    ]
+
+
+class NetworkTable(DataTable):
+    """A Table specifically for Networks with context-aware bindings."""
+
+    BINDINGS = [
+        Binding("v", "network_connect", "Connect"),
+        Binding("m", "network_disconnect", "Disconnect"),
     ]

@@ -54,10 +54,19 @@ TabbedContent {
     padding: 2;
 }
 
+#connection-indicator {
+    dock: top;
+    margin-top: 1; /* Leaves room for the built-in Header */
+    width: 100%;
+    height: 1;
+    content-align: right middle;
+    padding: 0 2;
+}
+
 #connection-banner {
     display: none;
     dock: top;
-    margin-top: 1; /* Leaves room for the built-in Header */
+    margin-top: 2; /* Leaves room for the Header + #connection-indicator */
     width: 100%;
     height: auto;
     background: $error;

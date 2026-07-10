@@ -44,6 +44,7 @@ from docksurf_py.actions import (
 from docksurf_py.config import DEFAULT_CONFIG_PATH, Config, load_config
 from docksurf_py.constants import (
     CONNECTION_BANNER_ID,
+    CONNECTION_INDICATOR_ID,
     DETAIL_PANE_ID,
     EMPTY_STATE_IDS,
     LOG_PANE_ID,
@@ -75,12 +76,16 @@ from docksurf_py.service import DockerService
 from docksurf_py.session import SessionState, load_session, save_session
 from docksurf_py.themes import CUSTOM_THEMES, DEFAULT_THEME_NAME
 from docksurf_py.widgets import (
+    ConnectionIndicator,
     ContainerTable,
     DetailPane,
     HelpScreen,
+    ImageTable,
     LogPane,
+    NetworkTable,
     SearchBar,
     StatusBar,
+    VolumeTable,
 )
 
 logger = logging.getLogger(__name__)
@@ -251,21 +256,27 @@ class DockSurfApp(
         ("r", "refresh", "Refresh"),
         ("/", "open_search", "Search"),
         ("q", "quit", "Quit"),
-        ("s", "stop_container", "Stop"),
-        ("S", "start_container", "Start"),
-        ("x", "restart_container", "Restart"),
-        ("p", "pause_container", "Pause/Unpause"),
-        ("K", "kill_container", "Kill"),
-        ("e", "exec_container", "Exec"),
+        # Container/log-viewer actions below are declared here so the Help screen
+        # (`action_help`) and command palette (`get_system_commands`) both of which only
+        # read `self.BINDINGS` still surface them everywhere. `show=False` keeps them
+        # out of the Footer globally; `ContainerTable.BINDINGS` (widgets/tables.py)
+        # re-declares the same actions with `show=True`, so the Footer only displays
+        # them while the Containers tab's table actually has focus.
+        Binding("s", "stop_container", "Stop", show=False),
+        Binding("S", "start_container", "Start", show=False),
+        Binding("x", "restart_container", "Restart", show=False),
+        Binding("p", "pause_container", "Pause/Unpause", show=False),
+        Binding("K", "kill_container", "Kill", show=False),
+        Binding("e", "exec_container", "Exec", show=False),
         Binding("E", "exec_custom", "Exec (custom)", show=False),
         ("i", "inspect", "Inspect"),
         ("d", "delete", "Delete"),
-        ("l", "view_logs", "Logs"),
-        ("f", "follow_logs", "Pause/Resume"),
-        ("c", "clear_logs", "Clear"),
+        Binding("l", "view_logs", "Logs", show=False),
+        Binding("f", "follow_logs", "Pause/Resume", show=False),
+        Binding("c", "clear_logs", "Clear", show=False),
         Binding("C", "copy_files", "Copy files", show=False),
-        ("z", "toggle_log_expand", "Expand Logs"),
-        ("o", "log_options", "Log options"),
+        Binding("z", "toggle_log_expand", "Expand Logs", show=False),
+        Binding("o", "log_options", "Log options", show=False),
         Binding("T", "toggle_timestamps", "Toggle timestamps", show=False),
         Binding("W", "toggle_log_wrap", "Toggle wrap", show=False),
         Binding("n", "next_match", "Next log match", show=False),
@@ -273,9 +284,9 @@ class DockSurfApp(
         Binding("g", "log_top", "Jump to log top", show=False),
         Binding("G", "log_bottom", "Jump to log bottom", show=False),
         Binding("X", "export_logs", "Export logs", show=False),
-        Binding("ctrl+u", "compose_up", "Compose Up"),
-        Binding("ctrl+k", "compose_down", "Compose Down"),
-        ("t", "container_top", "Top"),
+        Binding("ctrl+u", "compose_up", "Compose Up", show=False),
+        Binding("ctrl+k", "compose_down", "Compose Down", show=False),
+        Binding("t", "container_top", "Top", show=False),
         ("space", "toggle_mark", "Mark / Collapse"),
         ("w", "system_df", "Disk usage"),
         ("P", "prune", "Prune"),
@@ -383,6 +394,7 @@ class DockSurfApp(
 
     def compose(self) -> ComposeResult:
         yield Header()
+        yield ConnectionIndicator(id=CONNECTION_INDICATOR_ID)
         yield Static("", id=CONNECTION_BANNER_ID)
         with Horizontal(id=MAIN_CONTAINER_ID):
             with TabbedContent():
@@ -392,17 +404,17 @@ class DockSurfApp(
                         "", id=EMPTY_STATE_IDS[TabID.CONTAINERS], classes="empty-state"
                     )
                 with TabPane("Images", id=TabID.IMAGES):
-                    yield DataTable(id=TableID.IMAGES)
+                    yield ImageTable(id=TableID.IMAGES)
                     yield Static(
                         "", id=EMPTY_STATE_IDS[TabID.IMAGES], classes="empty-state"
                     )
                 with TabPane("Volumes", id=TabID.VOLUMES):
-                    yield DataTable(id=TableID.VOLUMES)
+                    yield VolumeTable(id=TableID.VOLUMES)
                     yield Static(
                         "", id=EMPTY_STATE_IDS[TabID.VOLUMES], classes="empty-state"
                     )
                 with TabPane("Networks", id=TabID.NETWORKS):
-                    yield DataTable(id=TableID.NETWORKS)
+                    yield NetworkTable(id=TableID.NETWORKS)
                     yield Static(
                         "", id=EMPTY_STATE_IDS[TabID.NETWORKS], classes="empty-state"
                     )
@@ -487,6 +499,12 @@ class DockSurfApp(
             self._sync_top()
             self._sync_image_architecture()
             return
+        table = self.query_one(f"#{entry.table_id}", DataTable)
+        # Explicitly follow focus to the active tab's table (rather than
+        # relying on Textual's implicit initial-focus behavior) so the
+        # Footer's per-table BINDINGS scoping is deterministic.
+        if not self.query_one(f"#{SEARCH_BAR_ID}", Input).display:
+            table.focus()
         current = self._current.get(active, [])
         if not current:
             pane.clear_details()
@@ -494,7 +512,7 @@ class DockSurfApp(
             self._sync_top()
             self._sync_image_architecture()
             return
-        self.query_one(f"#{entry.table_id}", DataTable).move_cursor(row=0)
+        table.move_cursor(row=0)
         try:
             entry.show_details(pane, 0)
         except IndexError:

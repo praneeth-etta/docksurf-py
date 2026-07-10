@@ -12,6 +12,9 @@ from docksurf_py.constants import (
     EMPTY_STATE_IDS,
     MARK_GLYPH,
     SEARCH_BAR_ID,
+    STATUS_GREEN,
+    STATUS_RED,
+    STATUS_YELLOW,
     SafeMarkup,
     TabID,
     markup_green,
@@ -36,6 +39,17 @@ if TYPE_CHECKING:
 _NEEDS_SNAPSHOT_MSG = "populate with no items needs a snapshot"
 
 
+def _status_color(c: Container) -> str:
+    """The color a container's state maps to — shared by `_status_markup`
+    (Status column/field text) and `DetailPaneRenderer` (detail panel border),
+    so the two never drift apart."""
+    if c.running:
+        return STATUS_GREEN
+    if c.state in ("exited", "dead"):
+        return STATUS_RED
+    return STATUS_YELLOW  # paused, restarting, created
+
+
 def _status_markup(c: Container) -> SafeMarkup:
     if c.running:
         label = escape(c.status)
@@ -45,11 +59,12 @@ def _status_markup(c: Container) -> SafeMarkup:
             label += " ✗"
         elif c.health == "starting":
             label += " …"
-        return markup_green(label)
-    if c.state in ("exited", "dead"):
+    elif c.state in ("exited", "dead"):
         suffix = f" ({c.exit_code})" if c.exit_code != 0 else ""
-        return markup_red(escape(c.status) + suffix)
-    return markup_yellow(escape(c.status))  # paused, restarting, created
+        label = escape(c.status) + suffix
+    else:
+        label = escape(c.status)  # paused, restarting, created
+    return SafeMarkup(f"[{_status_color(c)}]{label}[/]")
 
 
 def _safe_row(table: DataTable, *values) -> None:
@@ -130,9 +145,13 @@ def _group_by_project(
     return projects, standalone
 
 
+def _project_status_color(project: ComposeProject) -> str:
+    return STATUS_GREEN if project.all_running else STATUS_YELLOW
+
+
 def _project_status_markup(project: ComposeProject) -> SafeMarkup:
     summary = f"{project.running_count}/{project.total_count} running"
-    return markup_green(summary) if project.all_running else markup_yellow(summary)
+    return SafeMarkup(f"[{_project_status_color(project)}]{summary}[/]")
 
 
 class TableRenderer(_Base):

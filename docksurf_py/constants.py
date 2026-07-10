@@ -95,6 +95,9 @@ EMPTY_STATE_HINTS: dict[TabID, str] = {
 # SnapshotManager._maybe_notify_connection_change).
 CONNECTION_BANNER_ID = "connection-banner"
 
+# Small, always visible connected/disconnected readout docked under the Header
+CONNECTION_INDICATOR_ID = "connection-indicator"
+
 # PromptScreen button IDs
 BTN_PROMPT_OK_ID = "prompt-ok"
 BTN_PROMPT_CANCEL_ID = "prompt-cancel"

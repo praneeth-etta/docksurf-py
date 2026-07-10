@@ -52,24 +52,37 @@ class DetailPane(VerticalScroll):
     def update_details(
         self,
         title: str,
-        data: dict,
+        sections: dict[str, dict],
         env_text: str | None = None,
         env_masked: bool = True,
         health_log: str | None = None,
+        border_style: str = "blue",
     ) -> None:
+        """Update the details panel and its optional collapsible sections.
+
+        The main panel displays fields grouped into named sections. `sections`
+        maps each section heading to a dictionary of field names and values.
+        A falsy heading (``""``) suppresses the section header, which is useful
+        for rendering an ungrouped set of fields.
+        """
         safe_title = title if isinstance(title, SafeMarkup) else escape(title)
 
-        table = Table(show_header=False, expand=True, box=None)
-        table.add_column("Property", style="cyan", justify="right", width=15)
-        table.add_column("Value")
-        for key, value in data.items():
-            safe_value = (
-                str(value) if isinstance(value, SafeMarkup) else escape(str(value))
-            )
-            table.add_row(f"[b]{key}[/b]", safe_value)
+        table = Table(show_header=False, expand=True, box=None, pad_edge=False)
+        table.add_column("Property", style="cyan", justify="left")
+        table.add_column("Value", ratio=1)
+        for i, (heading, fields) in enumerate(sections.items()):
+            if heading:
+                if i:
+                    table.add_row("", "")
+                table.add_row(f"[b dim]{escape(heading.upper())}[/b dim]", "")
+            for key, value in fields.items():
+                safe_value = (
+                    str(value) if isinstance(value, SafeMarkup) else escape(str(value))
+                )
+                table.add_row(f"[b]{key}[/b]", safe_value)
 
         self._panel.update(
-            Panel(table, title=f"[b]{safe_title}[/b]", border_style="blue")
+            Panel(table, title=f"[b]{safe_title}[/b]", border_style=border_style)
         )
 
         if self._env_collapsible is not None:

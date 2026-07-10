@@ -12,6 +12,7 @@ from textual.widgets import DataTable, Input, LoadingIndicator, Static, TabbedCo
 from docksurf_py.connection import ConnectionState, ConnectionStatus
 from docksurf_py.constants import (
     CONNECTION_BANNER_ID,
+    CONNECTION_INDICATOR_ID,
     DETAIL_PANE_ID,
     REFRESH_LOADING_ID,
     SEARCH_BAR_ID,
@@ -28,7 +29,7 @@ from docksurf_py.models import (
     Volume,
 )
 from docksurf_py.renderer.common import _Base
-from docksurf_py.widgets import DetailPane, StatusBar
+from docksurf_py.widgets import ConnectionIndicator, DetailPane, StatusBar
 
 logger = logging.getLogger(__name__)
 
@@ -207,6 +208,8 @@ class SnapshotManager(_Base):
         connected = state.status == ConnectionStatus.CONNECTED
         status_bar = self.query_one(f"#{STATUS_BAR_ID}", StatusBar)
         status_bar.set_connection_state(connected, "" if connected else state.message)
+        indicator = self.query_one(f"#{CONNECTION_INDICATOR_ID}", ConnectionIndicator)
+        indicator.set_connection_state(connected)
         banner = self.query_one(f"#{CONNECTION_BANNER_ID}", Static)
         if connected:
             banner.display = False

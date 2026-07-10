@@ -52,3 +52,17 @@ class StatusBar(Static):
             f"{context_part}{self._conn_text}"
         )
         self.update(text)
+
+
+class ConnectionIndicator(Static):
+    """A small `● Connected` / `● Disconnected` readout, docked under the Header."""
+
+    def on_mount(self) -> None:
+        self.update("[dim]● Connecting…[/dim]")
+
+    def set_connection_state(self, connected: bool) -> None:
+        self.update(
+            "[green]● Connected[/green]"
+            if connected
+            else "[bold red]● Disconnected[/bold red]"
+        )

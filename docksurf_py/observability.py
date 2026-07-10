@@ -10,6 +10,7 @@ import logging
 import threading
 from typing import TYPE_CHECKING
 
+from rich import box
 from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
@@ -56,8 +57,12 @@ def _render_stats(stats: ContainerStats, name: str) -> Panel:
     table.add_row(
         "BLK", f"↓ {format_size(stats.blk_read)}   ↑ {format_size(stats.blk_write)}"
     )
+
     return Panel(
-        table, title=f"[b]Live stats: {escape(name)}[/b]", border_style="green"
+        table,
+        title=f"[b green]Live stats: {escape(name)}[/b green]",
+        border_style="dim",
+        box=box.MINIMAL,
     )
 
 
@@ -84,7 +89,10 @@ def _render_top(top: ContainerTop, name: str) -> Panel:
     for process in top.processes:
         table.add_row(*process)
     return Panel(
-        table, title=f"[b]Processes: {escape(name)}[/b]", border_style="magenta"
+        table,
+        title=f"[b magenta]Processes: {escape(name)}[/b magenta]",
+        border_style="dim",
+        box=box.MINIMAL,
     )
 
 
