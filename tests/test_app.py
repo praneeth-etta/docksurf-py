@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 from rich.console import Console
 from rich.table import Table as RichTable
+from rich.text import Text as RichText
 from textual.widgets import (
     Checkbox,
     DataTable,
@@ -23,6 +24,7 @@ from docksurf_py.actions import (
     VolumeActionHandler,
     _open_in_browser,
 )
+from docksurf_py.actions.clipboard import _yank_fields
 from docksurf_py.app import (
     DockSurfApp,
     _compose_actions,
@@ -63,6 +65,7 @@ from docksurf_py.models import (
     Volume,
 )
 from docksurf_py.session import SessionState
+from docksurf_py.topology import _network_members, _network_summary, network_topology
 from docksurf_py.widgets import (
     ConfirmDialog,
     ConnectionIndicator,
@@ -1632,6 +1635,47 @@ class NetworkActionTests(unittest.IsolatedAsyncioTestCase):
                 lambda: ("disconnect_container", "net1", "web") in svc.calls
             )
 
+    async def test_network_detail_shows_topology_diagram(self) -> None:
+        web = make_container("web")
+        web.networks = ["net1", "proxy"]
+        net = _network(
+            endpoints=[NetworkEndpoint(container_name="web", ipv4="172.18.0.2")]
+        )
+        svc = MockDockerService(lambda: DockerSnapshot([web], [], [], [net]))
+        app = DockSurfApp(docker=svc)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await self._on_networks(app, pilot)
+            pane = app.query_one(f"#{DETAIL_PANE_ID}", DetailPane)
+            console = Console(width=120)
+            with console.capture() as cap:
+                console.print(pane._topology_panel.content)
+            rendered = cap.get()
+            self.assertIn("net1", rendered)
+            self.assertIn("web", rendered)
+            self.assertIn("172.18.0.2", rendered)
+            self.assertIn("also on: proxy", rendered)
+
+    async def test_yank_network_copies_summary_directly(self) -> None:
+        web = make_container("web")
+        web.networks = ["net1"]
+        net = _network(
+            endpoints=[NetworkEndpoint(container_name="web", ipv4="172.18.0.2")]
+        )
+        svc = MockDockerService(lambda: DockerSnapshot([web], [], [], [net]))
+        app = DockSurfApp(docker=svc)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await self._on_networks(app, pilot)
+            app.action_yank()
+            await pilot.pause()
+            self.assertFalse(
+                any(isinstance(s, ContainerPickerScreen) for s in app.screen_stack)
+            )
+            self.assertIn("net1", app._clipboard)
+            self.assertIn("web", app._clipboard)
+            self.assertIn("172.18.0.2", app._clipboard)
+
     async def test_disconnect_no_endpoints_does_nothing(self) -> None:
         net = _network(endpoints=[])
         svc = MockDockerService(lambda: DockerSnapshot([], [], [], [net]))
@@ -1645,23 +1689,159 @@ class NetworkActionTests(unittest.IsolatedAsyncioTestCase):
                 any(isinstance(s, ContainerPickerScreen) for s in app.screen_stack)
             )
 
-    async def test_network_detail_shows_attached_endpoint(self) -> None:
+
+class NetworkTopologyHelperTests(unittest.TestCase):
+    """`_network_members` / `_topology_tree` / `_network_summary` / yank."""
+
+    def _net_and_containers(self) -> tuple[Network, list[Container]]:
+        web = make_container("web")
+        web.networks = ["net1", "proxy"]
+        web.ports = [PortBinding("80/tcp", "0.0.0.0", "8080")]
+        db = make_container("db", running=False)
+        db.networks = ["net1"]
         net = _network(
-            endpoints=[NetworkEndpoint(container_name="web", ipv4="172.18.0.2/16")]
+            endpoints=[NetworkEndpoint(container_name="web", ipv4="172.18.0.2")]
         )
-        svc = MockDockerService(lambda: DockerSnapshot([], [], [], [net]))
+        return net, [web, db]
+
+    def test_members_union_endpoints_and_stopped_containers(self) -> None:
+        net, containers = self._net_and_containers()
+        db, web = _network_members(net, containers)
+        self.assertEqual((db.name, web.name), ("db", "web"))
+        self.assertFalse(db.running)
+        self.assertEqual(db.ipv4, "")  # stopped: no endpoint, hence no IP
+        self.assertTrue(web.running)
+        self.assertEqual(web.ipv4, "172.18.0.2")
+        self.assertEqual(web.ports, "0.0.0.0:8080->80/tcp")
+        self.assertEqual(web.other_networks, ["proxy"])
+
+    def test_endpoint_without_snapshot_container_still_listed(self) -> None:
+        net = _network(
+            endpoints=[NetworkEndpoint(container_name="ghost", ipv4="172.18.0.9")]
+        )
+        (member,) = _network_members(net, [])
+        self.assertTrue(member.running)
+        self.assertEqual(member.ipv4, "172.18.0.9")
+
+    def _render(self, diagram, width: int = 120) -> str:
+        console = Console(width=width)
+        with console.capture() as cap:
+            console.print(diagram)
+        return cap.get()
+
+    def test_network_diagram_marks_state_and_cross_network(self) -> None:
+        net, containers = self._net_and_containers()
+        out = self._render(network_topology(net, containers))
+        self.assertIn("net1", out)
+        self.assertIn("also on: proxy", out)
+        self.assertIn("stopped", out)
+        self.assertIn("172.18.0.2", out)
+
+    def test_network_diagram_survives_narrow_width(self) -> None:
+        net, containers = self._net_and_containers()
+        out = self._render(network_topology(net, containers), width=30)
+        self.assertIn("web", out)
+        # Every rendered line fits the width — truncated, never wrapped.
+        self.assertTrue(all(len(ln) <= 30 for ln in out.splitlines()))
+
+    def test_radial_places_hub_between_members(self) -> None:
+        net, containers = self._net_and_containers()
+        lines = self._render(network_topology(net, containers), width=100)
+        rows = lines.splitlines()
+        hub = next(i for i, ln in enumerate(rows) if "net1" in ln)
+        db = next(i for i, ln in enumerate(rows) if "db" in ln)
+        web = next(i for i, ln in enumerate(rows) if "web" in ln)
+        # Radial: the hub sits *between* its members, not above them.
+        self.assertTrue(min(db, web) < hub < max(db, web))
+        # Connectors puncture the hub's borders as T-junctions.
+        self.assertIn("╧", lines)
+        self.assertIn("╤", lines)
+
+    def test_radial_falls_back_when_narrow(self) -> None:
+        net, containers = self._net_and_containers()
+        out = self._render(network_topology(net, containers), width=30)
+        # Stacked fallback puts the hub box first.
+        self.assertTrue(out.splitlines()[0].lstrip().startswith("╔"))
+
+    def test_radial_falls_back_when_crowded(self) -> None:
+        net = _network(
+            endpoints=[
+                NetworkEndpoint(container_name=f"c{i}", ipv4=f"172.18.0.{i}")
+                for i in range(7)  # one over _MAX_RADIAL
+            ]
+        )
+        out = self._render(network_topology(net, []), width=100)
+        self.assertTrue(out.splitlines()[0].lstrip().startswith("╔"))
+
+    def _rows_at_width(self, diagram, width: int) -> list[RichText]:
+        """The diagram's yielded rows at an exact render width — unlike
+        `_render`, console wrapping can't mask a too-wide row here."""
+        console = Console(width=width)
+        opts = console.options.update_width(width)
+        rows: list[RichText] = []
+        for item in diagram.__rich_console__(console, opts):
+            if isinstance(item, RichText):
+                rows.append(item)
+            else:  # the stacked-fallback _HubDiagram renderable
+                rows.extend(item.__rich_console__(console, opts))
+        return rows
+
+    def test_diagram_rows_fit_all_member_counts_and_widths(self) -> None:
+        for n in range(1, 9):
+            net = _network(
+                endpoints=[
+                    NetworkEndpoint(container_name=f"svc-{i}", ipv4=f"172.18.0.{i}")
+                    for i in range(n)
+                ]
+            )
+            diagram = network_topology(net, [])
+            for width in range(24, 121, 8):
+                rows = self._rows_at_width(diagram, width)
+                self.assertTrue(
+                    all(r.cell_len <= width for r in rows),
+                    f"row overflow at members={n} width={width}",
+                )
+
+    def test_summary_has_header_and_one_line_per_member(self) -> None:
+        net, containers = self._net_and_containers()
+        lines = _network_summary(net, containers).splitlines()
+        self.assertIn("net1", lines[0])
+        self.assertIn("172.18.0.0/16", lines[0])
+        self.assertIn("gateway 172.18.0.1", lines[0])
+        self.assertTrue(
+            any(
+                "web" in ln and "running" in ln and "also on: proxy" in ln
+                for ln in lines[1:]
+            )
+        )
+        self.assertTrue(any("db" in ln and "stopped" in ln for ln in lines[1:]))
+
+    def test_summary_for_empty_network(self) -> None:
+        self.assertIn("(no containers attached)", _network_summary(_network(), []))
+
+    def test_yank_fields_for_network_is_single_summary(self) -> None:
+        # A single field means action_yank copies it directly, no picker.
+        net, containers = self._net_and_containers()
+        fields = _yank_fields(net, containers)
+        self.assertEqual([label for label, _ in fields], ["Network summary"])
+        self.assertIn("web", fields[0][1])
+
+
+class ContainerTopologyPaneTests(unittest.IsolatedAsyncioTestCase):
+    async def test_selecting_container_leaves_topology_panel_empty(self) -> None:
+        # The diagram is a Networks-tab feature; a container selection must
+        # not draw one (and must clear any left over from the Networks tab).
+        web = make_container("web")
+        web.networks = ["net1"]
+        svc = MockDockerService(lambda: DockerSnapshot([web], [], [], [_network()]))
         app = DockSurfApp(docker=svc)
         async with app.run_test() as pilot:
             await pilot.pause()
-            await self._on_networks(app, pilot)
+            await wait_until(lambda: bool(app._current.get(TabID.CONTAINERS)))
+            app.query_one(f"#{TableID.CONTAINERS}", DataTable).move_cursor(row=0)
+            await pilot.pause()
             pane = app.query_one(f"#{DETAIL_PANE_ID}", DetailPane)
-            # Render the detail Panel to text and assert the endpoint shows up.
-            console = Console(width=200)
-            with console.capture() as cap:
-                console.print(pane._panel.content)
-            out = cap.get()
-            self.assertIn("web", out)
-            self.assertIn("172.18.0.2", out)
+            self.assertEqual(str(pane._topology_panel.content), "")
 
 
 class ContextSwitchTests(unittest.IsolatedAsyncioTestCase):

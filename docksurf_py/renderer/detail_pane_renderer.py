@@ -30,6 +30,7 @@ from docksurf_py.renderer.table_renderer import (
     _status_color,
     _status_markup,
 )
+from docksurf_py.topology import network_topology
 from docksurf_py.widgets import DetailPane
 
 
@@ -92,6 +93,7 @@ class DetailPaneRenderer(_Base):
             health_log=_format_health_log(c.health_log),
             border_style=_status_color(c),
         )
+        pane.clear_topology()
 
     def _show_project_details(self, pane: DetailPane, project: ComposeProject) -> None:
         services = "\n".join(
@@ -109,6 +111,7 @@ class DetailPaneRenderer(_Base):
             {"": details},
             border_style=_project_status_color(project),
         )
+        pane.clear_topology()
 
     def _show_image_details(self, pane: DetailPane, row: int) -> None:
         images = self._current.get(TabID.IMAGES, [])
@@ -147,6 +150,7 @@ class DetailPaneRenderer(_Base):
             {"Identity": identity, "Details": info, "Usage": usage},
             border_style=border_style,
         )
+        pane.clear_topology()
 
     def _show_volume_details(self, pane: DetailPane, row: int) -> None:
         volumes = self._current.get(TabID.VOLUMES, [])
@@ -175,6 +179,7 @@ class DetailPaneRenderer(_Base):
             {"Identity": identity, "Usage": usage},
             border_style=STATUS_GREEN if volume.used_by else STATUS_YELLOW,
         )
+        pane.clear_topology()
 
     def _show_network_details(self, pane: DetailPane, row: int) -> None:
         networks = self._current.get(TabID.NETWORKS, [])
@@ -182,14 +187,6 @@ class DetailPaneRenderer(_Base):
             return
         network = networks[row]
 
-        if network.endpoints:
-            attached = "\n".join(
-                f"{ep.container_name}: {ep.ipv4 or '—'}"
-                + (f" / {ep.mac}" if ep.mac else "")
-                for ep in network.endpoints
-            )
-        else:
-            attached = "None"
         identity = {
             "ID": _dim(network.id),
             "Driver": network.driver,
@@ -202,9 +199,10 @@ class DetailPaneRenderer(_Base):
 
         pane.update_details(
             f"Network: {network.name}",
-            {
-                "Identity": identity,
-                "Addressing": addressing,
-                "Attached": {"Containers": attached},
-            },
+            {"Identity": identity, "Addressing": addressing},
         )
+        # The attached-containers list is drawn as the topology diagram below
+        # the panel (endpoints joined with snapshot containers), replacing the
+        # old plaintext "Attached" section.
+        containers = self.snapshot.containers if self.snapshot else []
+        pane.update_topology(network_topology(network, containers))

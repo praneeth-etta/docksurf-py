@@ -13,17 +13,19 @@ from docksurf_py.constants import SafeMarkup
 class DetailPane(VerticalScroll):
     """A custom container that displays a key-value table and collapsible extras.
 
-    The `_stats_panel` and `_top_panel` regions show live resource usage and
-    (on-demand) running processes for the selected container; both update
-    independently of `update_details` (which rebuilds the main panel +
-    collapsibles) so neither resets the other or the collapsibles. Both
-    renderables are built by the controller, keeping this widget display-only
-    (no Docker/model imports).
+    The `_stats_panel`, `_top_panel`, and `_topology_panel` regions show live
+    resource usage, (on-demand) running processes, and the network-topology
+    diagram for the selected item; each updates independently of
+    `update_details` (which rebuilds the main panel + collapsibles) so none
+    resets the others or the collapsibles. All three renderables are built by
+    the controller, keeping this widget display-only (no Docker/model
+    imports).
     """
 
     _panel: Static
     _stats_panel: Static
     _top_panel: Static
+    _topology_panel: Static
     _env_collapsible: "Collapsible | None" = None
     _health_collapsible: "Collapsible | None" = None
 
@@ -36,6 +38,14 @@ class DetailPane(VerticalScroll):
         yield self._stats_panel
         self._top_panel = Static("")
         yield self._top_panel
+        self._topology_panel = Static("")
+        yield self._topology_panel
+
+    def update_topology(self, content) -> None:
+        self._topology_panel.update(content)
+
+    def clear_topology(self) -> None:
+        self._topology_panel.update("")
 
     def update_live_stats(self, content) -> None:
         self._stats_panel.update(content)
@@ -115,6 +125,7 @@ class DetailPane(VerticalScroll):
         self._panel.update(Panel("Select an item to view details.", border_style="dim"))
         self._stats_panel.update("")
         self._top_panel.update("")
+        self._topology_panel.update("")
         if self._env_collapsible is not None:
             self._env_collapsible.remove()
             self._env_collapsible = None
