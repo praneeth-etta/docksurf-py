@@ -1,3 +1,4 @@
+import asyncio
 import os
 import unittest
 from unittest.mock import MagicMock, patch
@@ -363,6 +364,29 @@ class LiveObservabilityAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(
                 any(isinstance(s, SystemDfScreen) for s in app.screen_stack)
             )
+
+    async def test_system_df_failure_notifies_instead_of_opening_screen(self) -> None:
+        """Regression (BF-2): a daemon that dies mid-`system_df` must notify
+        an error, not crash the `@work(thread=True)` worker or push a blank
+        screen."""
+        svc = MockDockerService(lambda: EMPTY_SNAPSHOT)
+        svc._connected = False
+        svc.system_df = lambda: SystemDf(  # type: ignore[method-assign]
+            entries=[], total_size=0, total_reclaimable=0
+        )
+        app = DockSurfApp(docker=svc)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            with patch.object(app, "notify") as notify:
+                app.action_system_df()
+                await pilot.pause()
+                await asyncio.sleep(0.05)
+                await pilot.pause()
+                self.assertFalse(
+                    any(isinstance(s, SystemDfScreen) for s in app.screen_stack)
+                )
+                messages = [call.args[0] for call in notify.call_args_list]
+                self.assertTrue(any("disk usage" in m.lower() for m in messages))
 
     async def test_container_top_fetches_then_toggles_off(self) -> None:
         snap = DockerSnapshot([make_container("web", running=True)], [], [], [])

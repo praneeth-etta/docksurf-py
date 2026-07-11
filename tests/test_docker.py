@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, patch
 
 from docker.errors import APIError, DockerException, NotFound
 
-from docksurf_py.connection import ConnectionStatus
+from docksurf_py.connection import ConnectionState, ConnectionStatus
 from docksurf_py.docker import DockerClient, format_size
 from docksurf_py.models import CommandErrorKind, ContainerTop, DockerSnapshot
 
@@ -843,6 +843,37 @@ class VolumeWriteTests(unittest.TestCase):
     def test_volume_sizes_not_connected_returns_empty(self) -> None:
         client = DockerClient()
         self.assertEqual(client.volume_sizes(), {})
+
+
+class SystemDfTests(unittest.TestCase):
+    """Regression (BF-2): `system_df` must not raise into its `@work` caller
+    when the daemon dies mid-call — mirrors `volume_sizes`'s try/except shape."""
+
+    def _client(self) -> DockerClient:
+        client = DockerClient()
+        client._sdk = MagicMock()
+        return client
+
+    def test_daemon_error_returns_empty_and_marks_disconnected(self) -> None:
+        client = self._client()
+        client.connection = ConnectionState(
+            status=ConnectionStatus.CONNECTED,
+            message="Connected",
+            hint="",
+            context="default",
+            host="unix:///var/run/docker.sock",
+        )
+        client._sdk.df.side_effect = DockerException("daemon went away")
+        result = client.system_df()
+        self.assertEqual(result.entries, [])
+        self.assertEqual(result.total_size, 0)
+        self.assertEqual(result.total_reclaimable, 0)
+        self.assertFalse(client.is_connected)
+
+    def test_not_connected_returns_empty(self) -> None:
+        client = DockerClient()
+        result = client.system_df()
+        self.assertEqual(result.entries, [])
 
 
 class NetworkWriteTests(unittest.TestCase):

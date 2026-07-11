@@ -395,11 +395,18 @@ class DockerClient:
         """Disk usage per resource category (`docker system df`).
 
         Slow on the daemon side (it sums layer/volume sizes), so callers should
-        run this off the UI thread and never on the snapshot path.
+        run this off the UI thread and never on the snapshot path. Mirrors
+        `volume_sizes`'s try/except shape, a daemon that dies mid-call must
+        not raise into the caller's worker.
         """
         if not self._sdk:
             return SystemDf(entries=[], total_size=0, total_reclaimable=0)
-        raw = self._sdk.df()
+        try:
+            raw = self._sdk.df()
+        except (APIError, DockerException, requests.exceptions.RequestException) as e:
+            logger.warning("system_df failed: %s", e)
+            self.mark_disconnected(e)
+            return SystemDf(entries=[], total_size=0, total_reclaimable=0)
         return _parse_system_df(raw)
 
     # --- Writes ---
@@ -641,7 +648,9 @@ class DockerClient:
         """Full raw attrs for one resource — the `docker inspect` escape hatch.
 
         `kind` matches `_row_key()`'s first element (container/image/volume/
-        network) so callers can pass a row key straight through.
+        network) so callers can pass a row key straight through — except an
+        image `ref`, which must be the plain image id, not `_row_key()`'s
+        `id|repo:tag` composite (see `actions/inspect.py`).
         """
         sdk = self._sdk
         if not sdk:

@@ -13,6 +13,7 @@ from docksurf_py.constants import TabID
 from docksurf_py.models import (
     CommandErrorKind,
     CommandResult,
+    ComposeProject,
     Container,
     Image,
     Network,
@@ -78,6 +79,8 @@ class ResourceDeletionHandler(_Base):
                 self.start_refresh()
 
     def _plan_container_delete(self, c: Container) -> DeletePlan | None:
+        if not isinstance(c, Container):
+            return None
         is_running = c.running
         msg = (
             f"Force-remove RUNNING container '{escape(c.name)}'?"
@@ -94,14 +97,17 @@ class ResourceDeletionHandler(_Base):
     def _plan_image_delete(self, img: Image) -> DeletePlan | None:
         in_use = bool(img.used_by)
         img_label = f"{escape(img.repository)}:{escape(img.tag)}"
+        remove_ref = img.id if img.is_dangling else f"{img.repository}:{img.tag}"
         msg = (
             f"Force-remove IN-USE image '{img_label}'?"
             if in_use
             else f"Remove image '{img_label}'?"
         )
+        if not img.is_dangling:
+            msg += " Untags only — the image is removed once its last tag is gone."
         return DeletePlan(
             confirm_message=msg,
-            command=lambda force: self.docker.remove_image(img.id, force=force),
+            command=lambda force: self.docker.remove_image(remove_ref, force=force),
             success_message=f"Removed image {img_label}",
             force_default=in_use,
         )
@@ -170,6 +176,13 @@ class ResourceDeletionHandler(_Base):
         item = self._get_focused_resource(active)
         if item is None:
             self.notify(f"No {entry.label} selected", severity="warning")
+            return
+
+        if isinstance(item, ComposeProject):
+            # `d` on a Compose project header has no single container to
+            # delete, route to the project-wide teardown instead (already
+            # confirms via ConfirmDialog when Config.confirm_compose_down).
+            self.action_compose_down()
             return
 
         plan = entry.plan_delete(item)

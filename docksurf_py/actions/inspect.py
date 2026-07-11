@@ -7,7 +7,7 @@ from textual import work
 from textual.widgets import TabbedContent
 
 from docksurf_py.actions.common import _Base, _display_name
-from docksurf_py.models import ComposeProject
+from docksurf_py.models import ComposeProject, Image
 from docksurf_py.widgets import InspectScreen
 
 
@@ -32,6 +32,9 @@ class InspectHandler(_Base):
             self.notify("Nothing selected to inspect", severity="warning")
             return
         kind, ref = key
+        if isinstance(item, Image):
+            # An image's row key carries `id|repo:tag` for per-tag identity
+            ref = item.id
         self._execute_inspect(kind, ref, _display_name(item))
 
     @work(thread=True)

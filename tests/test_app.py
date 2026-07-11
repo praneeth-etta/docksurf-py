@@ -1,16 +1,19 @@
 import asyncio
 import threading
 import unittest
+from dataclasses import replace
 from typing import Callable
 from unittest.mock import patch
 
 from rich.console import Console
 from rich.table import Table as RichTable
 from rich.text import Text as RichText
+from textual.app import App
 from textual.widgets import (
     Checkbox,
     DataTable,
     Input,
+    Label,
     LoadingIndicator,
     RichLog,
     Static,
@@ -40,7 +43,9 @@ from docksurf_py.constants import (
     CONNECTION_INDICATOR_ID,
     DETAIL_PANE_ID,
     EMPTY_STATE_IDS,
+    LOG_PANE_HEADER_ID,
     LOG_PANE_ID,
+    PULL_PROGRESS_VIEW_ID,
     SEARCH_BAR_ID,
     STATUS_BAR_ID,
     LogLine,
@@ -677,6 +682,90 @@ class ComposeGroupingTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(collapsed_rows), full_rows - 2)
             self.assertIn("myapp", app._collapsed_projects)
 
+    async def test_delete_on_project_header_routes_to_compose_down(self) -> None:
+        """Regression (BF-1): `d` on a Compose project header used to crash
+        the app — `_plan_container_delete` read `.running` off a
+        `ComposeProject`, which doesn't have it. It must now route to
+        `action_compose_down` instead."""
+        svc = MockDockerService(_compose_snapshot)
+        app = DockSurfApp(docker=svc)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await wait_until(lambda: bool(app._current.get(TabID.CONTAINERS)))
+            table = app.query_one(f"#{TableID.CONTAINERS}", DataTable)
+            table.move_cursor(row=0)
+            self.assertTrue(app._focused_is_project_header())
+
+            app.action_delete()
+            await wait_until(
+                lambda: any(isinstance(s, ConfirmDialog) for s in app.screen_stack)
+            )
+            app.screen_stack[-1].dismiss(True)
+            await wait_until(lambda: ("compose_action", "myapp", "down") in svc.calls)
+            self.assertNotIn(
+                ("remove_container", "myapp"),
+                [c[:2] for c in svc.calls],
+            )
+
+
+class BulkContainerActionTests(unittest.IsolatedAsyncioTestCase):
+    """Regression (BF-4): restart now honors marks like stop/start do, and
+    all three bulk verbs are gated to the Containers tab being active."""
+
+    def _two_container_snapshot(self) -> DockerSnapshot:
+        return DockerSnapshot(
+            containers=[
+                make_container("a", running=True),
+                make_container("b", running=True),
+            ],
+            images=[],
+            volumes=[],
+            networks=[],
+        )
+
+    async def test_restart_honors_marked_containers(self) -> None:
+        svc = MockDockerService(self._two_container_snapshot)
+        app = DockSurfApp(docker=svc)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await wait_until(lambda: bool(app._current.get(TabID.CONTAINERS)))
+            table = app.query_one(f"#{TableID.CONTAINERS}", DataTable)
+            table.focus()
+            table.move_cursor(row=0)
+            app.action_toggle_mark()
+            table.move_cursor(row=1)
+            app.action_toggle_mark()
+            await pilot.pause()
+
+            app.action_restart_container()
+            await wait_until(lambda: ("restart_container", "a") in svc.calls)
+            await wait_until(lambda: ("restart_container", "b") in svc.calls)
+
+    async def test_bulk_verbs_ignore_marks_from_another_tab(self) -> None:
+        svc = MockDockerService(self._two_container_snapshot)
+        app = DockSurfApp(docker=svc)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await wait_until(lambda: bool(app._current.get(TabID.CONTAINERS)))
+            table = app.query_one(f"#{TableID.CONTAINERS}", DataTable)
+            table.focus()
+            table.move_cursor(row=0)
+            app.action_toggle_mark()
+            await pilot.pause()
+            self.assertTrue(app._marked[TabID.CONTAINERS])
+
+            app.query_one(TabbedContent).active = TabID.IMAGES
+            await pilot.pause()
+
+            with patch.object(app, "notify") as notify:
+                app.action_stop_container()
+                await pilot.pause()
+                notify.assert_called_once()
+            self.assertEqual(
+                [c for c in svc.calls if c[0] == "stop_container"],
+                [],
+            )
+
 
 class TabNavigationTests(unittest.IsolatedAsyncioTestCase):
     """SearchBar (an Input) holds default focus on mount and would otherwise
@@ -1208,6 +1297,63 @@ class ExecCustomActionTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(any(isinstance(s, PromptScreen) for s in app.screen_stack))
 
 
+class ExecContainerActionTests(unittest.IsolatedAsyncioTestCase):
+    """Regression (BF-5): `e`'s shell probe used to run inline on the UI
+    thread; it must now go through `asyncio.to_thread` (same pattern as `E`/
+    `action_exec_custom`) so a slow daemon can't freeze the whole TUI."""
+
+    _HAS_SHELL_PATCH_TARGET = (
+        "docksurf_py.actions.ContainerActionHandler._container_has_shell"
+    )
+    _WHICH_PATCH_TARGET = "docksurf_py.actions.container.shutil.which"
+
+    async def _select_first_row(self, app: DockSurfApp) -> None:
+        await wait_until(lambda: bool(app._current.get(TabID.CONTAINERS)))
+        table = app.query_one(f"#{TableID.CONTAINERS}", DataTable)
+        table.move_cursor(row=0)
+
+    async def test_exec_runs_shell_probe_via_to_thread_and_execs_detected_shell(
+        self,
+    ) -> None:
+        snapshot = _standalone_snapshot(running=True)
+        app = DockSurfApp(docker=MockDockerService(lambda: snapshot))
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await self._select_first_row(app)
+
+            with (
+                patch(self._HAS_SHELL_PATCH_TARGET, return_value=True),
+                patch(self._WHICH_PATCH_TARGET, return_value="/usr/bin/docker"),
+                patch(
+                    "docksurf_py.actions.container.asyncio.to_thread",
+                    wraps=asyncio.to_thread,
+                ) as to_thread,
+                patch.object(app, "_run_interactive_exec") as run_exec,
+            ):
+                app.action_exec_container()
+                await wait_until(lambda: run_exec.called)
+                to_thread.assert_called_once()
+                argv = run_exec.call_args[0][1]
+                self.assertEqual(argv, ["docker", "exec", "-it", "web", "bash"])
+
+    async def test_exec_notifies_when_no_shell_found(self) -> None:
+        snapshot = _standalone_snapshot(running=True)
+        app = DockSurfApp(docker=MockDockerService(lambda: snapshot))
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await self._select_first_row(app)
+
+            with (
+                patch(self._HAS_SHELL_PATCH_TARGET, return_value=False),
+                patch(self._WHICH_PATCH_TARGET, return_value="/usr/bin/docker"),
+                patch.object(app, "notify") as notify,
+                patch.object(app, "_run_interactive_exec") as run_exec,
+            ):
+                app.action_exec_container()
+                await wait_until(lambda: notify.called)
+                run_exec.assert_not_called()
+
+
 class CopyFilesActionTests(unittest.IsolatedAsyncioTestCase):
     async def _select_first_row(self, app: DockSurfApp) -> None:
         await wait_until(lambda: bool(app._current.get(TabID.CONTAINERS)))
@@ -1317,6 +1463,19 @@ class LogViewerTests(unittest.IsolatedAsyncioTestCase):
             texts = [line.text for line in log_pane._line_buffer]
             self.assertEqual(texts, ["starting up", "request handled", "boom"])
             self.assertEqual(log_pane._line_buffer[2].stream, "stderr")
+
+    async def test_header_hints_lowercase_l_to_close(self) -> None:
+        """Regression (BF-8): the footer said "L to close" while the actual
+        binding is lowercase `l`."""
+        snapshot = _standalone_snapshot(running=True)
+        app = DockSurfApp(docker=MockDockerService(lambda: snapshot))
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            log_pane = await self._open_logs(app, pilot)
+            header = log_pane.query_one(f"#{LOG_PANE_HEADER_ID}", Label)
+            text = str(header.render())
+            self.assertIn("l to close", text)
+            self.assertNotIn("L to close", text)
 
     async def test_toggle_timestamps_and_wrap_via_keys(self) -> None:
         snapshot = _standalone_snapshot(running=True)
@@ -1474,6 +1633,45 @@ class ImageActionTests(unittest.IsolatedAsyncioTestCase):
             app.screen_stack[-1].dismiss(["busybox"])
             await wait_until(lambda: ("stream_pull", "busybox", "latest") in svc.calls)
 
+    async def test_pull_completes_reports_success_and_refreshes(self) -> None:
+        svc = MockDockerService(lambda: DockerSnapshot([], [_image()], [], []))
+        app = DockSurfApp(docker=svc)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await self._on_images(app, pilot)
+            with patch.object(app, "notify") as notify:
+                app.action_pull_image()
+                await wait_until(
+                    lambda: any(isinstance(s, PromptScreen) for s in app.screen_stack)
+                )
+                app.screen_stack[-1].dismiss(["busybox"])
+                await wait_until(
+                    lambda: any(
+                        str(c.args[0]).startswith("Pulled busybox:latest")
+                        for c in notify.call_args_list
+                    )
+                )
+
+    async def test_pull_abort_mid_stream_does_not_claim_success(self) -> None:
+        """Regression (BF-6): if delivering a progress line to the screen
+        fails partway through the stream (e.g. the screen was torn down),
+        `_finish_pull` must not report "Pulled ..." — the pull's real
+        outcome on the daemon side is unknown once we lose the display."""
+        svc = MockDockerService(lambda: EMPTY_SNAPSHOT)
+        app = DockSurfApp(docker=svc)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            screen = PullProgressScreen("Pulling busybox:latest")
+            with (
+                patch.object(screen, "append", side_effect=RuntimeError("screen gone")),
+                patch.object(app, "notify") as notify,
+            ):
+                app._execute_pull(screen, "busybox", "latest")
+                await wait_until(lambda: notify.called)
+            messages = [str(c.args[0]) for c in notify.call_args_list]
+            self.assertTrue(any("Lost the progress display" in m for m in messages))
+            self.assertFalse(any(m.startswith("Pulled ") for m in messages))
+
     async def test_pull_guarded_off_images_tab(self) -> None:
         svc = MockDockerService(lambda: EMPTY_SNAPSHOT)
         app = DockSurfApp(docker=svc)
@@ -1525,8 +1723,87 @@ class ImageActionTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             self.assertEqual(
                 app._marked[TabID.IMAGES],
-                {("image", "sha256:d1"), ("image", "sha256:d2")},
+                {
+                    ("image", "sha256:d1|<none>:<none>"),
+                    ("image", "sha256:d2|<none>:<none>"),
+                },
             )
+
+
+class MultiTagImageTests(unittest.IsolatedAsyncioTestCase):
+    """Regression (BF-3): `get_images` emits one row per tag, all sharing the
+    same `id` — row identity now includes the tag so marking, selection
+    restore, and delete are per-tag-row-accurate instead of colliding."""
+
+    def _two_tag_snapshot(self) -> DockerSnapshot:
+        return DockerSnapshot(
+            containers=[],
+            images=[
+                _image(repo="myapp", tag="v1", image_id="sha256:shared"),
+                _image(repo="myapp", tag="v2", image_id="sha256:shared"),
+            ],
+            volumes=[],
+            networks=[],
+        )
+
+    async def test_marking_one_tag_row_does_not_mark_the_other(self) -> None:
+        svc = MockDockerService(self._two_tag_snapshot)
+        app = DockSurfApp(docker=svc)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.query_one(TabbedContent).active = TabID.IMAGES
+            await pilot.pause()
+            await wait_until(lambda: bool(app._current.get(TabID.IMAGES)))
+            table = app.query_one(f"#{TableID.IMAGES}", DataTable)
+            table.focus()
+            table.move_cursor(row=0)
+
+            app.action_toggle_mark()
+            await pilot.pause()
+            self.assertEqual(len(app._marked[TabID.IMAGES]), 1)
+
+    async def test_delete_removes_by_name_tag_not_shared_id(self) -> None:
+        """Deleting one tag row must untag by `repo:tag`, not remove by the
+        id shared with the other tag row."""
+        svc = MockDockerService(self._two_tag_snapshot)
+        app = DockSurfApp(docker=svc)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.query_one(TabbedContent).active = TabID.IMAGES
+            await pilot.pause()
+            await wait_until(lambda: bool(app._current.get(TabID.IMAGES)))
+            table = app.query_one(f"#{TableID.IMAGES}", DataTable)
+            table.move_cursor(row=0)
+
+            app.action_delete()
+            await wait_until(
+                lambda: any(isinstance(s, ConfirmDialog) for s in app.screen_stack)
+            )
+            app.screen_stack[-1].dismiss((True, False))
+            await wait_until(lambda: any(c[0] == "remove_image" for c in svc.calls))
+            remove_calls = [c for c in svc.calls if c[0] == "remove_image"]
+            self.assertEqual(len(remove_calls), 1)
+            self.assertEqual(remove_calls[0][1], "myapp:v1")
+
+    async def test_dangling_image_still_removed_by_id(self) -> None:
+        img = _image(repo="<none>", tag="<none>", dangling=True, image_id="sha256:d1")
+        svc = MockDockerService(lambda: DockerSnapshot([], [img], [], []))
+        app = DockSurfApp(docker=svc)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.query_one(TabbedContent).active = TabID.IMAGES
+            await pilot.pause()
+            await wait_until(lambda: bool(app._current.get(TabID.IMAGES)))
+            app.query_one(f"#{TableID.IMAGES}", DataTable).move_cursor(row=0)
+
+            app.action_delete()
+            await wait_until(
+                lambda: any(isinstance(s, ConfirmDialog) for s in app.screen_stack)
+            )
+            app.screen_stack[-1].dismiss((True, False))
+            await wait_until(lambda: any(c[0] == "remove_image" for c in svc.calls))
+            remove_calls = [c for c in svc.calls if c[0] == "remove_image"]
+            self.assertEqual(remove_calls[0][1], "sha256:d1")
 
 
 class VolumeActionTests(unittest.IsolatedAsyncioTestCase):
@@ -1614,6 +1891,34 @@ class NetworkActionTests(unittest.IsolatedAsyncioTestCase):
             )
             app.screen_stack[-1].dismiss("web")
             await wait_until(lambda: ("connect_container", "net1", "web") in svc.calls)
+
+    async def test_connect_picker_excludes_stopped_but_attached_container(
+        self,
+    ) -> None:
+        """Regression (BF-7): `Network.endpoints` only lists running
+        containers (Docker's network inspect omits stopped ones), so a
+        stopped container already attached via its own `.networks` list used
+        to show up as connectable and fail when picked."""
+        running = make_container(name="web", running=True)
+        stopped = replace(make_container(name="db", running=False), networks=["net1"])
+        net = _network()  # no endpoints — "db" isn't running, so none listed
+        svc = MockDockerService(
+            lambda: DockerSnapshot([running, stopped], [], [], [net])
+        )
+        app = DockSurfApp(docker=svc)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await self._on_networks(app, pilot)
+            app.action_network_connect()
+            await wait_until(
+                lambda: any(
+                    isinstance(s, ContainerPickerScreen) for s in app.screen_stack
+                )
+            )
+            picker = app.screen_stack[-1]
+            assert isinstance(picker, ContainerPickerScreen)
+            offered_ids = {container_id for container_id, _ in picker._options}
+            self.assertEqual(offered_ids, {"web"})
 
     async def test_disconnect_lists_attached_and_disconnects(self) -> None:
         net = _network(
@@ -2218,6 +2523,32 @@ class DeleteForceTests(unittest.IsolatedAsyncioTestCase):
                 ("disconnect_container", "net1", "web"),
                 svc.calls,
             )
+
+
+class PullProgressScreenBufferTests(unittest.IsolatedAsyncioTestCase):
+    """Regression (BF-6): a pull chunk can arrive before the modal finishes
+    mounting — `append` must buffer it instead of a bare `query_one` raising
+    and killing the pump thread."""
+
+    async def test_append_before_mount_does_not_raise(self) -> None:
+        screen = PullProgressScreen("Pulling busybox:latest")
+        screen.append("first line")  # not mounted yet — must not raise
+        self.assertEqual(screen._pending_lines, ["first line"])
+
+    async def test_buffered_lines_flush_on_mount(self) -> None:
+        app = App()
+        async with app.run_test() as pilot:
+            screen = PullProgressScreen("Pulling busybox:latest")
+            screen.append("buffered before mount")
+            self.assertEqual(screen._pending_lines, ["buffered before mount"])
+
+            await app.push_screen(screen)
+            await pilot.pause()
+
+            self.assertEqual(screen._pending_lines, [])
+            log = screen.query_one(f"#{PULL_PROGRESS_VIEW_ID}", RichLog)
+            rendered = "".join(strip.text for strip in log.lines)
+            self.assertIn("buffered before mount", rendered)
 
 
 class OpenInBrowserTests(unittest.TestCase):

@@ -210,6 +210,11 @@ class LiveStatsController(_Base):
     def action_system_df(self) -> None:
         self.call_from_thread(self.notify, "Computing disk usage…")
         df: SystemDf = self.docker.system_df()
+        if not df.entries and not self.docker.is_connected:
+            self.call_from_thread(
+                self.notify, "Could not compute disk usage", severity="error"
+            )
+            return
         self.call_from_thread(self.push_screen, SystemDfScreen(_render_df(df)))
 
     # --- `t`: on-demand running-process snapshot ---

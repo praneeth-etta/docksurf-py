@@ -61,8 +61,10 @@ class NetworkActionHandler(_Base):
         net = self._require_network()
         if net is None:
             return
-        attached = {ep.container_name for ep in net.endpoints}
         containers = self.snapshot.containers if self.snapshot else []
+        attached = {ep.container_name for ep in net.endpoints} | {
+            c.name for c in containers if net.name in c.networks
+        }
         options = [(c.id, c.name) for c in containers if c.name not in attached]
         if not options:
             self.notify(

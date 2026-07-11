@@ -157,6 +157,7 @@ class ImageActionHandler(_Base):
     ) -> None:
         stream = self.docker.stream_pull(repository, tag)
         error: str | None = None
+        aborted = False
         last: dict[str, str] = {}
         for chunk in stream:
             if not isinstance(chunk, dict):
@@ -176,9 +177,12 @@ class ImageActionHandler(_Base):
             try:
                 self.call_from_thread(screen.append, line)
             except Exception:
+                aborted = True
                 break
         try:
-            self.call_from_thread(self._finish_pull, screen, repository, tag, error)
+            self.call_from_thread(
+                self._finish_pull, screen, repository, tag, error, aborted
+            )
         except Exception:
             pass
 
@@ -188,7 +192,20 @@ class ImageActionHandler(_Base):
         repository: str,
         tag: str,
         error: str | None,
+        aborted: bool = False,
     ) -> None:
+        if aborted:
+            logger.warning(
+                "Pull progress display for %s:%s lost mid-stream — outcome unknown",
+                repository,
+                tag,
+            )
+            self.notify(
+                f"Lost the progress display for {repository}:{tag} — check "
+                "`docker images` for the result",
+                severity="warning",
+            )
+            return
         if error:
             self.notify(f"Pull failed: {error}", severity="error")
         else:

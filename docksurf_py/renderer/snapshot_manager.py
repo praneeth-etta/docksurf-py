@@ -154,7 +154,11 @@ class SnapshotManager(_Base):
         if isinstance(item, ComposeProject):
             return ("project", item.name)
         if isinstance(item, Image):
-            return ("image", item.id)
+            # `get_images()` emits one row per tag, all sharing `item.id` —
+            # the tag must be part of the identity, or marking/selection
+            # restore/delete on one tag row would silently affect every tag
+            # row of the same image (BF-3).
+            return ("image", f"{item.id}|{item.repository}:{item.tag}")
         if isinstance(item, Volume):
             return ("volume", item.name)
         if isinstance(item, Network):

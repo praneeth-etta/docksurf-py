@@ -190,9 +190,17 @@ class ContainerActionHandler(_Base):
                 # Our snapshot is stale — the container is already gone.
                 self.start_refresh()
 
+    def _marked_containers_pending(self) -> bool:
+        """True only when there are marked containers AND the Containers tab
+        is active. Without the tab guard, pressing a bulk verb while on
+        another tab would silently act on marks left over from Containers."""
+        return bool(self._marked.get(TabID.CONTAINERS)) and (
+            self.query_one(TabbedContent).active == TabID.CONTAINERS
+        )
+
     def action_stop_container(self) -> None:
         # Marked containers win over the focused row — bulk stop the set.
-        if self._marked.get(TabID.CONTAINERS):
+        if self._marked_containers_pending():
             self._run_bulk_container_verb(
                 verb="Stop",
                 command=self.docker.stop_container,
@@ -213,7 +221,7 @@ class ContainerActionHandler(_Base):
         )
 
     def action_start_container(self) -> None:
-        if self._marked.get(TabID.CONTAINERS):
+        if self._marked_containers_pending():
             self._run_bulk_container_verb(
                 verb="Start",
                 command=self.docker.start_container,
@@ -261,6 +269,13 @@ class ContainerActionHandler(_Base):
         self._run_bulk(TabID.CONTAINERS, verb, jobs)
 
     def action_restart_container(self) -> None:
+        if self._marked_containers_pending():
+            self._run_bulk_container_verb(
+                verb="Restart",
+                command=self.docker.restart_container,
+                include=lambda c: True,
+            )
+            return
         if self._focused_is_project_header():
             self.action_compose_restart()
             return
@@ -338,13 +353,16 @@ class ContainerActionHandler(_Base):
                 severity="warning",
             )
 
-    def action_exec_container(self) -> None:
+    @work
+    async def action_exec_container(self) -> None:
         c = self._exec_preflight()
         if c is None:
             return
 
-        shell = select_exec_shell(
-            EXEC_SHELL_CANDIDATES, lambda sh: self._container_has_shell(c.id, sh)
+        shell = await asyncio.to_thread(
+            select_exec_shell,
+            EXEC_SHELL_CANDIDATES,
+            lambda sh: self._container_has_shell(c.id, sh),
         )
         if shell is None:
             logger.warning("Exec aborted — no usable shell found in %s", c.id)

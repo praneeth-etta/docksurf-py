@@ -186,7 +186,7 @@ class LogPane(Widget):
         elif self._following:
             state = "  |  [bold green][FOLLOWING][/]"
         else:
-            state = "  |  [dim]stream ended[/]  |  L to close"
+            state = "  |  [dim]stream ended[/]  |  l to close"
         self.query_one(f"#{LOG_PANE_HEADER_ID}", Label).update(
             f"Logs: {escape(self._container_name)}{state}{filter_hint}"
         )
