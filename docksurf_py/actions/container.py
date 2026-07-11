@@ -18,7 +18,13 @@ from textual.widgets import DataTable, TabbedContent
 
 from docksurf_py.actions.common import _PROJECT_HINT, _Base
 from docksurf_py.constants import DETAIL_PANE_ID, LOG_PANE_ID, LogOptions, TabID
-from docksurf_py.models import CommandErrorKind, CommandResult, Container, PortBinding
+from docksurf_py.models import (
+    CommandErrorKind,
+    CommandResult,
+    Container,
+    ContainerDetail,
+    PortBinding,
+)
 from docksurf_py.paths import DATA_DIR
 from docksurf_py.widgets import (
     ContainerPickerScreen,
@@ -138,6 +144,51 @@ class ContainerActionHandler(_Base):
     """Start, stop, restart, exec, and log actions scoped to containers."""
 
     _CONTAINER_TAB_HINT = "Switch to the Containers tab and select a container"
+    # Container whose detail fetch is currently in flight (see
+    # _sync_container_detail).
+    _detail_target: str | None = None
+
+    def _sync_container_detail(self) -> None:
+        """Lazily fetch or refresh the focused container's detail-only fields
+        (env, health log, precise start time, restart count).
+
+        Unlike `ImageActionHandler._sync_image_architecture`, this always
+        re-fetches because these fields can change while a container remains
+        selected. `_detail_target` only prevents duplicate in-flight fetches for
+        the same container.
+        """
+        c = self._get_focused_container()
+        target = c.id if c is not None else None
+
+        if target is None or target == self._detail_target:
+            return
+        self._detail_target = target
+        self._fetch_container_detail(target)
+
+    @work(thread=True)
+    def _fetch_container_detail(self, container_id: str) -> None:
+        detail = self.docker.container_detail(container_id)
+        self.call_from_thread(self._apply_container_detail, container_id, detail)
+
+    def _apply_container_detail(
+        self, container_id: str, detail: ContainerDetail | None
+    ) -> None:
+        if detail is not None:
+            self._container_details[container_id] = detail
+        if self._detail_target == container_id:
+            self._detail_target = None
+        if self.query_one(TabbedContent).active != TabID.CONTAINERS:
+            return
+        entry = self._resource_registry[TabID.CONTAINERS]
+        table = self.query_one(f"#{entry.table_id}", DataTable)
+        row = table.cursor_row
+        if row is None:
+            return
+        pane = self.query_one(f"#{DETAIL_PANE_ID}", DetailPane)
+        try:
+            entry.show_details(pane, row)
+        except IndexError:
+            pass
 
     def _run_on_focused_container(
         self,

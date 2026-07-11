@@ -43,6 +43,8 @@ from docksurf_py.constants import (
     CONNECTION_INDICATOR_ID,
     DETAIL_PANE_ID,
     EMPTY_STATE_IDS,
+    INSPECT_SEARCH_ID,
+    INSPECT_VIEW_ID,
     LOG_PANE_HEADER_ID,
     LOG_PANE_ID,
     PULL_PROGRESS_VIEW_ID,
@@ -58,6 +60,7 @@ from docksurf_py.models import (
     CommandResult,
     ComposeProject,
     Container,
+    ContainerDetail,
     ContainerTop,
     ContextInfo,
     DockerSnapshot,
@@ -196,6 +199,11 @@ class MockDockerService:
         # Per-image Architecture returned by image_architecture(); tests can
         # override. Keyed by image id, default "amd64" for anything unlisted.
         self.architecture_map: dict[str, str] = {}
+        # Per-container detail-pane-only fields returned by container_detail();
+        # tests can override. Keyed by container id, default an "empty" detail
+        # (no env, no health log, no start time, no restarts) for anything
+        # unlisted.
+        self.container_detail_map: dict[str, ContainerDetail] = {}
 
     @property
     def is_connected(self) -> bool:
@@ -255,6 +263,13 @@ class MockDockerService:
     def image_architecture(self, image_id: str) -> str | None:
         self.calls.append(("image_architecture", image_id))
         return self.architecture_map.get(image_id, "amd64")
+
+    def container_detail(self, container_id: str) -> ContainerDetail | None:
+        self.calls.append(("container_detail", container_id))
+        return self.container_detail_map.get(
+            container_id,
+            ContainerDetail(env=[], health_log=[], started_at="", restart_count=0),
+        )
 
     def volume_sizes(self) -> dict[str, int]:
         self.calls.append(("volume_sizes",))
@@ -376,6 +391,14 @@ async def wait_until(predicate, timeout: float = 1.0) -> None:
             await asyncio.sleep(0.01)
 
 
+def _non_selection_calls(calls: list[tuple]) -> list[tuple]:
+    """Filter out `container_detail` — selecting a container row lazily
+    fetches its detail-pane-only fields (PATCH_WORK.md P-1) regardless of
+    what action a test then takes, so it isn't part of what these
+    "did the guarded/cancelled action call docker?" assertions care about."""
+    return [c for c in calls if c[0] != "container_detail"]
+
+
 class RefreshLoadingIndicatorTests(unittest.IsolatedAsyncioTestCase):
     async def test_refresh_request_is_ignored_while_refresh_is_active(self) -> None:
         started = threading.Event()
@@ -488,7 +511,7 @@ class PauseKillActionTests(unittest.IsolatedAsyncioTestCase):
 
             app.action_pause_container()
             await pilot.pause()
-            self.assertEqual(app.docker.calls, [])
+            self.assertEqual(_non_selection_calls(app.docker.calls), [])
 
     async def test_kill_running_container(self) -> None:
         snapshot = _standalone_snapshot(running=True)
@@ -510,7 +533,7 @@ class PauseKillActionTests(unittest.IsolatedAsyncioTestCase):
 
             app.action_kill_container()
             await pilot.pause()
-            self.assertEqual(app.docker.calls, [])
+            self.assertEqual(_non_selection_calls(app.docker.calls), [])
 
     async def test_pause_without_focused_container_does_not_call_docker(self) -> None:
         app = DockSurfApp(docker=MockDockerService(lambda: EMPTY_SNAPSHOT))
@@ -1398,7 +1421,7 @@ class CopyFilesActionTests(unittest.IsolatedAsyncioTestCase):
             )
             app.screen_stack[-1].dismiss(None)
             await pilot.pause()
-            self.assertEqual(svc.calls, [])
+            self.assertEqual(_non_selection_calls(svc.calls), [])
 
     async def test_copy_files_invalid_prefix_warns_without_calling_docker(
         self,
@@ -1417,7 +1440,7 @@ class CopyFilesActionTests(unittest.IsolatedAsyncioTestCase):
             # Neither side prefixed with "web:" -- invalid.
             app.screen_stack[-1].dismiss(["./a", "./b"])
             await pilot.pause()
-            self.assertEqual(svc.calls, [])
+            self.assertEqual(_non_selection_calls(svc.calls), [])
 
     async def test_copy_files_valid_input_calls_docker_container_cp(self) -> None:
         snapshot = _standalone_snapshot(running=True)
@@ -2367,6 +2390,68 @@ class ColumnSortTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(service_names, ["myapp-alpha", "myapp-zeta"])
 
 
+class LazyTabRenderTests(unittest.IsolatedAsyncioTestCase):
+    """PATCH_WORK.md P-5: only the active tab's table is repopulated on a
+    refresh; the other three are marked dirty and caught up lazily the
+    moment they become active, instead of every refresh rebuilding all four."""
+
+    async def test_inactive_tab_is_not_repopulated_until_switched_to(self) -> None:
+        state = {"snapshot": DockerSnapshot([], [_image(repo="alpine")], [], [])}
+        app = DockSurfApp(docker=MockDockerService(lambda: state["snapshot"]))
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await wait_until(lambda: TabID.IMAGES in app._dirty_tabs)
+
+            # Containers tab is active by default — Images was never populated.
+            images_table = app.query_one(f"#{TableID.IMAGES}", DataTable)
+            self.assertEqual(images_table.row_count, 0)
+            self.assertEqual(app._current[TabID.IMAGES], [])
+
+            # A refresh with new data lands while Images stays inactive.
+            state["snapshot"] = DockerSnapshot(
+                [],
+                [_image(repo="alpine"), _image(repo="redis", image_id="sha256:r")],
+                [],
+                [],
+            )
+            app.start_refresh()
+            await wait_until(lambda: not app._refresh_in_progress)
+            await pilot.pause()
+            self.assertIn(TabID.IMAGES, app._dirty_tabs)
+            self.assertEqual(images_table.row_count, 0)
+
+            # Switching to it catches it up with the latest snapshot.
+            app.query_one(TabbedContent).active = TabID.IMAGES
+            await pilot.pause()
+            await wait_until(lambda: TabID.IMAGES not in app._dirty_tabs)
+            self.assertEqual(images_table.row_count, 2)
+            self.assertEqual(
+                [i.repository for i in app._current[TabID.IMAGES]], ["alpine", "redis"]
+            )
+
+    async def test_returning_to_a_dirty_tab_does_not_lose_the_active_tabs_repopulate(
+        self,
+    ) -> None:
+        # The active (Containers) tab must still repopulate on every refresh
+        # even though the other three are now lazily deferred.
+        containers_v1 = [make_container(name="web", running=True)]
+        containers_v2 = [
+            make_container(name="web", running=True),
+            make_container(name="db", running=True),
+        ]
+        state = {"snapshot": DockerSnapshot(containers_v1, [], [], [])}
+        app = DockSurfApp(docker=MockDockerService(lambda: state["snapshot"]))
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await wait_until(lambda: bool(app._current.get(TabID.CONTAINERS)))
+            self.assertEqual(len(app._current[TabID.CONTAINERS]), 1)
+
+            state["snapshot"] = DockerSnapshot(containers_v2, [], [], [])
+            app.start_refresh()
+            await wait_until(lambda: len(app._current.get(TabID.CONTAINERS, [])) == 2)
+            self.assertNotIn(TabID.CONTAINERS, app._dirty_tabs)
+
+
 class LiveSearchTests(unittest.IsolatedAsyncioTestCase):
     async def test_typing_into_search_bar_filters_the_table(self) -> None:
         # Regression: ResourceSearchController.on_search_changed lives on a
@@ -2388,12 +2473,99 @@ class LiveSearchTests(unittest.IsolatedAsyncioTestCase):
             app.action_open_search()
             await pilot.pause()
             await pilot.click(f"#{SEARCH_BAR_ID}")
-            for ch in "redis":
-                await pilot.press(ch)
-            await pilot.pause()
+
+            # The filter is debounced 0.2s (PATCH_WORK.md P-7). Every prefix
+            # of "redis" already narrows the table to just the "redis" row
+            # (no other repo shares any of those letters), so waiting on the
+            # rendered table alone can be satisfied by an intermediate
+            # keystroke's debounced call rather than the final one — wait for
+            # the settled call itself instead, or a pending timer for the
+            # full query can still be armed when this test tears down the app.
+            with patch.object(app, "_apply_filter", wraps=app._apply_filter) as spy:
+                for ch in "redis":
+                    await pilot.press(ch)
+                await wait_until(
+                    lambda: (
+                        spy.call_args is not None and spy.call_args.args == ("redis",)
+                    )
+                )
             self.assertEqual(
                 [i.repository for i in app._current[TabID.IMAGES]], ["redis"]
             )
+
+    async def test_search_filter_is_debounced_not_applied_per_keystroke(self) -> None:
+        # Real wall-clock timing around a burst of pilot.press() calls is too
+        # fragile to assert on directly (keystroke dispatch overhead alone can
+        # exceed the 0.2s debounce window on a loaded machine) — instead assert
+        # the mechanism directly: 5 keystrokes collapse into one _apply_filter
+        # call for the settled query, not five (PATCH_WORK.md P-7).
+        images = [
+            _image(repo="alpine", image_id="sha256:a"),
+            _image(repo="redis", image_id="sha256:r"),
+        ]
+        app = DockSurfApp(
+            docker=MockDockerService(lambda: DockerSnapshot([], images, [], []))
+        )
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.query_one(TabbedContent).active = TabID.IMAGES
+            await pilot.pause()
+            await wait_until(lambda: bool(app._current.get(TabID.IMAGES)))
+
+            app.action_open_search()
+            await pilot.pause()
+            await pilot.click(f"#{SEARCH_BAR_ID}")
+
+            with patch.object(app, "_apply_filter", wraps=app._apply_filter) as spy:
+                for ch in "redis":
+                    await pilot.press(ch)
+                # Every prefix of "redis" already narrows the table to just
+                # the "redis" row (no other repo shares any of those letters),
+                # so wait for the debounced call itself to settle on the full
+                # query rather than inferring it from the rendered table.
+                await wait_until(
+                    lambda: (
+                        spy.call_args is not None and spy.call_args.args == ("redis",)
+                    )
+                )
+                # Collapsed into fewer calls than keystrokes typed — proves
+                # the debounce coalesced at least one, not just that the
+                # eventual query settled correctly. (A generous bound: under
+                # heavy parallel test load the 0.2s window can occasionally
+                # elapse mid-burst and split into more than one batch.)
+                self.assertLess(spy.call_count, len("redis"))
+
+
+class InspectScreenFilterDebounceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_filter_is_debounced_not_re_rendered_per_keystroke(self) -> None:
+        # PATCH_WORK.md P-7: InspectScreen's filter re-rendered the whole
+        # (potentially long) JSON dump on every keystroke — same fix as
+        # ResourceSearchController's search bar, mirroring LogPane's existing
+        # 0.2s debounce.
+        text = "\n".join(f"line {i}" for i in range(5)) + "\nmatches-line"
+        app = App()
+        async with app.run_test() as pilot:
+            screen = InspectScreen("Test", text)
+            app.push_screen(screen)
+            await pilot.pause()
+
+            search_bar = screen.query_one(f"#{INSPECT_SEARCH_ID}", Input)
+            search_bar.display = True
+            await pilot.pause()
+            await pilot.click(f"#{INSPECT_SEARCH_ID}")
+
+            log_view = screen.query_one(f"#{INSPECT_VIEW_ID}", RichLog)
+            with patch.object(
+                screen, "_render_lines", wraps=screen._render_lines
+            ) as spy:
+                for ch in "matches":
+                    await pilot.press(ch)
+                # `_filter` updates synchronously per keystroke; the debounced
+                # re-render lags 0.2s behind it — wait for the render itself.
+                await wait_until(lambda: len(log_view.lines) == 1)
+                # Collapsed into fewer calls than keystrokes typed — same
+                # generous bound as the search-bar debounce test above.
+                self.assertLess(spy.call_count, len("matches"))
 
 
 class DeleteForceTests(unittest.IsolatedAsyncioTestCase):
@@ -2868,7 +3040,14 @@ class SecretMaskingTests(unittest.IsolatedAsyncioTestCase):
         c = make_container("web")
         c.env = ["DB_PASSWORD=supersecret", "PATH=/usr/bin"]
         snapshot = DockerSnapshot([c], [], [], [])
-        app = DockSurfApp(docker=MockDockerService(lambda: snapshot))
+        svc = MockDockerService(lambda: snapshot)
+        # env is detail-pane-only and fetched lazily via container_detail()
+        # (PATCH_WORK.md P-1) — the plain Container built above no longer
+        # carries it through to the pane on its own.
+        svc.container_detail_map[c.id] = ContainerDetail(
+            env=c.env, health_log=[], started_at="", restart_count=0
+        )
+        app = DockSurfApp(docker=svc)
         async with app.run_test() as pilot:
             await pilot.pause()
             await wait_until(lambda: bool(app._current.get(TabID.CONTAINERS)))
@@ -2876,7 +3055,7 @@ class SecretMaskingTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
 
             pane = app.query_one(f"#{DETAIL_PANE_ID}", DetailPane)
-            assert pane._env_collapsible is not None
+            await wait_until(lambda: pane._env_collapsible is not None)
             masked_text = self._env_text(pane)
             self.assertIn("DB_PASSWORD=••••••••", masked_text)
             self.assertIn("PATH=/usr/bin", masked_text)

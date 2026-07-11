@@ -6,6 +6,7 @@ ResourceSearchController is a mixin class that composes into DockSurfApp.
 
 from typing import TYPE_CHECKING
 
+from textual.timer import Timer
 from textual.widgets import DataTable, Input, TabbedContent
 
 from docksurf_py.constants import SEARCH_BAR_ID
@@ -49,18 +50,30 @@ class ResourceSearchController(_Base):
     app.py, which just forward here.
     """
 
+    _search_filter_timer: Timer | None = None
+
     def action_open_search(self) -> None:
         search_bar = self.query_one(f"#{SEARCH_BAR_ID}", Input)
         search_bar.display = True
         search_bar.focus()
 
     def on_search_changed(self, event: Input.Changed) -> None:
-        self._apply_filter(event.value)
+        # Debounced like LogPane's filter (log_pane.py): otherwise each keystroke
+        # re-populates the active tab's table.
+        query = event.value
+        if self._search_filter_timer is not None:
+            self._search_filter_timer.stop()
+        self._search_filter_timer = self.set_timer(
+            0.2, lambda: self._apply_filter(query)
+        )
 
     def on_search_escape(self, event: Input.Submitted) -> None:
         self._close_search()
 
     def _close_search(self) -> None:
+        if self._search_filter_timer is not None:
+            self._search_filter_timer.stop()
+            self._search_filter_timer = None
         search_bar = self.query_one(f"#{SEARCH_BAR_ID}", Input)
         search_bar.display = False
         search_bar.value = ""

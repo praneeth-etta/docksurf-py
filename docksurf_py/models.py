@@ -84,6 +84,12 @@ class Container:
     started_at: str
     restart_count: int
     health_log: list[HealthProbe]
+    # Coarse "how long has this been up" text parsed straight from the list
+    # summary's Status field (e.g. "5 minutes"), blank when not running.
+    # `started_at` (the precise StartedAt timestamp `format_uptime` needs) is
+    # only in a full inspect, so the table shows this instead of paying for
+    # one — see `docker/fetcher.py`'s `_build_container_from_summary`.
+    uptime_hint: str = ""
 
     @property
     def compose_project(self) -> str:
@@ -104,6 +110,20 @@ class Container:
     @property
     def is_compose(self) -> bool:
         return bool(self.compose_project)
+
+
+@dataclass(slots=True, frozen=True)
+class ContainerDetail:
+    """Detail-pane-only container fields not present in the `/containers/json`, fetched
+    by `DockerClient.container_detail`. Unlike `image_architecture`, these
+    fields are refreshed while a container remains selected because they can
+    change over time.
+    """
+
+    env: list[str]
+    health_log: list[HealthProbe]
+    started_at: str
+    restart_count: int
 
 
 @dataclass(slots=True)

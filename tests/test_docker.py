@@ -9,14 +9,20 @@ from docker.errors import APIError, DockerException, NotFound
 
 from docksurf_py.connection import ConnectionState, ConnectionStatus
 from docksurf_py.docker import DockerClient, format_size
-from docksurf_py.models import CommandErrorKind, ContainerTop, DockerSnapshot
+from docksurf_py.models import (
+    CommandErrorKind,
+    ContainerDetail,
+    ContainerTop,
+    DockerSnapshot,
+)
 
 
 def _fake_sdk() -> MagicMock:
     sdk = MagicMock()
     # get_containers()/get_images() (docker/fetcher.py) call the low-level API
-    # directly (raw list + parallel inspect) rather than the high-level
-    # containers.list()/images.list() wrappers — see ROBUSTNESS_PERF_P2_PLAN.md §1.
+    # directly (raw list summary, no per-container inspect) rather than the
+    # high-level containers.list()/images.list() wrappers — see
+    # PATCH_WORK.md P-1/P-2.
     sdk.api.containers.return_value = []
     sdk.api.images.return_value = []
     sdk.volumes.list.return_value = []
@@ -97,12 +103,16 @@ class MarkDisconnectedTests(unittest.TestCase):
             client = _new_client()
             client.fetch_snapshot()  # connects
         self.assertTrue(client.is_connected)
+        old_fetcher = client._fetcher
 
         client.mark_disconnected(ConnectionError("connection refused"))
 
         self.assertFalse(client.is_connected)
         self.assertIsNone(client._sdk)
         self.assertIsNone(client._fetcher)
+        # PATCH_WORK.md P-3: the discarded fetcher's pool must be shut down,
+        # not just dropped, or its idle worker threads linger until process exit.
+        self.assertTrue(old_fetcher._pool._shutdown)
 
     def test_preserves_context_and_host_over_ambient(self) -> None:
         fake_sdk = _fake_sdk()
@@ -231,6 +241,31 @@ class SwitchContextTests(unittest.TestCase):
         self.assertEqual(client._context_override, "remote")
         save.assert_called_once_with("remote")
 
+    def test_switch_success_closes_previous_fetcher_pool(self) -> None:
+        fake_sdk = _fake_sdk()
+        with patch("docksurf_py.docker.context.docker.from_env", return_value=fake_sdk):
+            client = _new_client()
+            client.fetch_snapshot()  # connects via ambient default
+        old_fetcher = client._fetcher
+
+        ctx = _fake_context("remote", "ssh://example.com")
+        with (
+            patch("docker.context.ContextAPI.get_context", return_value=ctx),
+            patch(
+                "docksurf_py.docker.context.docker.DockerClient",
+                return_value=_fake_sdk(),
+            ),
+            patch("docksurf_py.docker.client._save_last_context"),
+        ):
+            result = client.switch_context("remote")
+
+        self.assertTrue(result.ok)
+        # PATCH_WORK.md P-3: the pool belonging to the fetcher we just
+        # replaced must be shut down, not orphaned.
+        self.assertTrue(old_fetcher._pool._shutdown)
+        self.assertIsNot(client._fetcher, old_fetcher)
+        self.assertFalse(client._fetcher._pool._shutdown)
+
     def test_switch_to_missing_context_fails(self) -> None:
         client = _new_client()
         with patch("docker.context.ContextAPI.get_context", return_value=None):
@@ -264,6 +299,10 @@ class SwitchContextTests(unittest.TestCase):
         # The working connection from before the failed switch is untouched.
         self.assertTrue(client.is_connected)
         self.assertIs(client._sdk, fake_sdk)
+        # PATCH_WORK.md P-3: a failed switch must not close the still-in-use
+        # fetcher's pool — closing before confirming the new client works
+        # would leave the working connection with a dead pool.
+        self.assertFalse(client._fetcher._pool._shutdown)
 
     def test_list_contexts_marks_current_by_active_connection(self) -> None:
         fake_sdk = _fake_sdk()
@@ -413,6 +452,52 @@ class SdkClientTimeoutTests(unittest.TestCase):
         self.assertTrue(sdk_ctor.call_args.kwargs.get("use_ssh_client"))
         self.assertEqual(
             sdk_ctor.call_args.kwargs.get("timeout"), context._SDK_TIMEOUT_SECONDS
+        )
+
+
+class SdkClientPoolSizeTests(unittest.TestCase):
+    """Every SDK client builder sets `max_pool_size` above docker-py's
+    default of 10, so the snapshot fetch's concurrent fan-out (plus any
+    concurrent streams/lazy detail fetches) rides pooled connections instead
+    of churning sockets past the pool limit (PATCH_WORK.md P-4)."""
+
+    def test_default_socket_path_passes_pool_size_to_from_env(self) -> None:
+        from docksurf_py.docker import context
+
+        with (
+            patch("docksurf_py.docker.context.docker.from_env") as from_env,
+            patch("docker.context.ContextAPI.get_current_context", return_value=None),
+        ):
+            context._build_sdk_client_for_context(
+                _fake_context("default", context._DEFAULT_DOCKER_SOCK)
+            )
+            context._build_sdk_client_for_host("")
+            context._create_sdk_client()
+
+        self.assertEqual(from_env.call_count, 3)
+        for call in from_env.call_args_list:
+            self.assertEqual(call.kwargs.get("max_pool_size"), context._MAX_POOL_SIZE)
+
+    def test_context_with_custom_host_passes_pool_size(self) -> None:
+        from docksurf_py.docker import context
+
+        with patch("docksurf_py.docker.context.docker.DockerClient") as sdk_ctor:
+            context._build_sdk_client_for_context(
+                _fake_context("remote", "tcp://remote:2375")
+            )
+
+        self.assertEqual(
+            sdk_ctor.call_args.kwargs.get("max_pool_size"), context._MAX_POOL_SIZE
+        )
+
+    def test_host_override_with_custom_host_passes_pool_size(self) -> None:
+        from docksurf_py.docker import context
+
+        with patch("docksurf_py.docker.context.docker.DockerClient") as sdk_ctor:
+            context._build_sdk_client_for_host("tcp://remote:2375")
+
+        self.assertEqual(
+            sdk_ctor.call_args.kwargs.get("max_pool_size"), context._MAX_POOL_SIZE
         )
 
 
@@ -691,6 +776,61 @@ class ContainerTopTests(unittest.TestCase):
         client = DockerClient()
         result = client.container_top("abc")
         self.assertIsNone(result)
+
+
+class ContainerDetailTests(unittest.TestCase):
+    """`container_detail` is the lazy per-selection fetch for fields
+    `get_containers()` no longer inspects eagerly (PATCH_WORK.md P-1)."""
+
+    def _client(self) -> DockerClient:
+        client = DockerClient()
+        client._sdk = MagicMock()
+        return client
+
+    def test_maps_env_health_log_started_at_and_restart_count(self) -> None:
+        client = self._client()
+        client._sdk.containers.get.return_value.attrs = {
+            "RestartCount": 3,
+            "State": {
+                "StartedAt": "2026-07-02T09:00:00Z",
+                "Health": {
+                    "Status": "unhealthy",
+                    "Log": [
+                        {
+                            "Start": "2026-07-02T09:05:00Z",
+                            "ExitCode": 1,
+                            "Output": "boom\n",
+                        }
+                    ],
+                },
+            },
+            "Config": {"Env": ["FOO=bar"]},
+        }
+
+        result = client.container_detail("abc")
+
+        assert result is not None
+        self.assertIsInstance(result, ContainerDetail)
+        self.assertEqual(result.env, ["FOO=bar"])
+        self.assertEqual(result.started_at, "2026-07-02T09:00:00Z")
+        self.assertEqual(result.restart_count, 3)
+        self.assertEqual(len(result.health_log), 1)
+        self.assertEqual(result.health_log[0].exit_code, 1)
+        self.assertEqual(result.health_log[0].output, "boom")
+
+    def test_not_found_returns_none(self) -> None:
+        client = self._client()
+        client._sdk.containers.get.side_effect = NotFound("no such container")
+        self.assertIsNone(client.container_detail("abc"))
+
+    def test_api_error_returns_none(self) -> None:
+        client = self._client()
+        client._sdk.containers.get.side_effect = APIError("boom")
+        self.assertIsNone(client.container_detail("abc"))
+
+    def test_not_connected_returns_none(self) -> None:
+        client = DockerClient()
+        self.assertIsNone(client.container_detail("abc"))
 
 
 class ContainerCpTests(unittest.TestCase):

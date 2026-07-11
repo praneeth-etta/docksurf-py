@@ -5,6 +5,7 @@ from textual import on
 from textual.app import ComposeResult
 from textual.containers import Vertical
 from textual.screen import ModalScreen
+from textual.timer import Timer
 from textual.widgets import Button, Input, Label, RichLog
 
 from docksurf_py.constants import (
@@ -34,6 +35,7 @@ class InspectScreen(ModalScreen):
         self._title = title
         self._lines = text.splitlines()
         self._filter = ""
+        self._filter_timer: Timer | None = None
 
     def compose(self) -> ComposeResult:
         with Vertical():
@@ -60,14 +62,22 @@ class InspectScreen(ModalScreen):
 
     @on(Input.Changed, f"#{INSPECT_SEARCH_ID}")
     def _on_filter_changed(self, event: Input.Changed) -> None:
+        # Debounced like LogPane's own filter (widgets/log_pane.py) — a JSON
+        # dump can be long, and re-rendering it on every keystroke otherwise
+        # repopulates the whole view per character typed (PATCH_WORK.md P-7).
         self._filter = event.value
-        self._render_lines()
+        if self._filter_timer is not None:
+            self._filter_timer.stop()
+        self._filter_timer = self.set_timer(0.2, self._render_lines)
 
     @on(Input.Submitted, f"#{INSPECT_SEARCH_ID}")
     def _on_filter_submitted(self, event: Input.Submitted) -> None:
         self.query_one(f"#{INSPECT_VIEW_ID}", RichLog).focus()
 
     def _close_search(self, search_bar: Input) -> None:
+        if self._filter_timer is not None:
+            self._filter_timer.stop()
+            self._filter_timer = None
         search_bar.display = False
         search_bar.value = ""
         self._filter = ""

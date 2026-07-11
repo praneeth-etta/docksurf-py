@@ -21,10 +21,11 @@ from docksurf_py.constants import (
     markup_red,
     markup_yellow,
 )
-from docksurf_py.docker import format_relative_time, format_size, format_uptime
+from docksurf_py.docker import format_relative_time, format_size
 from docksurf_py.models import (
     ComposeProject,
     Container,
+    ContainerDetail,
     HealthProbe,
     Image,
     Network,
@@ -165,26 +166,37 @@ class TableRenderer(_Base):
         self._current: dict[TabID, list] = {
             tab_id: [] for tab_id in self._resource_registry
         }
+        # Tabs whose tables haven't been repopulated since the last snapshot.
+        # Inactive tabs are refreshed lazily when they become active.
+        self._dirty_tabs: set[TabID] = set()
+
         # Compose project names whose service rows are currently hidden.
         self._collapsed_projects: set[str] = set()
+
         # Multi-select: per-tab sets of marked row-keys (see `_row_key`).
         self._marked: dict[TabID, set[tuple[str, str]]] = {
             tab_id: set() for tab_id in self._resource_registry
         }
+
         # On-demand per-volume disk sizes (populated by the `b` size action),
         # keyed by volume name; read by `_show_volume_details`.
         self._volume_sizes: dict[str, int] = {}
+
         # On-demand per-image Architecture, keyed by image id;
         # lazily fetched on row-select by ImageActionHandler and read by
         # `_show_image_details`.
         self._image_architectures: dict[str, str] = {}
-        # Whether the detail pane shows real env-var values or masks anything
-        # that looks like a secret — toggled by `R` (action_toggle_secrets).
+
+        # On-demand container details (env, health log, start time, restart count),
+        # keyed by container id. Refreshed on row selection/refresh but retained
+        # between fetches so the detail pane keeps the last-known values.
+        self._container_details: dict[str, ContainerDetail] = {}
+
+        # Whether to reveal env vars that look like secrets (`R`).
         self._reveal_secrets: bool = False
-        # Active column sort per tab: (column name, reverse) or None for the
-        # unsorted (fetch/insertion order) default. Set by `_on_header_selected`.
-        # Seeded from the restored session, if any — an unknown/stale column
-        # name is harmless: `_sort_items` no-ops when it can't find a match.
+
+        # Per-tab column sort: (column, reverse), or `None` for insertion order.
+        # Restored from the previous session; unknown columns are ignored.
         self._sort_state: dict[TabID, tuple[str, bool] | None] = {
             tab_id: self._session.sort_state.get(tab_id.value)
             for tab_id in self._resource_registry
@@ -300,7 +312,7 @@ class TableRenderer(_Base):
                     c.image_name,
                     _status_markup(c),
                     _health_markup(c),
-                    format_uptime(c.started_at),
+                    c.uptime_hint or "—",
                 )
 
         for c in standalone:
@@ -312,7 +324,7 @@ class TableRenderer(_Base):
                 c.image_name,
                 _status_markup(c),
                 _health_markup(c),
-                format_uptime(c.started_at),
+                c.uptime_hint or "—",
             )
 
         self._current[TabID.CONTAINERS] = rows

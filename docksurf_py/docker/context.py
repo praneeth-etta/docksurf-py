@@ -32,6 +32,10 @@ _STATE_FILE = DATA_DIR / "state.json"
 # and SSH contexts while still allowing refreshes to recover promptly.
 _SDK_TIMEOUT_SECONDS = 30
 
+# docker-py's default pool is 10 connections. 16 leaves headroom for our
+# concurrent snapshot, streaming, and lazy SDK requests without being excessive.
+_MAX_POOL_SIZE = 16
+
 
 def _load_last_context() -> str | None:
     try:
@@ -60,11 +64,14 @@ def _clear_last_context() -> None:
 def _build_sdk_client_for_context(ctx) -> "docker.DockerClient":
     """Build an SDK client scoped to one `docker context` entry."""
     if not ctx.Host or ctx.Host == _DEFAULT_DOCKER_SOCK:
-        return docker.from_env(timeout=_SDK_TIMEOUT_SECONDS)
+        return docker.from_env(
+            timeout=_SDK_TIMEOUT_SECONDS, max_pool_size=_MAX_POOL_SIZE
+        )
     kwargs: dict = {
         "base_url": ctx.Host,
         "tls": ctx.TLSConfig or False,
         "timeout": _SDK_TIMEOUT_SECONDS,
+        "max_pool_size": _MAX_POOL_SIZE,
     }
     if ctx.Host.startswith("ssh://"):
         kwargs["use_ssh_client"] = True
@@ -78,8 +85,14 @@ def _build_sdk_client_for_host(host: str) -> "docker.DockerClient":
     pull TLS config from — a raw host string carries none.
     """
     if not host or host == _DEFAULT_DOCKER_SOCK:
-        return docker.from_env(timeout=_SDK_TIMEOUT_SECONDS)
-    kwargs: dict = {"base_url": host, "timeout": _SDK_TIMEOUT_SECONDS}
+        return docker.from_env(
+            timeout=_SDK_TIMEOUT_SECONDS, max_pool_size=_MAX_POOL_SIZE
+        )
+    kwargs: dict = {
+        "base_url": host,
+        "timeout": _SDK_TIMEOUT_SECONDS,
+        "max_pool_size": _MAX_POOL_SIZE,
+    }
     if host.startswith("ssh://"):
         kwargs["use_ssh_client"] = True
     return docker.DockerClient(**kwargs)
@@ -98,7 +111,9 @@ def _create_sdk_client() -> "docker.DockerClient":
     `from_env()`, so existing setups (and its TLS-env handling) are unchanged.
     """
     if os.environ.get("DOCKER_HOST"):
-        return docker.from_env(timeout=_SDK_TIMEOUT_SECONDS)
+        return docker.from_env(
+            timeout=_SDK_TIMEOUT_SECONDS, max_pool_size=_MAX_POOL_SIZE
+        )
     try:
         from docker.context import ContextAPI
 
@@ -108,4 +123,4 @@ def _create_sdk_client() -> "docker.DockerClient":
     if ctx is not None and ctx.Host and ctx.Host != _DEFAULT_DOCKER_SOCK:
         logger.info("Connecting via docker context %s → %s", ctx.Name, ctx.Host)
         return _build_sdk_client_for_context(ctx)
-    return docker.from_env(timeout=_SDK_TIMEOUT_SECONDS)
+    return docker.from_env(timeout=_SDK_TIMEOUT_SECONDS, max_pool_size=_MAX_POOL_SIZE)

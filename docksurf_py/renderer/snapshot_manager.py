@@ -124,12 +124,23 @@ class SnapshotManager(_Base):
             }
             self._marked[tab_id] &= live_keys
 
-        for tab_id, entry in self._resource_registry.items():
-            table = self.query_one(f"#{entry.table_id}", DataTable)
-            table.clear(columns=False)
-            items = self._sort_items(tab_id, entry, entry.snapshot_items(snapshot))
-            entry.populate(table, items)
-            self._update_empty_state(tab_id, entry, items)
+        # Only the active tab's table is visible, so only it needs
+        # repopulating now — the other three are marked dirty and caught up
+        # lazily by `_populate_tab` the moment they become active
+        # (`DockSurfApp.clear_on_tab_switch`). Cuts DataTable rebuild work
+        # ~4x per event-driven refresh (PATCH_WORK.md P-5).
+        for tab_id in self._resource_registry:
+            if tab_id != active:
+                self._dirty_tabs.add(tab_id)
+
+        search_bar = self.query_one(f"#{SEARCH_BAR_ID}", Input)
+        filter_active = search_bar.display and bool(search_bar.value)
+        if filter_active:
+            # _apply_filter (below) populates the active tab itself — doing
+            # it here too would repaint it twice.
+            self._dirty_tabs.discard(active)
+        else:
+            self._populate_tab(active)
 
         status_bar = self.query_one(f"#{STATUS_BAR_ID}", StatusBar)
         status_bar.update_stats(
@@ -139,12 +150,27 @@ class SnapshotManager(_Base):
             context=self.docker.connection.context,
         )
 
-        search_bar = self.query_one(f"#{SEARCH_BAR_ID}", Input)
-        if search_bar.display and search_bar.value:
+        if filter_active:
             self._apply_filter(search_bar.value)
 
         # Restore selection last — after any filter re-populate — so it wins.
         self._restore_selection(active, focus_key)
+
+    def _populate_tab(self, tab_id: TabID) -> None:
+        """(Re)populate a tab's table from the current snapshot and clear its dirty
+        flag.
+
+        Used when refreshing the active tab and when a dirty tab becomes active.
+        """
+        if self.snapshot is None:
+            return
+        entry = self._resource_registry[tab_id]
+        table = self.query_one(f"#{entry.table_id}", DataTable)
+        table.clear(columns=False)
+        items = self._sort_items(tab_id, entry, entry.snapshot_items(self.snapshot))
+        entry.populate(table, items)
+        self._update_empty_state(tab_id, entry, items)
+        self._dirty_tabs.discard(tab_id)
 
     @staticmethod
     def _row_key(item: Any) -> tuple[str, str] | None:
@@ -185,10 +211,11 @@ class SnapshotManager(_Base):
                     entry.show_details(pane, idx)
                 except IndexError:
                     pane.clear_details()
-                # Cursor may not have moved (same index) so RowHighlighted won't
-                # fire — sync stats/top here in case the item's state changed.
+                # If the cursor stayed on the same row, `RowHighlighted` won't fire.
+                # Refresh dependent panes (stats, top, container details) explicitly.
                 self._sync_stats()
                 self._sync_top()
+                self._sync_container_detail()
                 return
         # The previously-focused resource is gone — select the first row.
         self._auto_select_first()

@@ -1,14 +1,14 @@
 """Read-only Docker state fetching, parsed into typed dataclasses."""
 
 import logging
+import re
 from collections import defaultdict
 from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timezone
 
-from docker.errors import APIError, NotFound
-
 from docksurf_py.models import (
     Container,
+    ContainerDetail,
     DockerSnapshot,
     HealthProbe,
     Image,
@@ -19,13 +19,6 @@ from docksurf_py.models import (
 )
 
 logger = logging.getLogger(__name__)
-
-# Number of workers used to parallelize `inspect_container` calls in
-# `get_containers()`. docker-py performs these inspections serially, making
-# container discovery effectively one HTTP round-trip per container. A small
-# worker pool reduces overall latency while avoiding excessive concurrent
-# connections on large Docker hosts.
-_INSPECT_WORKERS = 16
 
 
 def _filter_real_tags(repo_tags: list[str] | None) -> list[str]:
@@ -59,40 +52,117 @@ def _unix_ts_to_iso(ts: int | float | None) -> str:
     return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
 
 
-# TODO: Refactor to reduce complexity.
-def _build_container(
-    container_id: str, attrs: dict, tags_by_image_id: dict[str, list[str]]
-) -> Container:
-    """Assemble one `Container` from a full `inspect_container` attrs dict."""
-    ports: list[PortBinding] = []
-    port_bindings = attrs.get("NetworkSettings", {}).get("Ports", {}) or {}
-    for port, bindings in port_bindings.items():
-        if bindings:
-            for binding in bindings:
-                ports.append(
-                    PortBinding(
-                        container_port=port,
-                        host_ip=binding.get("HostIp", ""),
-                        host_port=binding.get("HostPort", ""),
-                    )
+def _parse_summary_ports(raw_ports: list[dict] | None) -> list[PortBinding]:
+    """Parse the `/containers/json` list summary's `Ports` entries.
+
+    Unlike `NetworkSettings.Ports` from a full inspect, the summary is already a
+    flat list of bindings, with unpublished ports lacking host-binding fields.
+    """
+    bindings: list[PortBinding] = []
+    for p in raw_ports or []:
+        container_port = f"{p.get('PrivatePort', '')}/{p.get('Type', 'tcp')}"
+        public_port = p.get("PublicPort")
+        if public_port:
+            bindings.append(
+                PortBinding(
+                    container_port=container_port,
+                    host_ip=p.get("IP", ""),
+                    host_port=str(public_port),
                 )
+            )
         else:
-            ports.append(PortBinding(container_port=port))
+            bindings.append(PortBinding(container_port=container_port))
+    return bindings
 
-    mounts = [
-        m["Name"]
-        for m in attrs.get("Mounts", [])
-        if m.get("Type") == "volume" and m.get("Name")
-    ]
 
-    networks = list(attrs.get("NetworkSettings", {}).get("Networks", {}).keys())
-    config = attrs.get("Config", {}) or {}
-    env_vars = config.get("Env", [])
-    labels = config.get("Labels") or {}
+def _parse_health_from_status(status: str) -> str:
+    """Extract health from the summary `Status` string.
 
-    image_id = attrs.get("Image", "")
+    `/containers/json` omits `State.Health.Status`, instead embedding it as a
+    suffix like "(healthy)" or "(health: starting)".
+    """
+    if "(healthy)" in status:
+        return "healthy"
+    if "(unhealthy)" in status:
+        return "unhealthy"
+    if "(health: starting)" in status:
+        return "starting"
+    return ""
+
+
+_EXIT_CODE_RE = re.compile(r"^Exited \((-?\d+)\)")
+
+
+def _parse_exit_code_from_status(status: str) -> int:
+    """Parses e.g. "Exited (137) 3 minutes ago" — 0 for anything else
+    (including a bare "Dead", which carries no exit code in the summary)."""
+    match = _EXIT_CODE_RE.match(status)
+    return int(match.group(1)) if match else 0
+
+
+_UPTIME_SUFFIX_RE = re.compile(r"\s*\([^)]*\)\s*$")
+
+
+def _parse_uptime_hint(status: str, running: bool) -> str:
+    """Extract the table's uptime text from the summary `Status` string.
+
+    Unlike `format_uptime`, this uses Docker's human-readable duration because
+    `StartedAt` is only available from a full inspect.
+    """
+    if not running or not status.startswith("Up "):
+        return ""
+    return _UPTIME_SUFFIX_RE.sub("", status[len("Up ") :]).strip()
+
+
+def _build_container_from_summary(
+    summary: dict, tags_by_image_id: dict[str, list[str]]
+) -> Container:
+    """Build a `Container` from a `/containers/json` summary.
+
+    Everything needed for the table comes from the summary; detail-pane fields are
+    fetched lazily via `DockerClient.container_detail`.
+    """
+    names = summary.get("Names") or []
+    name = names[0].lstrip("/") if names else ""
+
+    image_id = summary.get("ImageID", "")
     image_tags = tags_by_image_id.get(image_id) or [image_id]
 
+    state = summary.get("State", "")
+    status = summary.get("Status", "")
+    running = state == "running"
+
+    return Container(
+        id=summary.get("Id", "")[:12],
+        name=name,
+        image_id=image_id,
+        image_name=image_tags[0],
+        status=state,
+        state=state,
+        running=running,
+        exit_code=_parse_exit_code_from_status(status),
+        health=_parse_health_from_status(status),
+        ports=_parse_summary_ports(summary.get("Ports")),
+        mounts=[
+            m["Name"]
+            for m in (summary.get("Mounts") or [])
+            if m.get("Type") == "volume" and m.get("Name")
+        ],
+        networks=list((summary.get("NetworkSettings") or {}).get("Networks", {})),
+        created=_unix_ts_to_iso(summary.get("Created")),
+        env=[],
+        labels=summary.get("Labels") or {},
+        started_at="",
+        restart_count=0,
+        health_log=[],
+        uptime_hint=_parse_uptime_hint(status, running),
+    )
+
+
+def _parse_container_detail(attrs: dict) -> ContainerDetail:
+    """Parse the detail-pane-only fields from a full `inspect_container`
+    result — used by `DockerClient.container_detail`'s lazy per-selection
+    fetch (see `models.ContainerDetail`)."""
     sdk_state = attrs.get("State") or {}
     health_info = sdk_state.get("Health") or {}
     health_log = [
@@ -103,27 +173,12 @@ def _build_container(
         )
         for probe in (health_info.get("Log") or [])
     ]
-    status = sdk_state.get("Status", "")
-
-    return Container(
-        id=container_id[:12],
-        name=(attrs.get("Name") or "").lstrip("/"),
-        image_id=image_id,
-        image_name=image_tags[0],
-        status=status,
-        state=status,
-        running=sdk_state.get("Running", False),
-        exit_code=sdk_state.get("ExitCode", 0),
-        health=health_info.get("Status", ""),
-        ports=ports,
-        mounts=mounts,
-        networks=networks,
-        created=attrs.get("Created", ""),
-        env=env_vars,
-        labels=labels,
+    config = attrs.get("Config", {}) or {}
+    return ContainerDetail(
+        env=config.get("Env", []),
+        health_log=health_log,
         started_at=sdk_state.get("StartedAt", ""),
         restart_count=attrs.get("RestartCount", 0),
-        health_log=health_log,
     )
 
 
@@ -135,58 +190,59 @@ class DockerResourceFetcher:
 
     def __init__(self, sdk_client) -> None:
         self._client = sdk_client
+        # Hoisted here rather than built-and-torn-down inside every
+        # fetch_snapshot() call — a fresh ThreadPoolExecutor per refresh means
+        # up to 5 threads spun up and joined on every ~0.4s event-driven tick.
+        # This fetcher is itself recreated on reconnect/context switch (see
+        # DockerClient._connect/switch_context/mark_disconnected), so the
+        # pool's lifecycle matches the fetcher's — callers must call close()
+        # before discarding a fetcher instance.
+        self._pool = ThreadPoolExecutor(max_workers=5)
 
-    def get_containers(self) -> list[Container]:
+    def close(self) -> None:
+        """Shut down the fetch pool.
+
+        `wait=False` and no `cancel_futures` — a fetch already in flight on
+        this pool (e.g. a background refresh racing a daemon disconnect) must
+        run to completion rather than raise `CancelledError`, which subclasses
+        `BaseException` and would slip past `fetch_snapshot`'s `except
+        Exception` handling and kill the worker outright. Idle threads still
+        exit once any in-flight work drains.
+        """
+        self._pool.shutdown(wait=False)
+
+    def get_containers(
+        self, image_summaries: list[dict] | None = None
+    ) -> list[Container]:
+        """Build `Container` rows from `/containers/json` summaries.
+
+        Avoids per-container inspect; detail-pane fields are fetched lazily via
+        `DockerClient.container_detail`.
+        `image_summaries` lets snapshot refreshes share one `/images/json` listing;
+        `None` fetches it on demand.
+        """
         summaries = self._client.api.containers(all=True)
         if not summaries:
             return []
 
-        tags_by_image_id = _image_tags_by_id(self._client.api.images(all=True))
+        if image_summaries is None:
+            image_summaries = self._client.api.images(all=True)
+        tags_by_image_id = _image_tags_by_id(image_summaries)
 
-        ids = [s["Id"] for s in summaries]
-        attrs_by_id = self._inspect_containers(ids)
+        return [_build_container_from_summary(s, tags_by_image_id) for s in summaries]
 
-        containers = []
-        for container_id in ids:
-            attrs = attrs_by_id.get(container_id)
-            if attrs is None:
-                continue  # vanished mid-fetch, or inspect failed — see below
-            containers.append(_build_container(container_id, attrs, tags_by_image_id))
-        return containers
+    def get_images(self, image_summaries: list[dict] | None = None) -> list[Image]:
+        """Build `Image` rows from `/images/json` summaries.
 
-    def _inspect_containers(self, ids: list[str]) -> dict[str, dict]:
-        """Fan `inspect_container` out across a small thread pool.
-
-        A container removed between the list call and its own inspect (a
-        race, not a real error) or one that briefly rejects the request
-        raises `NotFound`/`APIError` — skip just that container rather than
-        failing the whole fetch.
+        Avoids per-image inspect; `Architecture` is fetched lazily via
+        `DockerClient.image_architecture`.
+        `image_summaries` lets snapshot refreshes share one listing with
+        `get_containers`; `None` fetches it on demand.
         """
-        attrs_by_id: dict[str, dict] = {}
-        with ThreadPoolExecutor(max_workers=_INSPECT_WORKERS) as pool:
-            future_to_id = {
-                pool.submit(self._client.api.inspect_container, cid): cid for cid in ids
-            }
-            for future, cid in future_to_id.items():
-                try:
-                    attrs_by_id[cid] = future.result()
-                except NotFound:
-                    logger.debug("Container %s vanished mid-fetch — skipping", cid)
-                except APIError as e:
-                    logger.warning("Inspect failed for container %s: %s", cid, e)
-        return attrs_by_id
-
-    def get_images(self) -> list[Image]:
-        """Build every `Image` row straight from the `/images/json` listing.
-
-        No per-image inspect — unlike docker-py's `images.list()`, which
-        calls `.get(id)` (a full inspect) for every item, one at a time. The
-        one field that requires a full inspect, `Architecture`, is detail-pane
-        only (never shown in the table or matched by search) and is fetched
-        lazily on row-select instead — see `DockerClient.image_architecture`.
-        """
+        if image_summaries is None:
+            image_summaries = self._client.api.images(all=True)
         images = []
-        for s in self._client.api.images(all=True):
+        for s in image_summaries:
             tags = _filter_real_tags(s.get("RepoTags")) or ["<none>:<none>"]
             for tag_str in tags:
                 repo, _, tag = tag_str.partition(":")
@@ -267,13 +323,28 @@ class DockerResourceFetcher:
         failure across every category as the daemon itself being down.
         """
         logger.debug("Fetching Docker snapshot")
-        with ThreadPoolExecutor(max_workers=4) as pool:
-            futures: dict[str, Future] = {
-                "containers": pool.submit(self.get_containers),
-                "images": pool.submit(self.get_images),
-                "volumes": pool.submit(self.get_volumes),
-                "networks": pool.submit(self.get_networks),
-            }
+        # The `/images/json` listing is fetched once here and shared by both
+        # get_containers (tag resolution) and get_images, instead of each
+        # fetching it separately — halves the image-listing payload per
+        # refresh. `image_summary_future` is submitted alongside the other
+        # four so nothing serializes ahead of the pool; containers/images just
+        # block on its `.result()` (raising through to their own category's
+        # error handling below if the listing itself failed).
+        pool = self._pool
+        image_summary_future = pool.submit(self._client.api.images, all=True)
+
+        def containers_task() -> list[Container]:
+            return self.get_containers(image_summary_future.result())
+
+        def images_task() -> list[Image]:
+            return self.get_images(image_summary_future.result())
+
+        futures: dict[str, Future] = {
+            "containers": pool.submit(containers_task),
+            "images": pool.submit(images_task),
+            "volumes": pool.submit(self.get_volumes),
+            "networks": pool.submit(self.get_networks),
+        }
 
         results: dict[str, list] = {}
         errors: dict[str, Exception] = {}

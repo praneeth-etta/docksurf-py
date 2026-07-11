@@ -57,7 +57,7 @@ from docksurf_py.constants import (
     TabID,
     TableID,
 )
-from docksurf_py.models import CommandResult, Container, DockerSnapshot
+from docksurf_py.models import CommandResult, Container, ContainerDetail, DockerSnapshot
 from docksurf_py.observability import LiveStatsController
 from docksurf_py.paths import DATA_DIR
 from docksurf_py.renderer import (
@@ -172,17 +172,20 @@ class AppContext(Protocol):
     _session: SessionState
     _persist_session: bool
     _current: dict[TabID, list]
+    _dirty_tabs: set[TabID]
     _resource_registry: dict[TabID, ResourceEntry]
     _collapsed_projects: set[str]
     _marked: dict[TabID, set[tuple[str, str]]]
     _volume_sizes: dict[str, int]
     _image_architectures: dict[str, str]
+    _container_details: dict[str, ContainerDetail]
     _reveal_secrets: bool
     _sort_state: dict[TabID, tuple[str, bool] | None]
     is_running: bool  # really a textual.app.App property
 
     def start_refresh(self) -> None: ...
     def _auto_select_first(self) -> None: ...
+    def _populate_tab(self, tab_id: TabID) -> None: ...
     def _apply_filter(self, query: str) -> None: ...
     def _rerender_containers(self) -> None: ...
     def _rerender_active_table(self) -> None: ...
@@ -193,6 +196,7 @@ class AppContext(Protocol):
     def _sync_stats(self) -> None: ...
     def _sync_top(self) -> None: ...
     def _sync_image_architecture(self) -> None: ...
+    def _sync_container_detail(self) -> None: ...
     def _get_focused_container(self) -> Container | None: ...
     def _get_focused_resource(self, tab_id: TabID) -> Any: ...
     def _get_focused_project(self) -> Any: ...
@@ -345,7 +349,6 @@ class DockSurfApp(
                     "Image": lambda c: c.image_name.lower(),
                     "Status": lambda c: (not c.running, c.status.lower()),
                     "Health": lambda c: c.health.lower(),
-                    "Uptime": lambda c: c.started_at,
                 },
             ),
             TabID.IMAGES: ResourceEntry(
@@ -500,6 +503,7 @@ class DockSurfApp(
             self._sync_stats()
             self._sync_top()
             self._sync_image_architecture()
+            self._sync_container_detail()
             return
         table = self.query_one(f"#{entry.table_id}", DataTable)
         # Explicitly follow focus to the active tab's table (rather than
@@ -513,6 +517,7 @@ class DockSurfApp(
             self._sync_stats()
             self._sync_top()
             self._sync_image_architecture()
+            self._sync_container_detail()
             return
         table.move_cursor(row=0)
         try:
@@ -522,6 +527,7 @@ class DockSurfApp(
         self._sync_stats()
         self._sync_top()
         self._sync_image_architecture()
+        self._sync_container_detail()
 
     @on(DataTable.RowHighlighted)
     def update_details(self, event: DataTable.RowHighlighted) -> None:
@@ -543,12 +549,16 @@ class DockSurfApp(
         self._sync_stats()
         self._sync_top()
         self._sync_image_architecture()
+        self._sync_container_detail()
 
     @on(TabbedContent.TabActivated)
     def clear_on_tab_switch(self) -> None:
+        active = self.query_one(TabbedContent).active
+        if active in self._dirty_tabs:
+            self._populate_tab(active)
         self._auto_select_first()
         if self._persist_session:
-            self._session.active_tab = self.query_one(TabbedContent).active
+            self._session.active_tab = active
             save_session(self._session)
 
     @on(DataTable.HeaderSelected)

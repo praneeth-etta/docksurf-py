@@ -18,6 +18,7 @@ from docksurf_py.docker import (
 )
 from docksurf_py.models import (
     CommandResult,
+    ContainerDetail,
     ContainerTop,
     ContextInfo,
     DockerSnapshot,
@@ -65,6 +66,8 @@ class DockerService(Protocol):
     def image_history(self, image_id: str) -> list[ImageLayer] | None: ...
 
     def image_architecture(self, image_id: str) -> str | None: ...
+
+    def container_detail(self, container_id: str) -> ContainerDetail | None: ...
 
     def volume_sizes(self) -> dict[str, int]: ...
 

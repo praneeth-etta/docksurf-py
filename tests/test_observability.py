@@ -106,50 +106,66 @@ class ParseSystemDfTests(unittest.TestCase):
 
 
 class GetContainersFieldsTests(unittest.TestCase):
-    def test_maps_started_at_restart_count_and_health_log(self) -> None:
-        attrs = {
+    """`get_containers()` now builds every field from the `/containers/json`
+    list summary alone (PATCH_WORK.md P-1) — health, exit code, and the table's
+    Uptime hint are parsed from the summary's human `Status` string rather
+    than a per-container inspect. `env`/`health_log`/precise `started_at`/
+    `restart_count` are detail-pane-only and fetched lazily instead — see
+    `ContainerDetailTests` in test_docker.py."""
+
+    def test_maps_health_exit_code_and_uptime_hint_from_status_text(self) -> None:
+        summary = {
             "Id": "abc123" + "0" * 58,
-            "Name": "/web",
-            "Image": "sha256:deadbeef",
-            "Created": "2026-07-01T00:00:00Z",
-            "RestartCount": 3,
-            "State": {
-                "Status": "running",
-                "Running": True,
-                "ExitCode": 0,
-                "StartedAt": "2026-07-02T09:00:00Z",
-                "Health": {
-                    "Status": "unhealthy",
-                    "Log": [
-                        {
-                            "Start": "2026-07-02T09:05:00Z",
-                            "ExitCode": 1,
-                            "Output": "boom\n",
-                        },
-                    ],
-                },
-            },
-            "Config": {"Env": [], "Labels": {}},
-            "NetworkSettings": {"Ports": {}, "Networks": {}},
+            "Names": ["/web"],
+            "ImageID": "sha256:deadbeef",
+            "Created": 1751328000,  # 2025-07-01T00:00:00Z
+            "State": "running",
+            "Status": "Up 5 minutes (unhealthy)",
+            "Labels": {},
+            "NetworkSettings": {"Networks": {}},
             "Mounts": [],
+            "Ports": [],
         }
         sdk = MagicMock()
-        sdk.api.containers.return_value = [{"Id": attrs["Id"]}]
-        sdk.api.inspect_container.return_value = attrs
+        sdk.api.containers.return_value = [summary]
         sdk.api.images.return_value = [
             {"Id": "sha256:deadbeef", "RepoTags": ["nginx:latest"]}
         ]
+
         containers = DockerResourceFetcher(sdk).get_containers()
+
         self.assertEqual(len(containers), 1)
         got = containers[0]
         self.assertEqual(got.name, "web")
         self.assertEqual(got.image_name, "nginx:latest")
-        self.assertEqual(got.started_at, "2026-07-02T09:00:00Z")
-        self.assertEqual(got.restart_count, 3)
         self.assertEqual(got.health, "unhealthy")
-        self.assertEqual(len(got.health_log), 1)
-        self.assertEqual(got.health_log[0].exit_code, 1)
-        self.assertEqual(got.health_log[0].output, "boom")
+        self.assertEqual(got.exit_code, 0)
+        self.assertEqual(got.uptime_hint, "5 minutes")
+        sdk.api.inspect_container.assert_not_called()
+
+    def test_exited_container_parses_exit_code_from_status_text(self) -> None:
+        summary = {
+            "Id": "b" * 64,
+            "Names": ["/db"],
+            "ImageID": "sha256:deadbeef",
+            "Created": 0,
+            "State": "exited",
+            "Status": "Exited (137) 3 minutes ago",
+            "Labels": {},
+            "NetworkSettings": {"Networks": {}},
+            "Mounts": [],
+            "Ports": [],
+        }
+        sdk = MagicMock()
+        sdk.api.containers.return_value = [summary]
+        sdk.api.images.return_value = []
+
+        got = DockerResourceFetcher(sdk).get_containers()[0]
+
+        self.assertFalse(got.running)
+        self.assertEqual(got.exit_code, 137)
+        self.assertEqual(got.uptime_hint, "")
+        sdk.api.inspect_container.assert_not_called()
 
 
 class EventNoiseFilterTests(unittest.TestCase):

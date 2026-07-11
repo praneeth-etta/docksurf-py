@@ -30,10 +30,14 @@ from docksurf_py.constants import (
     SafeMarkup,
 )
 
-# Caps LogPane._line_buffer so tailing a noisy container indefinitely can't
-# grow memory without bound. Oldest lines drop silently once full — export
-# past this point only covers the most recent _LOG_BUFFER_MAXLEN lines.
+# Cap LogPane._line_buffer so tailing a noisy container can't grow memory
+# without bound. Export only includes the most recent `_LOG_BUFFER_MAXLEN` lines.
 _LOG_BUFFER_MAXLEN = 20_000
+
+# How often the UI drains queued log lines. Batching avoids per-line
+# cross-thread dispatch under heavy log traffic, keeping the UI responsive at
+# the cost of up to ~50 ms of display latency.
+_DRAIN_INTERVAL_SECONDS = 0.05
 
 
 def _highlight_match(line: str, term: str) -> str:
@@ -109,6 +113,16 @@ class LogPane(Widget):
         self._expanded = False
         self._stream_factory: Callable[[str, LogOptions], LogSource] | None = None
         self._line_buffer: deque[LogLine] = deque(maxlen=_LOG_BUFFER_MAXLEN)
+        # Lines the pump thread has queued since the last UI-thread drain.
+        # Swapped out for a fresh list under `_pending_lock` on each drain —
+        # the pump thread only ever appends, so the lock's critical sections
+        # stay tiny.
+        self._pending: list[LogLine] = []
+        self._pending_lock = threading.Lock()
+        self._drain_timer: Timer | None = None
+        # Cached at mount so the pump-thread drain (and every other hot-path
+        # write) skips a `query_one` per call.
+        self._log_view: RichLog | None = None
         self._filter: str = ""
         self._filter_timer: Timer | None = None
         self._options = default_options or LogOptions()
@@ -129,6 +143,7 @@ class LogPane(Widget):
 
     def on_mount(self) -> None:
         self.query_one(f"#{LOG_PANE_SEARCH_ID}", Input).display = False
+        self._log_view = self.query_one(f"#{LOG_PANE_VIEW_ID}", RichLog)
 
     @on(Button.Pressed, f"#{BTN_EXPAND_ID}")
     def _on_expand_pressed(self) -> None:
@@ -149,6 +164,14 @@ class LogPane(Widget):
         """Human-readable name of the current source (for the export filename)."""
         return self._container_name
 
+    @property
+    def _view(self) -> RichLog:
+        """The log `RichLog`, cached at mount — avoids a `query_one` on every
+        drained batch (the hot path a chatty stream exercises repeatedly)."""
+        if self._log_view is None:
+            self._log_view = self.query_one(f"#{LOG_PANE_VIEW_ID}", RichLog)
+        return self._log_view
+
     def load(
         self,
         container_id: str,
@@ -166,7 +189,7 @@ class LogPane(Widget):
         search_bar = self.query_one(f"#{LOG_PANE_SEARCH_ID}", Input)
         search_bar.value = ""
         search_bar.display = False
-        self.query_one(f"#{LOG_PANE_VIEW_ID}", RichLog).clear()
+        self._view.clear()
         self._start_follow()
         self._update_header()
 
@@ -203,7 +226,7 @@ class LogPane(Widget):
 
     def clear_log(self) -> None:
         self._line_buffer.clear()
-        self.query_one(f"#{LOG_PANE_VIEW_ID}", RichLog).clear()
+        self._view.clear()
 
     def toggle_search(self) -> None:
         search_bar = self.query_one(f"#{LOG_PANE_SEARCH_ID}", Input)
@@ -233,7 +256,7 @@ class LogPane(Widget):
 
     @on(Input.Submitted, f"#{LOG_PANE_SEARCH_ID}")
     def _on_filter_submitted(self, event: Input.Submitted) -> None:
-        self.query_one(f"#{LOG_PANE_VIEW_ID}", RichLog).focus()
+        self._view.focus()
 
     def on_key(self, event) -> None:
         search_bar = self.query_one(f"#{LOG_PANE_SEARCH_ID}", Input)
@@ -250,7 +273,7 @@ class LogPane(Widget):
         return not term or term.lower() in line.text.lower()
 
     def _render_to_view(self) -> None:
-        log_view = self.query_one(f"#{LOG_PANE_VIEW_ID}", RichLog)
+        log_view = self._view
         log_view.clear()
         term = self._filter
         count = 0
@@ -269,10 +292,20 @@ class LogPane(Widget):
 
     def _render_line(self, line: LogLine) -> None:
         if self._matches(line, self._filter):
-            log_view = self.query_one(f"#{LOG_PANE_VIEW_ID}", RichLog)
-            log_view.write(_render_log_line(line, self._filter, self._show_timestamps))
+            rendered = _render_log_line(line, self._filter, self._show_timestamps)
+            self._view.write(rendered)
             if self._filter:
                 self._match_count += 1
+
+    def _ingest_batch(self, batch: list[LogLine]) -> None:
+        """Apply one drained batch: store every line, render only if not
+        paused — mirrors what per-line `_store_line`/`_render_line` did, just
+        amortized over a batch instead of one `call_from_thread` hop each."""
+        for line in batch:
+            self._store_line(line)
+        if not self._paused:
+            for line in batch:
+                self._render_line(line)
 
     def toggle_timestamps(self) -> None:
         self._show_timestamps = not self._show_timestamps
@@ -282,7 +315,7 @@ class LogPane(Widget):
         self._wrap = not self._wrap
         # Set before re-rendering: RichLog decides wrapping as each line is
         # written, and _render_to_view rewrites the whole buffer.
-        self.query_one(f"#{LOG_PANE_VIEW_ID}", RichLog).wrap = self._wrap
+        self._view.wrap = self._wrap
         self._render_to_view()
 
     def jump(self, delta: int) -> None:
@@ -297,16 +330,14 @@ class LogPane(Widget):
             self._match_cursor = 0 if delta > 0 else self._match_count - 1
         else:
             self._match_cursor = (self._match_cursor + delta) % self._match_count
-        self.query_one(f"#{LOG_PANE_VIEW_ID}", RichLog).scroll_to(
-            y=self._match_cursor, animate=False
-        )
+        self._view.scroll_to(y=self._match_cursor, animate=False)
         self._update_header()
 
     def jump_home(self) -> None:
-        self.query_one(f"#{LOG_PANE_VIEW_ID}", RichLog).scroll_home(animate=False)
+        self._view.scroll_home(animate=False)
 
     def jump_end(self) -> None:
-        self.query_one(f"#{LOG_PANE_VIEW_ID}", RichLog).scroll_end(animate=False)
+        self._view.scroll_end(animate=False)
 
     def export_text(self) -> str:
         """The full buffer as plain text (timestamps + stderr markers)."""
@@ -319,7 +350,7 @@ class LogPane(Widget):
         self._line_buffer.clear()
         self._match_cursor = -1
         self._match_count = 0
-        self.query_one(f"#{LOG_PANE_VIEW_ID}", RichLog).clear()
+        self._view.clear()
         self._start_follow()
         self._update_header()
 
@@ -336,34 +367,65 @@ class LogPane(Widget):
         self._log_stream = log_stream
         self._following = True
         self._paused = False
+        with self._pending_lock:
+            self._pending = []
         threading.Thread(
             target=self._stream_logs, args=(generation, log_stream), daemon=True
         ).start()
+        self._drain_timer = self.set_interval(
+            _DRAIN_INTERVAL_SECONDS, self._drain_pending
+        )
 
     def _stream_logs(self, generation: int, log_stream: LogSource) -> None:
+        """Pump thread: only ever appends to `_pending` — no UI-thread hop per
+        line. `_drain_pending` (a UI-side timer) and `_on_stream_ended` (below)
+        are the sole consumers, both running on the UI thread."""
         for line in log_stream:
             if not self._following or self._generation != generation:
                 break
-
-            try:
-                self.app.call_from_thread(self._store_line, line)
-                if not self._paused:
-                    self.app.call_from_thread(self._render_line, line)
-            except Exception:
-                break
+            with self._pending_lock:
+                self._pending.append(line)
         if self._generation == generation:
             self._following = False
             try:
-                self.app.call_from_thread(self._update_header)
+                self.app.call_from_thread(self._on_stream_ended)
             except Exception:
                 pass
+
+    def _drain_pending(self) -> None:
+        """UI-thread timer callback: flush whatever the pump thread queued
+        since the last tick, in one pass."""
+        with self._pending_lock:
+            if not self._pending:
+                return
+            batch = self._pending
+            self._pending = []
+        self._ingest_batch(batch)
+        self._update_header()
+
+    def _on_stream_ended(self) -> None:
+        """The stream is done (or was superseded) — flush any residual lines
+        before reflecting "stream ended" in the header, so nothing queued
+        right before the end is silently dropped. Also stops the drain timer:
+        `_start_follow`/`stop_follow` are the only other places that would
+        otherwise stop it, so a naturally-finished stream would leave it
+        ticking at 20Hz for no reason until the pane is reloaded or closed."""
+        if self._drain_timer is not None:
+            self._drain_timer.stop()
+            self._drain_timer = None
+        self._drain_pending()
+        self._update_header()
 
     def stop_follow(self) -> None:
         self._following = False
         self._paused = False
+        if self._drain_timer is not None:
+            self._drain_timer.stop()
+            self._drain_timer = None
         if self._log_stream is not None:
             self._log_stream.stop()
             self._log_stream = None
+        self._drain_pending()
 
     def on_unmount(self) -> None:
         self.stop_follow()

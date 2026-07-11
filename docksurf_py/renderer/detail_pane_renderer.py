@@ -58,6 +58,10 @@ class DetailPaneRenderer(_Base):
             self._show_project_details(pane, item)
             return
         c = item
+        # env/health-log/started-at/restart-count aren't in the list summary.
+        # They're fetched lazily on selection, cached by container id, and remain
+        # `None` until that fetch succeeds (or fails).
+        detail = self._container_details.get(c.id)
 
         identity = {"ID": _dim(c.id), "Image": c.image_name}
         if c.is_compose:
@@ -65,13 +69,19 @@ class DetailPaneRenderer(_Base):
             identity["Service"] = c.compose_service
         identity["Image SHA"] = _dim(c.image_id)
 
+        uptime = format_uptime(detail.started_at) if detail else (c.uptime_hint or "—")
+        restarts = (
+            _flag(
+                detail.restart_count, when=detail.restart_count > 0, color=STATUS_YELLOW
+            )
+            if detail
+            else SafeMarkup("[dim]…[/]")
+        )
         runtime = {
             "Status": _status_markup(c),
             "Health": _health_markup(c),
-            "Uptime": format_uptime(c.started_at),
-            "Restarts": _flag(
-                c.restart_count, when=c.restart_count > 0, color=STATUS_YELLOW
-            ),
+            "Uptime": uptime,
+            "Restarts": restarts,
             "Exit Code": (
                 "—"
                 if c.running
@@ -88,9 +98,11 @@ class DetailPaneRenderer(_Base):
         pane.update_details(
             f"Container: {c.name}",
             {"Identity": identity, "Runtime": runtime, "Network": network},
-            env_text=format_env(c.env, reveal=self._reveal_secrets),
+            env_text=format_env(detail.env, reveal=self._reveal_secrets)
+            if detail
+            else "…",
             env_masked=not self._reveal_secrets,
-            health_log=_format_health_log(c.health_log),
+            health_log=_format_health_log(detail.health_log) if detail else None,
             border_style=_status_color(c),
         )
         pane.clear_topology()

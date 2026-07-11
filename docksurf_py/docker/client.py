@@ -30,7 +30,7 @@ from docksurf_py.docker.context import (
     _load_last_context,
     _save_last_context,
 )
-from docksurf_py.docker.fetcher import DockerResourceFetcher
+from docksurf_py.docker.fetcher import DockerResourceFetcher, _parse_container_detail
 from docksurf_py.docker.format import _parse_system_df, format_size
 from docksurf_py.docker.streams import (
     EventStream,
@@ -42,6 +42,7 @@ from docksurf_py.docker.streams import (
 from docksurf_py.models import (
     CommandErrorKind,
     CommandResult,
+    ContainerDetail,
     ContainerTop,
     ContextInfo,
     DockerSnapshot,
@@ -221,6 +222,8 @@ class DockerClient:
         if not self.is_connected:
             return
         self._sdk = None
+        if self._fetcher is not None:
+            self._fetcher.close()
         self._fetcher = None
         classified = _classify_docker_error(exc)
         # Preserve the context/host we were actually using — `_classify_docker_error`
@@ -370,6 +373,25 @@ class DockerClient:
             logger.warning("Architecture lookup failed for %s: %s", image_id, e)
             return None
 
+    def container_detail(self, container_id: str) -> ContainerDetail | None:
+        """Detail-pane-only container fields — `None` on error.
+
+        Unlike `get_containers()`, this performs a full inspect to retrieve fields
+        missing from the `/containers/json` summary (env, health log, precise start
+        time, restart count). Fetched lazily when the detail pane is shown.
+        """
+        if not self._sdk:
+            return None
+        try:
+            attrs = self._sdk.containers.get(container_id).attrs
+        except NotFound:
+            logger.warning("Detail: container %s not found", container_id)
+            return None
+        except (APIError, DockerException, requests.exceptions.RequestException) as e:
+            logger.warning("Detail fetch failed for %s: %s", container_id, e)
+            return None
+        return _parse_container_detail(attrs)
+
     def volume_sizes(self) -> dict[str, int]:
         """Per-volume on-disk size, keyed by volume name (`docker system df -v`).
 
@@ -412,15 +434,12 @@ class DockerClient:
     # --- Writes ---
 
     def switch_context(self, name: str) -> CommandResult:
-        """Switch DockSurf's own Docker connection to another context.
+        """Switch DockSurf's Docker connection to another context.
 
-        In-app only: unlike `docker context use`, this never touches
-        `~/.docker/config.json`, so every other terminal keeps whatever
-        context it already had. Builds and pings a fresh client scoped to
-        the target context *before* touching `self._sdk`/`self.connection`,
-        so a failed switch (e.g. an unreachable remote host) leaves the
-        current working connection untouched. On success the choice is
-        persisted so it survives an app restart.
+        Unlike `docker context use`, this only affects the app and never modifies
+        `~/.docker/config.json`. The new client is created and pinged before
+        replacing the current connection, so a failed switch leaves the existing
+        connection intact. On success the selection is persisted.
         """
         try:
             from docker.context import ContextAPI
@@ -443,8 +462,12 @@ class DockerClient:
                 kind=CommandErrorKind.DAEMON_UNREACHABLE,
             )
 
+        # Keep the current fetcher until the new client has been validated.
+        old_fetcher = self._fetcher
         self._sdk = sdk
         self._fetcher = DockerResourceFetcher(sdk)
+        if old_fetcher is not None:
+            old_fetcher.close()
         self._context_override = name
         self.connection = ConnectionState(
             status=ConnectionStatus.CONNECTED,
