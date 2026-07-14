@@ -2,51 +2,99 @@
 
 from textual.theme import Theme
 
-DOCKSURF_OCEAN = Theme(
-    name="docksurf-ocean",
-    primary="#22D3C0",
-    secondary="#2E7DB2",
-    accent="#FF8A5B",
-    foreground="#E4F3F1",
-    background="#061620",
-    surface="#0E2430",
-    panel="#123044",
-    success="#4ADE9B",
-    warning="#F2B84B",
-    error="#E9505A",
-    dark=True,
-)
-
 DOCKSURF_NIGHTCITY = Theme(
     name="docksurf-nightcity",
-    primary="#FF2E92",
-    secondary="#7B2FF7",
-    accent="#00E5FF",
+    primary="#2B2D2DFF",
+    secondary="#4A4159",
+    accent="#3D5B5E",
     foreground="#E4DCF5",
-    background="#0B0714",
-    surface="#150F24",
-    panel="#1D1530",
-    success="#05FFA1",
-    warning="#F9F002",
-    error="#FF3864",
+    background="#0D0C0D",
+    surface="#3F2C3E",
+    panel="#141317",
+    success="#639B65",
+    warning="#B0916F",
+    error="#B35959",
+    dark=True,
+    variables={
+        "scrollbar-background": "#221E24",
+        "scrollbar": "#6E6178",
+        "scrollbar-hover": "#8A7B94",
+        "scrollbar-active": "#B3A3C2",
+    },
+)
+
+DOCKSURF_LINEN = Theme(
+    name="docksurf-linen",
+    primary="#A6875D",
+    secondary="#6E6A63",
+    accent="#8C6239",
+    foreground="#2A241C",
+    background="#F6F3EC",
+    surface="#EDE6D8",
+    panel="#E2D9C6",
+    success="#3F6B3F",
+    warning="#8A5A2E",
+    error="#8B3A3A",
+    dark=False,
+)
+
+DOCKSURF_FOREST = Theme(
+    name="docksurf-forest",
+    primary="#4CAF7D",
+    secondary="#C9A66B",
+    accent="#5EC8E0",
+    foreground="#E6F1E9",
+    background="#0A130E",
+    surface="#111F17",
+    panel="#182B1F",
+    success="#7FD858",
+    warning="#F2A65A",
+    error="#E85D5D",
     dark=True,
 )
 
-DOCKSURF_AUGGOLD = Theme(
-    name="docksurf-auggold",
-    primary="#D4A24C",
-    secondary="#5C6773",
-    accent="#F5C158",
-    foreground="#EDE3D0",
-    background="#0C0B09",
-    surface="#1A1611",
-    panel="#241E16",
-    success="#7FA65C",
-    warning="#C97A34",
-    error="#B23A3A",
+DOCKSURF_SAKURA = Theme(
+    name="docksurf-sakura",
+    primary="#E7B6C3",
+    secondary="#5B4B8A",
+    accent="#A0A7BA",
+    foreground="#2B1B22",
+    background="#FBCAD7",
+    surface="#F3E4E9",
+    panel="#ECD8DF",
+    success="#1B7A43",
+    warning="#C9A27F",
+    error="#A31D1D",
+    dark=False,
+)
+
+DOCKSURF_ABYSS = Theme(
+    name="docksurf-abyss",
+    primary="#5A8EC4",
+    secondary="#8172B8",
+    accent="#F03DAE",
+    foreground="#C9D9E8",
+    background="#03050A",
+    surface="#080D16",
+    panel="#0D1420",
+    success="#3FC7D9",
+    warning="#B5C23D",
+    error="#C6634A",
     dark=True,
 )
 
-CUSTOM_THEMES = [DOCKSURF_OCEAN, DOCKSURF_NIGHTCITY, DOCKSURF_AUGGOLD]
+CUSTOM_THEMES = [
+    DOCKSURF_NIGHTCITY,
+    DOCKSURF_LINEN,
+    DOCKSURF_FOREST,
+    DOCKSURF_SAKURA,
+    DOCKSURF_ABYSS,
+]
 
-DEFAULT_THEME_NAME = DOCKSURF_OCEAN.name
+DEFAULT_THEME_NAME = DOCKSURF_ABYSS.name
+
+TERMINAL_NATIVE_THEME_NAMES = ["ansi-dark", "ansi-light"]
+
+THEME_CYCLE_NAMES = [
+    theme.name for theme in CUSTOM_THEMES
+] + TERMINAL_NATIVE_THEME_NAMES

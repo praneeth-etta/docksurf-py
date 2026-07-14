@@ -205,17 +205,23 @@ class SnapshotManager(_Base):
             return
         for idx, item in enumerate(self._current.get(tab_id, [])):
             if self._row_key(item) == focus_key:
-                self.query_one(f"#{entry.table_id}", DataTable).move_cursor(row=idx)
-                pane = self.query_one(f"#{DETAIL_PANE_ID}", DetailPane)
-                try:
-                    entry.show_details(pane, idx)
-                except IndexError:
-                    pane.clear_details()
-                # If the cursor stayed on the same row, `RowHighlighted` won't fire.
-                # Refresh dependent panes (stats, top, container details) explicitly.
-                self._sync_stats()
-                self._sync_top()
-                self._sync_container_detail()
+                table = self.query_one(f"#{entry.table_id}", DataTable)
+                # `RowHighlighted` only fires when the cursor's coordinate actually
+                # changes, so only drive the detail pane / live panes here when the
+                # cursor is not about to move, otherwise the event handler
+                # (`DockSurfApp.update_details`) does it, and doing both
+                # renders everything twice.
+                cursor_will_move = table.cursor_row != idx
+                table.move_cursor(row=idx)
+                if not cursor_will_move:
+                    pane = self.query_one(f"#{DETAIL_PANE_ID}", DetailPane)
+                    try:
+                        entry.show_details(pane, idx)
+                    except IndexError:
+                        pane.clear_details()
+                    self._sync_stats()
+                    self._sync_top()
+                    self._sync_container_detail()
                 return
         # The previously-focused resource is gone — select the first row.
         self._auto_select_first()

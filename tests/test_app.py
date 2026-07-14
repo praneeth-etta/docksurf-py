@@ -1190,7 +1190,7 @@ class SessionRestoreTests(unittest.IsolatedAsyncioTestCase):
         app = DockSurfApp(docker=svc, session=SessionState(theme="not-a-theme"))
         async with app.run_test() as pilot:
             await pilot.pause()
-            self.assertEqual(app.theme, "docksurf-ocean")
+            self.assertEqual(app.theme, "docksurf-abyss")
 
     async def test_cycle_theme_key_cycles_and_persists(self) -> None:
         svc = MockDockerService(lambda: EMPTY_SNAPSHOT)
@@ -1201,11 +1201,11 @@ class SessionRestoreTests(unittest.IsolatedAsyncioTestCase):
                 # Key-press tests need explicit focus on the container table —
                 # see TabNavigationTests/LogViewerTests._open_logs.
                 app.query_one(f"#{TableID.CONTAINERS}", DataTable).focus()
-                self.assertEqual(app.theme, "docksurf-ocean")
+                self.assertEqual(app.theme, "docksurf-abyss")
                 await pilot.press("M")
                 await pilot.pause()
-                self.assertEqual(app.theme, "docksurf-nightcity")
-                self.assertEqual(app._session.theme, "docksurf-nightcity")
+                self.assertEqual(app.theme, "ansi-dark")
+                self.assertEqual(app._session.theme, "ansi-dark")
         save.assert_called()
 
 

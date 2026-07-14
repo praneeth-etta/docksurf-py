@@ -75,7 +75,7 @@ from docksurf_py.search import (
 )
 from docksurf_py.service import DockerService
 from docksurf_py.session import SessionState, load_session, save_session
-from docksurf_py.themes import CUSTOM_THEMES, DEFAULT_THEME_NAME
+from docksurf_py.themes import CUSTOM_THEMES, DEFAULT_THEME_NAME, THEME_CYCLE_NAMES
 from docksurf_py.widgets import (
     ConnectionIndicator,
     ContainerTable,
@@ -595,8 +595,9 @@ class DockSurfApp(
             self.notify("Nothing to create on this tab", severity="information")
 
     def action_cycle_theme(self) -> None:
-        """`M`: cycle through just the 3 curated DockSurf themes."""
-        names = [t.name for t in CUSTOM_THEMES]
+        """`M`: cycle through the curated DockSurf themes, plus the
+        terminal-native ansi-dark/ansi-light options at the end."""
+        names = THEME_CYCLE_NAMES
         idx = names.index(self.theme) if self.theme in names else -1
         next_name = names[(idx + 1) % len(names)]
         self.theme = next_name

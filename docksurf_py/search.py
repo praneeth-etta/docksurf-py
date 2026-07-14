@@ -23,7 +23,14 @@ else:
 
 
 def _matches_container(c: Container, q: str) -> bool:
-    return q in c.name.lower() or q in c.image_name.lower() or q in c.status.lower()
+    return (
+        q in c.name.lower()
+        or q in c.image_name.lower()
+        or q in c.status.lower()
+        or q in c.id.lower()
+        or q in c.compose_project.lower()
+        or q in c.compose_service.lower()
+    )
 
 
 def _matches_image(i: Image, q: str) -> bool:

@@ -6,6 +6,7 @@
      2. Overlays & overlays
      3. ConfirmDialog  (migrated from widgets.py DEFAULT_CSS)
      4. LogPane        (migrated from widgets.py DEFAULT_CSS)
+     5. Toast          (ansi-dark/ansi-light contrast fix)
    ========================================================================= */
 
 
@@ -444,4 +445,20 @@ ContainerPickerScreen Button {
     background: $surface-lighten-1;
     color: $text;
     padding: 0 2;
+}
+
+Toast:ansi:dark {
+    color: ansi_white;
+}
+
+Toast:ansi:light {
+    color: ansi_black;
+}
+
+Toast:ansi:dark .toast--title {
+    color: ansi_white;
+}
+
+Toast:ansi:light .toast--title {
+    color: ansi_black;
 }
