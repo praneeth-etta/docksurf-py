@@ -34,7 +34,7 @@ else:
 logger = logging.getLogger(__name__)
 
 
-def _bar(percent: float, width: int = 12) -> str:
+def _bar(percent: float, width: int = 40) -> str:
     """A fixed-width colour-coded usage bar as Rich markup."""
     filled = max(0, min(width, round(percent / 100 * width)))
     return f"[green]{'█' * filled}[/][dim]{'░' * (width - filled)}[/]"

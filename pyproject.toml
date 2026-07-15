@@ -1,14 +1,45 @@
 [project]
 name = "docksurf"
 version = "0.1.0"
-description = "Terminal UI for visualising Docker containers, images, volumes and networks"
+description = "Live, keyboard-driven terminal UI for Docker: Compose-aware, real-time stats, zero polling — manage containers, images, volumes, and networks without leaving the terminal"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.11"
+authors = [
+    { name = "praneeth reddy etta", email = "praneethetta@gmail.com" },
+]
+maintainers = [
+    { name = "praneeth reddy etta", email = "praneethetta@gmail.com" },
+]
+keywords = ["docker", "tui", "terminal", "textual", "containers", "devtools"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: User Interfaces",
+    "Topic :: System :: Systems Administration",
+    "Topic :: Terminals",
+    "Typing :: Typed",
+]
 dependencies = [
     "textual>=0.80.0",
     "rich>=13.0.0",
     "docker>=7.1.0",
     "platformdirs>=4.0.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/praneeth-etta/docksurf"
+Repository = "https://github.com/praneeth-etta/docksurf"
+Issues = "https://github.com/praneeth-etta/docksurf/issues"
+Changelog = "https://github.com/praneeth-etta/docksurf/blob/main/CHANGELOG.md"
 
 [project.scripts]
 docksurf = "docksurf_py.app:main"

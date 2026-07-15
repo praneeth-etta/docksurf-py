@@ -88,7 +88,7 @@ def _new_client(
     context_override: str | None = None, host_override: str | None = None
 ) -> DockerClient:
     """A `DockerClient()` that never picks up a real persisted context
-    override from this machine's `~/.local/share/docksurf-py/state.json`,
+    override from this machine's `~/.local/share/docksurf/state.json`,
     so these tests stay hermetic regardless of host state."""
     with patch("docksurf_py.docker.client._load_last_context", return_value=None):
         return DockerClient(

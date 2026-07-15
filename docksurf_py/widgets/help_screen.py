@@ -3,7 +3,7 @@
 from rich.table import Table
 from textual import on
 from textual.app import ComposeResult
-from textual.containers import Vertical
+from textual.containers import Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import Button, Label, Static
 
@@ -79,7 +79,8 @@ class HelpScreen(ModalScreen):
 
         with Vertical():
             yield Label("[b]Help[/b]", id="help-title")
-            yield Static(table)
+            with VerticalScroll():
+                yield Static(table)
             yield Button("Close", variant="primary", id="help-close")
 
     @on(Button.Pressed, "#help-close")

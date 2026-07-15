@@ -23,6 +23,8 @@ A keyboard-driven terminal UI for visualising and managing Docker resources like
   q Quit  r Refresh  / Search  ? Help  l Logs  s Stop  u Up  k Down  w Disk
 ```
 
+**Docs:** [Quickstart](QUICKSTART.md) · [Full keybindings reference](KEYBINDINGS.md) · [Changelog](CHANGELOG.md)
+
 ## Highlights
 
 - **Live by default** — the tables auto-refresh on `docker events` (container start/stop/die, image pull/delete, …); `r` is a manual reload.
@@ -49,6 +51,8 @@ A keyboard-driven terminal UI for visualising and managing Docker resources like
 
 ## Install
 
+See [QUICKSTART.md](QUICKSTART.md) for install + first steps in under 2 minutes.
+
 ```bash
 git clone <repo>
 cd docksurf
@@ -67,78 +71,23 @@ uv run python -m docksurf_py.app
 
 ## Keybindings
 
-### Global
+The essentials — full reference (per-tab keys, log pane, Compose header behaviour) lives in [KEYBINDINGS.md](KEYBINDINGS.md).
 
-| Key     | Action                                                    |
-|---------|------------------------------------------------------------|
-| `r`     | Refresh all Docker data                                    |
-| `/`     | Open search / filter for active tab                        |
-| `i`     | Inspect focused resource — full `docker inspect` JSON, searchable (works on any tab) |
-| `P`     | Prune menu — stopped containers / dangling images / unused volumes / unused networks / everything |
-| `w`     | Disk-usage screen (`docker system df`)                     |
-| `D`     | Switch Docker context — in-app only, never touches `docker context use` (see [Docker contexts](#docker-contexts--local-and-remote)) |
-| `space` | Mark the focused row for a bulk action (or collapse/expand a Compose project header — see below) |
-| `escape`| Clear all marks on the active tab (no-op if nothing's marked) |
-| `?`     | Help screen                                                 |
-| `q`     | Quit                                                        |
-| `d`     | Delete the selected resource — or every marked resource — with confirmation |
-| `Tab`   | Switch between tabs                                         |
-| `↑/↓`   | Navigate rows                                               |
-
-**Multi-select + bulk actions**: mark any number of rows with `space` (on any tab), then `s`/`S`/`d` act on the whole marked set instead of just the focused row — e.g. mark five stopped test containers and `d` once to remove them all behind a single confirmation. Bulk stop/start silently skips marked containers that don't qualify (already stopped/running); bulk delete reuses each resource's normal guards (in-use volumes, built-in networks aren't touched).
-
-### Containers tab
-
-The container/project keys are context-sensitive: on a Compose **project header** (compose stack) row they act on the whole project; on a single container row they act on that container. When rows are marked, `s`/`S` act on the marked set instead (see above).
-
-| Key | On a container row                              | On a project header row          |
-|-----|--------------------------------------------------|-----------------------------------|
-| `s` | Stop container                                    | Stop whole project               |
-| `S` | Start container                                   | Start whole project              |
-| `x` | Restart container                                 | Restart whole project            |
-| `p` | Pause / unpause container                         | —                                 |
-| `K` | Kill container (`SIGKILL`) — no confirmation, the escape hatch when `stop` hangs | — |
-| `l` | Toggle log viewer                                 | Aggregated project logs          |
-| `e` | Exec shell (`bash`→`sh`)                          | —                                 |
-| `E` | Exec with a custom command and/or user (`-u`), pre-filled with the detected shell | — |
-| `t` | Toggle a `docker top` running-process snapshot in the detail pane | — |
-| `C` | Copy files in/out of the container (`docker cp`), via a source/destination prompt | — |
-| `u` | Compose **up** (`docker compose up -d`) — brings the focused project up |
-| `k` | Compose **down** (`docker compose down`, confirmed) — tears the project down |
-| `space` | Mark for bulk action                          | Collapse / expand project group  |
-
-### Images / Volumes / Networks tabs
-
-Like the container keys, these are tab-scoped — each acts on the focused row of its tab (and no-ops with a hint elsewhere). `+` is shared: it creates/pulls whatever the active tab holds.
-
-| Key | Tab       | Action                                                             |
-|-----|-----------|--------------------------------------------------------------------|
-| `+` | Images    | **Pull** an image (`name:tag`) with a live progress view           |
-| `+` | Volumes   | **Create** a volume (name / driver / labels prompt)                |
-| `+` | Networks  | **Create** a network (name / driver / subnet prompt)               |
-| `h` | Images    | **Layer history** (`docker history`) — per-layer command + size    |
-| `y` | Images    | **Tag** the selected image (repository / tag prompt)               |
-| `a` | Images    | **Mark all dangling** images — then `d` removes them as a batch    |
-| `b` | Volumes   | **Size on disk** for the selected volume (on-demand; it's slow)    |
-| `v` | Networks  | **Connect** a container to the network (pick from a list)          |
-| `m` | Networks  | **Disconnect** a container from the network (pick from a list)     |
-
-### Log pane (when open)
-
-| Key       | Action                                                           |
-|-----------|------------------------------------------------------------------|
-| `f`       | Toggle live log follow (pause / resume)                          |
-| `/`       | Filter to matching lines; matches are highlighted (Esc to clear) |
-| `n` / `N` | Jump to next / previous match (with a `k/N` counter in the header) |
-| `T`       | Show / hide timestamps                                           |
-| `o`       | Log options — tail depth (100 / 500 / 5000 / all) and a `--since` window |
-| `W`       | Toggle line wrap (for long JSON lines)                           |
-| `g` / `G` | Jump to top / bottom of the buffer                               |
-| `X`       | Export the buffer to a file (`~/.local/share/docksurf-py/exports/`) |
-| `z`       | Expand log pane to full width / collapse                         |
-| `l`       | Close log viewer, return to detail pane                          |
-
-The `⛶ Expand` / `⊡ Collapse` button in the log toolbar is also clickable.
+| Key          | Action                                                 |
+|--------------|----------------------------------------------------------|
+| `?`          | Help screen — every keybinding, in-app                   |
+| `r`          | Refresh all Docker data                                  |
+| `/`          | Search / filter the active tab                           |
+| `↑/↓`, `Tab` | Navigate rows / switch tabs                              |
+| `s`/`S`/`x`  | Stop / start / restart (Containers tab)                  |
+| `e`          | Exec shell into the focused container                    |
+| `l`          | Toggle log viewer                                        |
+| `space`      | Mark for a bulk action                                   |
+| `d`          | Delete the selected — or marked — resource(s)            |
+| `i`          | Inspect (raw `docker inspect` JSON)                      |
+| `P`          | Prune menu                                               |
+| `D`          | Switch Docker context                                    |
+| `q`          | Quit                                                     |
 
 ## Tabs
 
@@ -189,7 +138,7 @@ docker context create prod --docker "host=ssh://user@prod.example.com"
 docker context create staging --docker "host=tcp://staging.example.com:2375"
 ```
 
-**Switching contexts from inside DockSurf** — press `D` to list every context `docker context ls` knows about and pick one. This is in-app only: it never runs `docker context use`, so it doesn't touch `~/.docker/config.json` or repoint any other terminal's `docker`/`docker compose` — DockSurf just opens its own connection to the chosen context's daemon. The choice is remembered across restarts (`~/.local/share/docksurf-py/state.json`).
+**Switching contexts from inside DockSurf** — press `D` to list every context `docker context ls` knows about and pick one. This is in-app only: it never runs `docker context use`, so it doesn't touch `~/.docker/config.json` or repoint any other terminal's `docker`/`docker compose` — DockSurf just opens its own connection to the chosen context's daemon. The choice is remembered across restarts (`~/.local/share/docksurf/state.json`).
 
 **Auto-reconnect** — if the daemon your active context points at goes down mid-session (VM reboot, daemon restart, network blip), the status bar flags it immediately (`● <reason>`) and DockSurf retries on its own every couple of seconds, reconnecting and refreshing the moment it's back — no restart, no manual `r`.
 
@@ -203,4 +152,8 @@ Any endpoint that speaks the **Docker Engine API** works this way — a plain Li
 
 ## Logging
 
-App logs are written to `~/.local/share/docksurf-py/docksurf.log` — never to stdout (which belongs to the TUI). Useful for debugging refresh errors, failed Docker API calls, container/Compose action results, and stream lifecycle events.
+App logs are written to `~/.local/share/docksurf/docksurf.log` — never to stdout (which belongs to the TUI). Useful for debugging refresh errors, failed Docker API calls, container/Compose action results, and stream lifecycle events.
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md) for release history.

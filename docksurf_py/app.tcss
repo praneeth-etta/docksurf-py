@@ -159,8 +159,7 @@ HelpScreen {
 
 HelpScreen > Vertical {
     width: 70;
-    height: auto;
-    max-height: 85%;
+    height: 85%;
     border: double $accent;
     background: $surface;
     padding: 1 3;
@@ -172,6 +171,11 @@ HelpScreen #help-title {
     margin-bottom: 0;
     color: $accent;
     text-style: bold;
+}
+
+HelpScreen VerticalScroll {
+    height: 1fr;
+    border: solid $primary-background-lighten-2;
 }
 
 HelpScreen Static{
