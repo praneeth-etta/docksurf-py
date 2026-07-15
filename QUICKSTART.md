@@ -4,6 +4,20 @@ Get DockSurf running in a couple of minutes.
 
 ## 1. Install
 
+From [PyPI](https://pypi.org/project/docksurf/):
+
+```bash
+pip install docksurf
+```
+
+Or without installing, via [`uvx`](https://docs.astral.sh/uv/guides/tools/):
+
+```bash
+uvx docksurf
+```
+
+From source (development, or an unreleased change):
+
 ```bash
 git clone <repo>
 cd docksurf
@@ -38,7 +52,7 @@ docksurf --config ~/alt-config.toml      # a non-default config.toml
 
 ## 3. First things to try
 
-- `↑` / `↓` and `Tab` — move around the table and switch between Containers / Images / Volumes / Networks tabs
+- `↑` / `↓` and `Tab` — move around the table and switch between Containers / Images / Volumes / Networks tabs (or jump straight there with `1`-`4`)
 - Select a running container and glance at the detail pane — image, ports, uptime, live CPU/mem/net stats
 - `l` — open the log viewer for the selected container
 - `/` — search / filter the current tab

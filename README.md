@@ -2,43 +2,25 @@
 
 A keyboard-driven terminal UI for visualising and managing Docker resources like containers, images, volumes, and networks. Compose-aware and live: it reacts to Docker events on its own and streams real time resource usage, so you're observing, not polling. No GUI, no browser tab.
 
-```
-┌──────────────────────────────────────────────────────────────────────────────┐
-│  DockSurf                                                          12:34:56  │
-├──────────────────────────────────┬───────────────────────────────────────────┤
-│ Containers Images Volumes Nets   │  Container: myapp-api-1                   │
-│                                  │  ─────────────────────────────────────    │
-│ Name         Status   Health Up  │  Project    myapp                         │
-│ ▾ myapp      3/4 run             │  Service    api                           │
-│   ├ api      Up ✓     healthy 2h │  Status     Up 2 hours ✓                  │
-│   ├ web      Up       —       2h │  Health     healthy                       │
-│   └ worker   Exited(1)—       —  │  Uptime     2h     Restarts  0            │
-│ ▸ infra      2/2 run             │ ┌ Live stats: myapp-api-1 ──────────────┐ │
-│                                  │ │ CPU  ▐███▌     42.1%                  │ │
-│ redis        Up       —       5h │ │ MEM  ▐█▌  180 MiB / 512 MiB (35%)     │ │
-│                                  │ │ NET  ↓ 1.2 MB   ↑ 340 KB              │ │
-│                                  │ └───────────────────────────────────────┘ │
-└──────────────────────────────────┴───────────────────────────────────────────┘
-  Containers: 4 running / 1 stopped │ Images: 12 │ Volumes: 2 orphaned │ Context: default
-  q Quit  r Refresh  / Search  ? Help  l Logs  s Stop  u Up  k Down  w Disk
-```
+
+![docksurf's container tab](docksurf-container-tab.png)
 
 **Docs:** [Quickstart](QUICKSTART.md) · [Full keybindings reference](KEYBINDINGS.md) · [Changelog](CHANGELOG.md)
 
 ## Highlights
 
 - **Live by default** — the tables auto-refresh on `docker events` (container start/stop/die, image pull/delete, …); `r` is a manual reload.
-- **Docker Compose–aware** — containers are grouped by project into a collapsible tree, with project-wide up / down / stop / start / restart and interleaved, colour-coded-per-service logs.
+- **Local or remote** — honours your active `docker context` on startup, so it manages the same daemon your CLI does: local, Docker Desktop, Colima, or a remote host over SSH/TCP.
+- **Docker Compose aware** — containers are grouped by project into a collapsible tree, with project-wide up / down / stop / start / restart and interleaved, colour-coded-per-service logs.
 - **Live resource stats** — CPU %, memory, network and block I/O streamed into the detail pane for the selected running container.
-- **Full-control log viewer** — live follow, in-log search with `n`/`N` match jumping, a timestamps toggle, configurable tail depth and `--since` window, line wrap for long JSON, jump-to-top/bottom, and one-key export of the buffer to a file.
-- **Operational signals at a glance** — colour-coded health column, uptime and restart count, plus recent health-check probe output in the detail pane.
 - **Full lifecycle control** — pause/unpause and kill sit alongside stop/start/restart, so a `stop` that hangs on its 10s timeout never needs the CLI.
 - **Multi-select + bulk actions** — mark rows on any tab and stop/start/remove them as a batch; ideal for cleaning up after a test run.
 - **Inspect & prune** — the full raw `docker inspect` JSON for any resource in a searchable modal, plus a one-key menu to prune stopped containers, dangling images, unused volumes/networks, or everything at once.
 - **Image / volume / network operations** — pull images with live progress, view layer history, tag, and bulk-clean dangling images; create volumes and check per-volume disk size; create networks and connect/disconnect containers, with per-container IP/MAC in the detail pane.
 - **Power-user exec & copy** — a custom exec command with a chosen user, `docker cp` in/out of a container, and an on-demand `docker top` process snapshot, all via quick prompts.
+- **Full control log viewer** — live follow, in-log search with `n`/`N` match jumping, a timestamps toggle, configurable tail depth and `--since` window, line wrap for long JSON, jump-to-top/bottom, and one-key export of the buffer to a file.
+- **Operational signals at a glance** — colour-coded health column, uptime and restart count, plus recent health-check probe output in the detail pane.
 - **Disk usage** — a `docker system df` breakdown (per-type size + reclaimable) on demand.
-- **Local or remote** — honours your active `docker context` on startup, so it manages the same daemon your CLI does: local, Docker Desktop, Colima, or a remote host over SSH/TCP.
 - **In-app context switching** — list and switch Docker contexts from inside the TUI (`D`) without ever running `docker context use`, so other terminals keep whatever context they already had. The choice is remembered across restarts.
 - **Auto-reconnect** — if the daemon goes down mid-session, the status bar flags it immediately and DockSurf reconnects on its own the moment it's back, with a full refresh — no restart required.
 
@@ -52,6 +34,21 @@ A keyboard-driven terminal UI for visualising and managing Docker resources like
 ## Install
 
 See [QUICKSTART.md](QUICKSTART.md) for install + first steps in under 2 minutes.
+
+**From [PyPI](https://pypi.org/project/docksurf/):**
+
+```bash
+pip install docksurf
+docksurf
+```
+
+Or run it without installing, via [`uvx`](https://docs.astral.sh/uv/guides/tools/):
+
+```bash
+uvx docksurf
+```
+
+**From source** (for development, or to run an unreleased change):
 
 ```bash
 git clone <repo>
@@ -69,6 +66,10 @@ Or without installing:
 uv run python -m docksurf_py.app
 ```
 
+## Releases
+
+Published to PyPI via a tag-triggered GitHub Actions workflow (`.github/workflows/publish.yml`): pushing a `vX.Y.Z` tag builds the package and publishes it using [PyPI Trusted Publishing](https://docs.pypi.org/trusted-publishers/) (OIDC — no stored credentials), gated behind a manual approval step. See [CHANGELOG.md](CHANGELOG.md) for what's in each release.
+
 ## Keybindings
 
 The essentials — full reference (per-tab keys, log pane, Compose header behaviour) lives in [KEYBINDINGS.md](KEYBINDINGS.md).
@@ -79,6 +80,7 @@ The essentials — full reference (per-tab keys, log pane, Compose header behavi
 | `r`          | Refresh all Docker data                                  |
 | `/`          | Search / filter the active tab                           |
 | `↑/↓`, `Tab` | Navigate rows / switch tabs                              |
+| `1`-`4`      | Jump directly to Containers / Images / Volumes / Networks |
 | `s`/`S`/`x`  | Stop / start / restart (Containers tab)                  |
 | `e`          | Exec shell into the focused container                    |
 | `l`          | Toggle log viewer                                        |

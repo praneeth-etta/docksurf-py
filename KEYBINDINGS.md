@@ -19,6 +19,8 @@ Full keybinding reference for DockSurf. For the handful you'll use constantly, s
 | `d`     | Delete the selected resource — or every marked resource — with confirmation |
 | `Tab`   | Switch between tabs                                         |
 | `↑/↓`   | Navigate rows                                               |
+| `1`-`4` | Jump directly to the Containers / Images / Volumes / Networks tab |
+| `[` / `]` | Previous / next tab                                       |
 
 **Multi-select + bulk actions**: mark any number of rows with `space` (on any tab), then `s`/`S`/`d` act on the whole marked set instead of just the focused row — e.g. mark five stopped test containers and `d` once to remove them all behind a single confirmation. Bulk stop/start silently skips marked containers that don't qualify (already stopped/running); bulk delete reuses each resource's normal guards (in-use volumes, built-in networks aren't touched).
 
