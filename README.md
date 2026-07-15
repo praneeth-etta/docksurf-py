@@ -3,9 +3,9 @@
 A keyboard-driven terminal UI for visualising and managing Docker resources like containers, images, volumes, and networks. Compose-aware and live: it reacts to Docker events on its own and streams real time resource usage, so you're observing, not polling. No GUI, no browser tab.
 
 
-![docksurf's container tab](docksurf-container-tab.png)
+![docksurf's container tab](https://raw.githubusercontent.com/praneeth-etta/docksurf/main/docksurf-container-tab.png)
 
-**Docs:** [Quickstart](QUICKSTART.md) · [Full keybindings reference](KEYBINDINGS.md) · [Changelog](CHANGELOG.md)
+**Docs:** [Quickstart](https://github.com/praneeth-etta/docksurf/blob/main/QUICKSTART.md) · [Full keybindings reference](https://github.com/praneeth-etta/docksurf/blob/main/KEYBINDINGS.md) · [Changelog](https://github.com/praneeth-etta/docksurf/blob/main/CHANGELOG.md)
 
 ## Highlights
 
@@ -33,7 +33,7 @@ A keyboard-driven terminal UI for visualising and managing Docker resources like
 
 ## Install
 
-See [QUICKSTART.md](QUICKSTART.md) for install + first steps in under 2 minutes.
+See [QUICKSTART.md](https://github.com/praneeth-etta/docksurf/blob/main/QUICKSTART.md) for install + first steps in under 2 minutes.
 
 **From [PyPI](https://pypi.org/project/docksurf/):**
 
@@ -68,11 +68,11 @@ uv run python -m docksurf_py.app
 
 ## Releases
 
-Published to PyPI via a tag-triggered GitHub Actions workflow (`.github/workflows/publish.yml`): pushing a `vX.Y.Z` tag builds the package and publishes it using [PyPI Trusted Publishing](https://docs.pypi.org/trusted-publishers/) (OIDC — no stored credentials), gated behind a manual approval step. See [CHANGELOG.md](CHANGELOG.md) for what's in each release.
+Published to PyPI via a tag-triggered GitHub Actions workflow (`.github/workflows/publish.yml`): pushing a `vX.Y.Z` tag builds the package and publishes it using [PyPI Trusted Publishing](https://docs.pypi.org/trusted-publishers/) (OIDC — no stored credentials), gated behind a manual approval step. See [CHANGELOG.md](https://github.com/praneeth-etta/docksurf/blob/main/CHANGELOG.md) for what's in each release.
 
 ## Keybindings
 
-The essentials — full reference (per-tab keys, log pane, Compose header behaviour) lives in [KEYBINDINGS.md](KEYBINDINGS.md).
+The essentials — full reference (per-tab keys, log pane, Compose header behaviour) lives in [KEYBINDINGS.md](https://github.com/praneeth-etta/docksurf/blob/main/KEYBINDINGS.md).
 
 | Key          | Action                                                 |
 |--------------|----------------------------------------------------------|
@@ -158,4 +158,4 @@ App logs are written to `~/.local/share/docksurf/docksurf.log` — never to stdo
 
 ## Changelog
 
-See [CHANGELOG.md](CHANGELOG.md) for release history.
+See [CHANGELOG.md](https://github.com/praneeth-etta/docksurf/blob/main/CHANGELOG.md) for release history.

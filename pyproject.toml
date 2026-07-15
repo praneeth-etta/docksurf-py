@@ -1,6 +1,6 @@
 [project]
 name = "docksurf"
-version = "0.2.0"
+version = "0.2.1"
 description = "Live, keyboard-driven terminal UI for Docker: Compose-aware, real-time stats, zero polling — manage containers, images, volumes, and networks without leaving the terminal"
 readme = "README.md"
 license = "MIT"

@@ -13,6 +13,15 @@ PyPI publish workflow.
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-07-15
+
+### Fixed
+- README's screenshot and doc links (Quickstart/Keybindings/Changelog) used
+  paths relative to the repo, which only resolve on GitHub — PyPI renders the
+  README standalone with no bundled files, so the image showed as broken and
+  the doc links 404'd. Switched to absolute `github.com`/`raw.githubusercontent.com`
+  URLs, which work identically on both.
+
 ## [0.2.0] - 2026-07-15
 
 ### Added
