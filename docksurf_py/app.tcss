@@ -214,6 +214,30 @@ SystemDfScreen Button {
     width: 100%;
 }
 
+WhaleScreen {
+    align: center middle;
+    background: $background 60%;
+}
+
+WhaleScreen > Vertical {
+    width: 66;
+    height: auto;
+    border: double $accent;
+    background: $surface;
+    padding: 1 3;
+}
+
+WhaleScreen #whale-canvas {
+    margin: 1 0;
+    width: 100%;
+    content-align: center middle;
+}
+
+WhaleScreen Button {
+    margin-top: 1;
+    width: 100%;
+}
+
 InspectScreen {
     align: center middle;
     background: $background 60%;

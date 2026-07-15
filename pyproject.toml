@@ -1,5 +1,5 @@
 [project]
-name = "docksurf-py"
+name = "docksurf"
 version = "0.1.0"
 description = "Terminal UI for visualising Docker containers, images, volumes and networks"
 requires-python = ">=3.11"

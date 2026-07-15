@@ -8,6 +8,7 @@ key bindings, and wires the on_mount / action_refresh entry points.
 import argparse
 import logging
 from dataclasses import dataclass
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Callable, Iterable, Protocol
 
@@ -87,6 +88,7 @@ from docksurf_py.widgets import (
     SearchBar,
     StatusBar,
     VolumeTable,
+    WhaleScreen,
 )
 
 logger = logging.getLogger(__name__)
@@ -250,6 +252,8 @@ class DockSurfApp(
     LiveStatsController,
     App,
 ):
+    TITLE = "DockSurf"
+
     snapshot: DockerSnapshot | None = None
 
     docker: DockerService
@@ -318,6 +322,7 @@ class DockSurfApp(
         Binding("v", "network_connect", "Connect to network", show=False),
         Binding("m", "network_disconnect", "Disconnect from network", show=False),
         Binding("M", "cycle_theme", "Theme", show=True),
+        Binding("~", "show_whale", "Whale", show=True),
     ]
     CSS_PATH = "app.tcss"
 
@@ -652,6 +657,9 @@ class DockSurfApp(
             )
         )
 
+    def action_show_whale(self) -> None:
+        self.push_screen(WhaleScreen())
+
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -679,10 +687,14 @@ def main():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     log_file = DATA_DIR / "docksurf.log"
 
+    # Rotating FileHandlers, capped at 5MB per file, keeping
+    # 3 rotated backups (~20MB total)
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s  %(name)-30s  %(levelname)-8s  %(message)s",
-        handlers=[logging.FileHandler(log_file)],
+        handlers=[
+            RotatingFileHandler(log_file, maxBytes=5 * 1024 * 1024, backupCount=3)
+        ],
     )
     logger.info("DockSurf starting — log file: %s", log_file)
     DockSurfApp(

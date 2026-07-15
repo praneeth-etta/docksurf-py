@@ -34,6 +34,7 @@ from docksurf_py.widgets.tables import (
     NetworkTable,
     VolumeTable,
 )
+from docksurf_py.widgets.whale_screen import WhaleScreen
 
 __all__ = [
     "ContainerTable",
@@ -49,6 +50,7 @@ __all__ = [
     "LogOptionsScreen",
     "HelpScreen",
     "SystemDfScreen",
+    "WhaleScreen",
     "InspectScreen",
     "PruneScreen",
     "PullProgressScreen",

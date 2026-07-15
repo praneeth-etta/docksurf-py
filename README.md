@@ -1,4 +1,4 @@
-# docksurf-py
+# docksurf
 
 A keyboard-driven terminal UI for visualising and managing Docker resources like containers, images, volumes, and networks. Compose-aware and live: it reacts to Docker events on its own and streams real time resource usage, so you're observing, not polling. No GUI, no browser tab.
 
@@ -51,12 +51,12 @@ A keyboard-driven terminal UI for visualising and managing Docker resources like
 
 ```bash
 git clone <repo>
-cd docksurf-py
+cd docksurf
 
 uv venv && source .venv/bin/activate
 uv pip install -e .
 
-docksurf-py
+docksurf
 ```
 
 Or without installing:
