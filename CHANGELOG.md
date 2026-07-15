@@ -13,6 +13,13 @@ PyPI publish workflow.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-07-15
+
+### Added
+- PyPI install/release info
+- Add Container tab image in README
+- Include tab jump keys in docs
+
 ## [0.1.0] - 2026-07-15
 
 ### Added
