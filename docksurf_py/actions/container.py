@@ -14,6 +14,7 @@ from typing import Callable
 
 from rich.markup import escape
 from textual import work
+from textual.coordinate import Coordinate
 from textual.widgets import DataTable, TabbedContent
 
 from docksurf_py.actions.common import _PROJECT_HINT, _Base
@@ -26,6 +27,7 @@ from docksurf_py.models import (
     PortBinding,
 )
 from docksurf_py.paths import DATA_DIR
+from docksurf_py.renderer.table_renderer import _status_cell
 from docksurf_py.widgets import (
     ContainerPickerScreen,
     DetailPane,
@@ -189,6 +191,16 @@ class ContainerActionHandler(_Base):
             entry.show_details(pane, row)
         except IndexError:
             pass
+        # Refresh the row's Status cell too, now that its restart count (if
+        # any) is cached — `_status_cell` folds it in as a badge, but only
+        # once a container's been focused (see its own docstring for why).
+        rows = self._current.get(TabID.CONTAINERS, [])
+        item = rows[row] if row < len(rows) else None
+        if isinstance(item, Container) and item.id == container_id:
+            col = 1 + entry.columns.index("Status")
+            table.update_cell_at(
+                Coordinate(row, col), _status_cell(item, self._container_details)
+            )
 
     def _run_on_focused_container(
         self,

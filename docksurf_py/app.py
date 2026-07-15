@@ -337,7 +337,7 @@ class DockSurfApp(
         self._resource_registry = {
             TabID.CONTAINERS: ResourceEntry(
                 table_id=TableID.CONTAINERS,
-                columns=("Name", "Image", "Status", "Health", "Uptime"),
+                columns=("Name", "Image", "Status"),
                 label="container",
                 snapshot_items=lambda snap: snap.containers,
                 populate=self._populate_container_table,
@@ -348,12 +348,11 @@ class DockSurfApp(
                     "Name": lambda c: c.name.lower(),
                     "Image": lambda c: c.image_name.lower(),
                     "Status": lambda c: (not c.running, c.status.lower()),
-                    "Health": lambda c: c.health.lower(),
                 },
             ),
             TabID.IMAGES: ResourceEntry(
                 table_id=TableID.IMAGES,
-                columns=("Repository", "Tag", "Size"),
+                columns=("Repository", "Tag", "Size", "Status"),
                 label="image",
                 snapshot_items=lambda snap: snap.images,
                 populate=self._populate_image_table,
@@ -364,11 +363,12 @@ class DockSurfApp(
                     "Repository": lambda i: i.repository.lower(),
                     "Tag": lambda i: i.tag.lower(),
                     "Size": lambda i: i.size_bytes,
+                    "Status": lambda i: bool(i.used_by),
                 },
             ),
             TabID.VOLUMES: ResourceEntry(
                 table_id=TableID.VOLUMES,
-                columns=("Name", "Status"),
+                columns=("Name", "Size", "Status"),
                 label="volume",
                 snapshot_items=lambda snap: snap.volumes,
                 populate=self._populate_volume_table,
@@ -377,12 +377,13 @@ class DockSurfApp(
                 plan_delete=self._plan_volume_delete,
                 sort_keys={
                     "Name": lambda v: v.name.lower(),
+                    "Size": lambda v: self._volume_sizes.get(v.name, -1),
                     "Status": lambda v: bool(v.used_by),
                 },
             ),
             TabID.NETWORKS: ResourceEntry(
                 table_id=TableID.NETWORKS,
-                columns=("Name", "Driver", "Scope"),
+                columns=("Name", "Driver", "Scope", "Containers"),
                 label="network",
                 snapshot_items=lambda snap: snap.networks,
                 populate=self._populate_network_table,
@@ -434,7 +435,7 @@ class DockSurfApp(
         yield LoadingIndicator(id=REFRESH_LOADING_ID)
         yield SearchBar(placeholder="🔍 Filter...", id=SEARCH_BAR_ID)
         yield StatusBar(id=STATUS_BAR_ID)
-        yield Footer()
+        yield Footer(compact=True)
 
     def on_mount(self) -> None:
         self.docker = self._injected_docker

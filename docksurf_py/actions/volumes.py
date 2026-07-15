@@ -75,7 +75,9 @@ class VolumeActionHandler(_Base):
         self._volume_sizes = sizes
         if self.query_one(TabbedContent).active != TabID.VOLUMES:
             return
-        # Re-render the focused volume's detail so the Size row appears now.
+        # Re-render the table (Size column) and the focused volume's detail
+        # pane (Size row) now that sizes are known.
+        self._rerender_active_table()
         entry = self._resource_registry[TabID.VOLUMES]
         table = self.query_one(f"#{entry.table_id}", DataTable)
         row = table.cursor_row

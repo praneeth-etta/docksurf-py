@@ -2517,8 +2517,11 @@ class LiveSearchTests(unittest.IsolatedAsyncioTestCase):
             await pilot.click(f"#{SEARCH_BAR_ID}")
 
             with patch.object(app, "_apply_filter", wraps=app._apply_filter) as spy:
-                for ch in "redis":
-                    await pilot.press(ch)
+                # Batched into a single pilot.press() call — one
+                # `_wait_for_screen()` round-trip for the whole burst instead
+                # of one per character — to keep it well under the 0.2s
+                # debounce window even on a loaded CI runner.
+                await pilot.press(*"redis")
                 # Every prefix of "redis" already narrows the table to just
                 # the "redis" row (no other repo shares any of those letters),
                 # so wait for the debounced call itself to settle on the full
@@ -2558,8 +2561,7 @@ class InspectScreenFilterDebounceTests(unittest.IsolatedAsyncioTestCase):
             with patch.object(
                 screen, "_render_lines", wraps=screen._render_lines
             ) as spy:
-                for ch in "matches":
-                    await pilot.press(ch)
+                await pilot.press(*"matches")
                 # `_filter` updates synchronously per keystroke; the debounced
                 # re-render lags 0.2s behind it — wait for the render itself.
                 await wait_until(lambda: len(log_view.lines) == 1)

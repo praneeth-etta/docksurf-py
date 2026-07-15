@@ -33,6 +33,7 @@ from docksurf_py.models import (
 )
 from docksurf_py.renderer.common import _Base
 from docksurf_py.session import save_session
+from docksurf_py.topology import _network_members
 
 if TYPE_CHECKING:
     from docksurf_py.app import ResourceEntry
@@ -66,6 +67,22 @@ def _status_markup(c: Container) -> SafeMarkup:
     else:
         label = escape(c.status)  # paused, restarting, created
     return SafeMarkup(f"[{_status_color(c)}]{label}[/]")
+
+
+def _status_cell(
+    c: Container, container_details: dict[str, ContainerDetail]
+) -> SafeMarkup:
+    """Return the status markup, adding a restart-count badge if available.
+
+    Restart counts come from per-container inspect data, so the badge only
+    appears for containers whose details have already been loaded.
+    """
+    base = _status_markup(c)
+    detail = container_details.get(c.id)
+    if detail and detail.restart_count > 0:
+        badge = f"({detail.restart_count} restarts)"
+        return SafeMarkup(f"{base} [{STATUS_YELLOW}]{badge}[/]")
+    return base
 
 
 def _safe_row(table: DataTable, *values) -> None:
@@ -153,6 +170,24 @@ def _project_status_color(project: ComposeProject) -> str:
 def _project_status_markup(project: ComposeProject) -> SafeMarkup:
     summary = f"{project.running_count}/{project.total_count} running"
     return SafeMarkup(f"[{_project_status_color(project)}]{summary}[/]")
+
+
+def _image_status_markup(used_by: list[str]) -> SafeMarkup:
+    return markup_green("In Use") if used_by else markup_yellow("Unused")
+
+
+def _network_containers_markup(
+    network: Network, containers: list[Container]
+) -> SafeMarkup:
+    """`N attached (M running)` — the same endpoint↔container join the
+    topology diagram and clipboard summary already use (`topology.py`), so
+    the count here never drifts from what expanding the network shows."""
+    members = _network_members(network, containers)
+    if not members:
+        return SafeMarkup("[dim]0[/]")
+    running = sum(1 for m in members if m.running)
+    color = STATUS_GREEN if running == len(members) else STATUS_YELLOW
+    return SafeMarkup(f"[{color}]{len(members)} ({running} running)[/]")
 
 
 class TableRenderer(_Base):
@@ -295,8 +330,6 @@ class TableRenderer(_Base):
                 SafeMarkup(f"[b]{glyph} {escape(project.name)}[/b]"),
                 config,
                 _project_status_markup(project),
-                "",
-                "",
             )
             if collapsed:
                 continue
@@ -310,9 +343,7 @@ class TableRenderer(_Base):
                     _mark_cell(marked, self._row_key(c)),
                     name,
                     c.image_name,
-                    _status_markup(c),
-                    _health_markup(c),
-                    c.uptime_hint or "—",
+                    _status_cell(c, self._container_details),
                 )
 
         for c in standalone:
@@ -322,9 +353,7 @@ class TableRenderer(_Base):
                 _mark_cell(marked, self._row_key(c)),
                 c.name,
                 c.image_name,
-                _status_markup(c),
-                _health_markup(c),
-                c.uptime_hint or "—",
+                _status_cell(c, self._container_details),
             )
 
         self._current[TabID.CONTAINERS] = rows
@@ -361,6 +390,7 @@ class TableRenderer(_Base):
                 i.repository,
                 i.tag,
                 format_size(i.size_bytes),
+                _image_status_markup(i.used_by),
             )
 
     def _populate_volume_table(
@@ -374,7 +404,15 @@ class TableRenderer(_Base):
         for v in items:
             status = markup_green("In Use") if v.used_by else markup_yellow("Orphaned")
             raw = v.name[:50] + "..." if len(v.name) > 50 else v.name
-            _safe_row(table, _mark_cell(marked, self._row_key(v)), raw, status)
+            size_bytes = self._volume_sizes.get(v.name)
+            # Computed on-demand only (`b`) — never on the snapshot path, it's
+            # too slow to fetch on every refresh (see `DockerClient.volume_sizes`).
+            size = (
+                format_size(size_bytes)
+                if size_bytes is not None
+                else SafeMarkup("[dim]—[/]")
+            )
+            _safe_row(table, _mark_cell(marked, self._row_key(v)), raw, size, status)
 
     def _populate_network_table(
         self, table: DataTable, items: list[Network] | None = None
@@ -384,9 +422,15 @@ class TableRenderer(_Base):
             items = self.snapshot.networks
         self._current[TabID.NETWORKS] = items
         marked = self._marked[TabID.NETWORKS]
+        containers = self.snapshot.containers if self.snapshot else []
         for n in items:
             _safe_row(
-                table, _mark_cell(marked, self._row_key(n)), n.name, n.driver, n.scope
+                table,
+                _mark_cell(marked, self._row_key(n)),
+                n.name,
+                n.driver,
+                n.scope,
+                _network_containers_markup(n, containers),
             )
 
     def _sort_items(self, tab_id: TabID, entry: "ResourceEntry", items: list) -> list:
