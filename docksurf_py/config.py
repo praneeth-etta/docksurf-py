@@ -30,6 +30,8 @@ default_since_seconds = 0
 delete = true
 # Ask before `docker compose down` on a project.
 compose_down = true
+# Ask before rebuilding a Compose service (image + container).
+rebuild = true
 # Ask before any prune target.
 prune = true
 """
@@ -44,6 +46,7 @@ class Config:
     default_log_since_seconds: int = 0
     confirm_delete: bool = True
     confirm_compose_down: bool = True
+    confirm_rebuild: bool = True
     confirm_prune: bool = True
 
 
@@ -138,6 +141,11 @@ def load_config(path: Path | None = None) -> Config:
             confirm.get("compose_down", defaults.confirm_compose_down),
             defaults.confirm_compose_down,
             "confirm.compose_down",
+        ),
+        confirm_rebuild=_coerce_bool(
+            confirm.get("rebuild", defaults.confirm_rebuild),
+            defaults.confirm_rebuild,
+            "confirm.rebuild",
         ),
         confirm_prune=_coerce_bool(
             confirm.get("prune", defaults.confirm_prune),

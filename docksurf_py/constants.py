@@ -40,6 +40,10 @@ BTN_INSPECT_CLOSE_ID = "inspect-close"
 PULL_PROGRESS_VIEW_ID = "pull-progress-view"
 BTN_PULL_PROGRESS_CLOSE_ID = "pull-progress-close"
 
+# BuildProgressScreen widget IDs
+BUILD_PROGRESS_VIEW_ID = "build-progress-view"
+BTN_BUILD_PROGRESS_CLOSE_ID = "build-progress-close"
+
 # LayerHistoryScreen widget IDs
 BTN_LAYER_HISTORY_CLOSE_ID = "layer-history-close"
 

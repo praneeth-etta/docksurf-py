@@ -16,6 +16,7 @@ from docksurf_py.docker.format import (
     format_uptime,
 )
 from docksurf_py.docker.streams import (
+    ComposeBuildStream,
     EventStream,
     LogStream,
     MergedLogStream,
@@ -34,6 +35,7 @@ __all__ = [
     "StatsStream",
     "EventStream",
     "PullStream",
+    "ComposeBuildStream",
     "format_relative_time",
     "format_uptime",
     "format_size",

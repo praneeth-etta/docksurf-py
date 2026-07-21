@@ -9,6 +9,7 @@ Facade package: re-exports everything the single-file `widgets.py` used to
 expose, so callers keep using `from docksurf_py.widgets import X` unchanged.
 """
 
+from docksurf_py.widgets.build_progress_screen import BuildProgressScreen
 from docksurf_py.widgets.container_picker_screen import ContainerPickerScreen
 from docksurf_py.widgets.detail_pane import DetailPane
 from docksurf_py.widgets.dialogs import ConfirmDialog, PromptField, PromptScreen
@@ -54,6 +55,7 @@ __all__ = [
     "InspectScreen",
     "PruneScreen",
     "PullProgressScreen",
+    "BuildProgressScreen",
     "LayerHistoryScreen",
     "ContainerPickerScreen",
     "SearchBar",

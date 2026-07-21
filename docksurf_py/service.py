@@ -10,6 +10,7 @@ from typing import Protocol
 from docksurf_py.connection import ConnectionState
 from docksurf_py.constants import LogOptions
 from docksurf_py.docker import (
+    ComposeBuildStream,
     EventStream,
     LogStream,
     MergedLogStream,
@@ -78,6 +79,21 @@ class DockerService(Protocol):
         config_files: str = "",
         working_dir: str = "",
     ) -> CommandResult: ...
+
+    def compose_buildable_services(
+        self,
+        project: str,
+        config_files: str = "",
+        working_dir: str = "",
+    ) -> set[str] | None: ...
+
+    def stream_compose_rebuild(
+        self,
+        project: str,
+        service: str,
+        config_files: str = "",
+        working_dir: str = "",
+    ) -> ComposeBuildStream: ...
 
     def stop_container(self, container_id: str) -> CommandResult: ...
 

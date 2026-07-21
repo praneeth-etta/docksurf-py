@@ -552,8 +552,20 @@ class ContainerActionHandler(_Base):
         if c is None:
             self.notify(self._CONTAINER_TAB_HINT, severity="warning")
             return
-        logger.info("Opening log pane for container %s (%s)", c.name, c.id)
-        log_pane.load(c.id, c.name, self.docker.stream_logs)
+        self._open_container_logs(c.id, c.name)
+
+    def _open_container_logs(self, key: str, name: str) -> None:
+        """Open the log pane for one container, streaming `docker logs`.
+
+        `key` is the container reference handed to `stream_logs`, an id for the
+        `l` key (canonical, the focused container is live), or a Compose
+        container *name* for the post-rebuild flow, where the id has changed but
+        `docker logs <name>` resolves the freshly-recreated container. `name` is
+        the label shown in the pane header.
+        """
+        log_pane = self.query_one(f"#{LOG_PANE_ID}", LogPane)
+        logger.info("Opening log pane for container %s (%s)", name, key)
+        log_pane.load(key, name, self.docker.stream_logs)
         self.query_one(f"#{DETAIL_PANE_ID}", DetailPane).display = False
         log_pane.display = True
 

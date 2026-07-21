@@ -2,7 +2,9 @@
 docker/client.py — DockerClient: the sole Docker-facing object the app imports.
 """
 
+import json
 import logging
+import os
 import shutil
 import subprocess
 from dataclasses import replace
@@ -33,6 +35,7 @@ from docksurf_py.docker.context import (
 from docksurf_py.docker.fetcher import DockerResourceFetcher, _parse_container_detail
 from docksurf_py.docker.format import _parse_system_df, format_size
 from docksurf_py.docker.streams import (
+    ComposeBuildStream,
     EventStream,
     LogStream,
     MergedLogStream,
@@ -797,6 +800,81 @@ class DockerClient:
             return CommandResult.failure(msg, kind=CommandErrorKind.UNKNOWN)
 
         return CommandResult.success(f"Compose {verb} succeeded for {project}")
+
+    def compose_buildable_services(
+        self,
+        project: str,
+        config_files: str = "",
+        working_dir: str = "",
+    ) -> set[str] | None:
+        """Service names in a Compose project that declare a `build:` section.
+
+        Runs `docker compose ... config --format json` and inspects each service
+        for a build context, so the rebuild action can skip image-only services
+        (e.g. `image: postgres`) that have nothing to build. Returns `None` if the
+        config can't be resolved (docker missing / non-zero exit / parse error) —
+        callers treat `None` as "couldn't determine", not "nothing buildable".
+        """
+        if shutil.which("docker") is None:
+            logger.warning("compose config aborted — docker CLI not found on PATH")
+            return None
+
+        cmd = ["docker", "compose"]
+        for config_file in filter(None, config_files.split(",")):
+            cmd += ["-f", config_file.strip()]
+        cmd += ["-p", project, "config", "--format", "json"]
+
+        try:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, cwd=working_dir or None
+            )
+        except Exception as e:
+            logger.warning("compose config failed for %s: %s", project, e)
+            return None
+        if result.returncode != 0:
+            logger.warning(
+                "compose config exited %s for %s: %s",
+                result.returncode,
+                project,
+                (result.stderr or "").strip(),
+            )
+            return None
+        try:
+            parsed = json.loads(result.stdout)
+        except (json.JSONDecodeError, ValueError) as e:
+            logger.warning("compose config JSON parse failed for %s: %s", project, e)
+            return None
+
+        services = parsed.get("services") or {}
+        return {
+            name
+            for name, spec in services.items()
+            if isinstance(spec, dict) and spec.get("build")
+        }
+
+    def stream_compose_rebuild(
+        self,
+        project: str,
+        service: str,
+        config_files: str = "",
+        working_dir: str = "",
+    ) -> ComposeBuildStream:
+        """Stream a rebuild + recreate of one Compose service.
+
+        Sanctioned Compose subprocess exception (like `compose_action`): runs
+        `docker compose ... up -d --build --no-deps <service>`, rebuilding the
+        service's image from source and recreating only its container
+        (dependencies left untouched). `BUILDKIT_PROGRESS=plain` is set in the
+        environment (not as a CLI flag — `compose up` rejects `--progress`) so
+        BuildKit output stays line-oriented and streams cleanly into an
+        append-only log view.
+        """
+        cmd = ["docker", "compose"]
+        for config_file in filter(None, config_files.split(",")):
+            cmd += ["-f", config_file.strip()]
+        cmd += ["-p", project, "up", "-d", "--build", "--no-deps", service]
+        env = {**os.environ, "BUILDKIT_PROGRESS": "plain"}
+        return ComposeBuildStream(cmd, cwd=working_dir or None, env=env)
 
     # --- Internal ---
 

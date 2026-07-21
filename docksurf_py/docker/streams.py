@@ -2,6 +2,8 @@
 
 import logging
 import queue
+import shutil
+import subprocess
 import threading
 import time
 from dataclasses import replace
@@ -364,3 +366,85 @@ class PullStream:
             logger.info("Pull stream stopped for %s:%s", self._repository, self._tag)
         self._active = False
         _safe_close(self._generator)
+
+
+class ComposeBuildStream:
+    """Streams `docker compose up --build` output for one service.
+
+    A subprocess variant of the SDK-based streams here: docker-py has no Compose
+    support (the sanctioned Compose subprocess exception — see CLAUDE.md), so
+    this wraps a `docker compose` process rather than an SDK generator.
+    `__iter__` yields combined stdout/stderr lines as the build/recreate runs;
+    `returncode` is set when the process exits (like `EventStream.error`, this
+    iterator never raises). `stop()` terminates the process, so closing the
+    progress screen mid-build actually stops the build.
+    """
+
+    def __init__(
+        self,
+        cmd: list[str],
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+    ) -> None:
+        self._cmd = cmd
+        self._cwd = cwd or None
+        # Environment for the subprocess (e.g. BUILDKIT_PROGRESS=plain to keep
+        # build output line-oriented). None inherits the parent environment.
+        self._env = env
+        self._active = False
+        self._process: subprocess.Popen | None = None
+        # None until the process exits; consumers read it to tell success from
+        # failure after the line loop ends.
+        self.returncode: int | None = None
+
+    def __iter__(self) -> Iterator[str]:
+        self._active = True
+        logger.info(
+            "Compose build stream started: %s (cwd=%s)",
+            " ".join(self._cmd),
+            self._cwd,
+        )
+        if shutil.which(self._cmd[0]) is None:
+            self.returncode = 1
+            yield "docker CLI not found on PATH — cannot rebuild"
+            self._active = False
+            return
+        try:
+            self._process = subprocess.Popen(
+                self._cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                cwd=self._cwd,
+                env=self._env,
+            )
+            assert self._process.stdout is not None
+            for raw_line in self._process.stdout:
+                if not self._active:
+                    break
+                yield raw_line.rstrip("\n")
+            self._process.stdout.close()
+            self.returncode = self._process.wait()
+        except Exception as e:  # noqa: BLE001 - surface any unexpected failure
+            logger.exception("Compose build stream error: %s", e)
+            if self.returncode is None:
+                self.returncode = 1
+            yield f"Build stream error: {e}"
+        finally:
+            self.stop()
+
+    def stop(self) -> None:
+        if self._active:
+            logger.info("Compose build stream stopped")
+        self._active = False
+        proc = self._process
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+            except Exception:
+                pass

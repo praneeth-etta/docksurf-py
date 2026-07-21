@@ -13,6 +13,13 @@ PyPI publish workflow.
 
 ## [Unreleased]
 
+### Added
+- Rebuild a Compose service in place (`B`): rebuilds the service's image from
+  source and recreates just its container (`docker compose up -d --build
+  --no-deps`). Streams the build in a modal and, on success, opens
+  the recreated container's logs. Image-only services (no `build:` section) are
+  detected and skipped; the confirmation is skippable via `confirm.rebuild`.
+
 ## [0.2.1] - 2026-07-15
 
 ### Fixed

@@ -24,7 +24,7 @@ class ContainerTable(DataTable):
         Binding("e", "exec_container", "Exec"),
         Binding("E", "exec_custom", "Exec (custom)", show=False),
         Binding("C", "copy_files", "Copy files", show=False),
-        Binding("l", "view_logs", "Logs (toggle)"),
+        Binding("l", "view_logs", "Logs"),
         Binding("f", "follow_logs", "Follow"),
         Binding("c", "clear_logs", "Clear", show=False),
         Binding("z", "toggle_log_expand", "Expand Logs", show=False),
@@ -43,6 +43,7 @@ class ContainerTable(DataTable):
         Binding("d", "delete", "Delete"),
         Binding("ctrl+u", "compose_up", "Compose Up"),
         Binding("ctrl+k", "compose_down", "Compose Down"),
+        Binding("B", "rebuild_service", "Rebuild", show=False),
         Binding("t", "container_top", "Top"),
         Binding("space", "toggle_mark", "Mark / Collapse", show=False),
     ]

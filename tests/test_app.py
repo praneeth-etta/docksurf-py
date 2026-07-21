@@ -75,6 +75,7 @@ from docksurf_py.models import (
 from docksurf_py.session import SessionState
 from docksurf_py.topology import _network_members, _network_summary, network_topology
 from docksurf_py.widgets import (
+    BuildProgressScreen,
     ConfirmDialog,
     ConnectionIndicator,
     ContainerPickerScreen,
@@ -131,6 +132,26 @@ class FakePullStream:
             if not self._active:
                 break
             yield chunk
+
+    def stop(self) -> None:
+        self._active = False
+
+
+class FakeComposeBuildStream:
+    """A finite build stream yielding fixed lines then a fixed returncode."""
+
+    def __init__(self, lines: list[str], returncode: int) -> None:
+        self._lines = list(lines)
+        self._returncode = returncode
+        self.returncode: int | None = None
+        self._active = True
+
+    def __iter__(self):
+        for line in self._lines:
+            if not self._active:
+                break
+            yield line
+        self.returncode = self._returncode
 
     def stop(self) -> None:
         self._active = False
@@ -204,6 +225,12 @@ class MockDockerService:
         # (no env, no health log, no start time, no restarts) for anything
         # unlisted.
         self.container_detail_map: dict[str, ContainerDetail] = {}
+        # Rebuild controls: which services report a build section (None =
+        # "couldn't determine"), and the lines/exit code a rebuild stream
+        # yields. Tests can override before pressing `B`.
+        self.buildable_services: set[str] | None = None
+        self.rebuild_lines: list[str] = ["#1 building", "#2 exporting"]
+        self.rebuild_returncode: int = 0
 
     @property
     def is_connected(self) -> bool:
@@ -280,6 +307,16 @@ class MockDockerService:
     ) -> CommandResult:
         self.calls.append(("compose_action", project, verb))
         return CommandResult.success()
+
+    def compose_buildable_services(
+        self, project, config_files="", working_dir=""
+    ) -> set[str] | None:
+        self.calls.append(("compose_buildable_services", project))
+        return self.buildable_services
+
+    def stream_compose_rebuild(self, project, service, config_files="", working_dir=""):
+        self.calls.append(("stream_compose_rebuild", project, service))
+        return FakeComposeBuildStream(self.rebuild_lines, self.rebuild_returncode)
 
     def stop_container(self, container_id: str) -> CommandResult:
         self.calls.append(("stop_container", container_id))
@@ -848,6 +885,124 @@ class TabNavigationTests(unittest.IsolatedAsyncioTestCase):
             )
             app.screen_stack[-1].dismiss(True)
             await wait_until(lambda: ("compose_action", "myapp", "down") in svc.calls)
+
+
+class RebuildServiceTests(unittest.IsolatedAsyncioTestCase):
+    """`B` on a Compose service container rebuilds its image + recreates it.
+
+    `_compose_snapshot` groups the "myapp" project (header + sorted service
+    rows `db`, `web`) then the standalone container; `_focus_web_service`
+    resolves the "web" row by scanning `_current` rather than hardcoding an
+    index the group sort could shift.
+    """
+
+    async def _focus_web_service(self, app: DockSurfApp, pilot) -> None:
+        await wait_until(lambda: bool(app._current.get(TabID.CONTAINERS)))
+        rows = app._current[TabID.CONTAINERS]
+        row = next(
+            i
+            for i, item in enumerate(rows)
+            if isinstance(item, Container) and item.compose_service == "web"
+        )
+        table = app.query_one(f"#{TableID.CONTAINERS}", DataTable)
+        table.focus()
+        table.move_cursor(row=row)
+
+    async def test_rebuild_streams_then_opens_logs_on_success(self) -> None:
+        svc = MockDockerService(_compose_snapshot)
+        svc.buildable_services = {"web"}
+        svc.rebuild_returncode = 0
+        app = DockSurfApp(docker=svc)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await self._focus_web_service(app, pilot)
+
+            await pilot.press("B")
+            await wait_until(
+                lambda: any(isinstance(s, ConfirmDialog) for s in app.screen_stack)
+            )
+            app.screen_stack[-1].dismiss(True)
+
+            await wait_until(
+                lambda: ("stream_compose_rebuild", "myapp", "web") in svc.calls
+            )
+            # Success: the build modal is dismissed and the recreated
+            # container's logs are opened — by its (stable) Compose name, so a
+            # changed id doesn't matter.
+            log_pane = app.query_one(f"#{LOG_PANE_ID}", LogPane)
+            await wait_until(lambda: log_pane.display)
+            self.assertFalse(
+                any(isinstance(s, BuildProgressScreen) for s in app.screen_stack)
+            )
+            self.assertTrue(
+                any(c[0] == "stream_logs" and c[1] == "myapp-web" for c in svc.calls)
+            )
+
+    async def test_rebuild_failure_keeps_modal_and_skips_logs(self) -> None:
+        svc = MockDockerService(_compose_snapshot)
+        svc.buildable_services = {"web"}
+        svc.rebuild_returncode = 1
+        app = DockSurfApp(docker=svc)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await self._focus_web_service(app, pilot)
+
+            with patch.object(app, "notify") as notify:
+                await pilot.press("B")
+                await wait_until(
+                    lambda: any(isinstance(s, ConfirmDialog) for s in app.screen_stack)
+                )
+                app.screen_stack[-1].dismiss(True)
+                await wait_until(
+                    lambda: any(
+                        "Rebuild failed" in str(c.args[0])
+                        for c in notify.call_args_list
+                    )
+                )
+            # Modal stays up for the user to read the error; no logs opened.
+            self.assertTrue(
+                any(isinstance(s, BuildProgressScreen) for s in app.screen_stack)
+            )
+            self.assertFalse(app.query_one(f"#{LOG_PANE_ID}", LogPane).display)
+
+    async def test_rebuild_skips_build_less_service(self) -> None:
+        svc = MockDockerService(_compose_snapshot)
+        svc.buildable_services = set()  # "web" not buildable (image-only)
+        app = DockSurfApp(docker=svc)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await self._focus_web_service(app, pilot)
+
+            with patch.object(app, "notify") as notify:
+                await pilot.press("B")
+                await wait_until(
+                    lambda: any(
+                        "No build defined" in str(c.args[0])
+                        for c in notify.call_args_list
+                    )
+                )
+            # No confirm, no rebuild stream.
+            self.assertFalse(
+                any(isinstance(s, ConfirmDialog) for s in app.screen_stack)
+            )
+            self.assertFalse(any(c[0] == "stream_compose_rebuild" for c in svc.calls))
+
+    async def test_rebuild_noops_on_project_header(self) -> None:
+        svc = MockDockerService(_compose_snapshot)
+        svc.buildable_services = {"web"}
+        app = DockSurfApp(docker=svc)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await wait_until(lambda: bool(app._current.get(TabID.CONTAINERS)))
+            table = app.query_one(f"#{TableID.CONTAINERS}", DataTable)
+            table.focus()
+            table.move_cursor(row=0)  # project header
+            self.assertTrue(app._focused_is_project_header())
+
+            with patch.object(app, "notify") as notify:
+                await pilot.press("B")
+                await wait_until(lambda: notify.called)
+            self.assertFalse(any(c[0] == "stream_compose_rebuild" for c in svc.calls))
 
 
 class InspectActionTests(unittest.IsolatedAsyncioTestCase):

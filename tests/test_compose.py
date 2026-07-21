@@ -228,5 +228,88 @@ class ComposeActionCommandTests(unittest.TestCase):
         self.assertEqual(result.kind, CommandErrorKind.UNKNOWN)
 
 
+class ComposeRebuildCommandTests(unittest.TestCase):
+    def _client(self) -> DockerClient:
+        client = DockerClient()
+        client._sdk = MagicMock()
+        return client
+
+    def test_rebuild_builds_scoped_up_command(self) -> None:
+        client = self._client()
+        stream = client.stream_compose_rebuild(
+            "myapp",
+            "web",
+            config_files="/srv/myapp/a.yml,/srv/myapp/b.yml",
+            working_dir="/srv/myapp",
+        )
+        self.assertEqual(
+            stream._cmd,
+            [
+                "docker",
+                "compose",
+                "-f",
+                "/srv/myapp/a.yml",
+                "-f",
+                "/srv/myapp/b.yml",
+                "-p",
+                "myapp",
+                "up",
+                "-d",
+                "--build",
+                "--no-deps",
+                "web",
+            ],
+        )
+        self.assertEqual(stream._cwd, "/srv/myapp")
+        # Plain BuildKit progress is forced via env, not a CLI flag — `compose
+        # up` rejects `--progress`.
+        self.assertEqual(stream._env["BUILDKIT_PROGRESS"], "plain")
+
+    def test_buildable_services_parses_build_sections(self) -> None:
+        client = self._client()
+        config = (
+            '{"services": {'
+            '"web": {"build": {"context": "."}}, '
+            '"db": {"image": "postgres:16"}, '
+            '"worker": {"build": "./worker"}}}'
+        )
+        with (
+            patch(
+                "docksurf_py.docker.client.shutil.which", return_value="/usr/bin/docker"
+            ),
+            patch("docksurf_py.docker.client.subprocess.run") as run,
+        ):
+            run.return_value = MagicMock(returncode=0, stdout=config, stderr="")
+            services = client.compose_buildable_services("myapp")
+        self.assertEqual(services, {"web", "worker"})
+
+    def test_buildable_services_none_when_docker_missing(self) -> None:
+        client = self._client()
+        with patch("docksurf_py.docker.client.shutil.which", return_value=None):
+            self.assertIsNone(client.compose_buildable_services("myapp"))
+
+    def test_buildable_services_none_on_nonzero_exit(self) -> None:
+        client = self._client()
+        with (
+            patch(
+                "docksurf_py.docker.client.shutil.which", return_value="/usr/bin/docker"
+            ),
+            patch("docksurf_py.docker.client.subprocess.run") as run,
+        ):
+            run.return_value = MagicMock(returncode=1, stdout="", stderr="boom")
+            self.assertIsNone(client.compose_buildable_services("myapp"))
+
+    def test_buildable_services_none_on_bad_json(self) -> None:
+        client = self._client()
+        with (
+            patch(
+                "docksurf_py.docker.client.shutil.which", return_value="/usr/bin/docker"
+            ),
+            patch("docksurf_py.docker.client.subprocess.run") as run,
+        ):
+            run.return_value = MagicMock(returncode=0, stdout="not json", stderr="")
+            self.assertIsNone(client.compose_buildable_services("myapp"))
+
+
 if __name__ == "__main__":
     unittest.main()
