@@ -25,6 +25,7 @@ from docksurf_py.docker.streams import (
     _assign_service_colors,
     _parse_stats,
     _split_timestamp,
+    _strip_ansi,
 )
 
 __all__ = [
@@ -43,6 +44,7 @@ __all__ = [
     "format_labels",
     "format_env",
     "_split_timestamp",
+    "_strip_ansi",
     "_assign_service_colors",
     "_parse_stats",
     "_parse_system_df",

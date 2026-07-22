@@ -2,6 +2,7 @@
 
 import logging
 import queue
+import re
 import shutil
 import subprocess
 import threading
@@ -31,6 +32,24 @@ def _safe_close(generator) -> None:
             generator.close()
         except Exception:
             pass
+
+
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
+
+
+def _strip_ansi(text: str) -> str:
+    """Strip ANSI CSI escape codes (SGR colour codes, cursor moves, ...).
+
+    Some containerized apps (e.g. Erlang/RabbitMQ) colourize their own stdout
+    unconditionally, even with no TTY attached. Rich has no way to know these
+    bytes are meant to be invisible control codes — it counts each one as an
+    ordinary printable character. That mis-count both leaks the raw codes
+    into copied/exported text and throws off `RichLog`'s cell-width
+    bookkeeping (real terminals swallow the codes as zero-width, so content
+    can bleed into the scrollbar gutter). Stripping here, at ingestion, keeps
+    every downstream consumer (view, search, export, copy) clean.
+    """
+    return _ANSI_ESCAPE_RE.sub("", text)
 
 
 def _split_timestamp(raw: str) -> tuple[str, str]:
@@ -92,7 +111,7 @@ class LogStream:
                 if not self._active:
                     break
                 ts, text = _split_timestamp(
-                    raw_line.decode("utf-8", errors="replace").rstrip()
+                    _strip_ansi(raw_line.decode("utf-8", errors="replace").rstrip())
                 )
                 yield LogLine(text=text, ts=ts)
         except NotFound:

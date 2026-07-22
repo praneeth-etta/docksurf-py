@@ -152,6 +152,15 @@ LogPane #log-pane-view {
     padding: 0 1;
 }
 
+/* Text-selection highlight (drag-select in the log pane). Only the background
+   is used (SelectableRichLog keeps each line's own fg), and the percentage
+   makes it translucent — Textual blends it over the theme background to a solid
+   tint, so the original coloured text stays readable through the highlight.
+   Bump the percentage for a stronger highlight, or swap $accent for a colour. */
+Screen > .screen--selection {
+    background: $accent 40%;
+}
+
 HelpScreen {
     align: center middle;
     background: $background 60%;

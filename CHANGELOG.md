@@ -19,6 +19,19 @@ PyPI publish workflow.
   --no-deps`). Streams the build in a modal and, on success, opens
   the recreated container's logs. Image-only services (no `build:` section) are
   detected and skipped; the confirmation is skippable via `confirm.rebuild`.
+- Log pane: mouse drag-to-select now works — drag over log text to highlight it,
+  then `Ctrl+C` to copy. Textual's `RichLog` has no selection support (it never
+  maps click coordinates or paints the highlight), so DockSurf ships a
+  `SelectableRichLog` that implements selection over the rendered lines.
+
+### Fixed
+- Log pane: container log lines containing raw ANSI escape codes (some apps
+  colour their own stdout unconditionally, even without a TTY) leaked the raw
+  codes into copied/exported text and threw off `RichLog`'s cell-width
+  bookkeeping, letting content bleed into the scrollbar gutter. Now stripped
+  at ingestion.
+- Whale (`~`): the tail-fin and lobe frames were missing a trailing space,
+  misaligning the ASCII art by one column as it cycled.
 
 ## [0.2.1] - 2026-07-15
 

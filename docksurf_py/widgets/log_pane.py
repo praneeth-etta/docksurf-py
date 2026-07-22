@@ -5,12 +5,16 @@ import threading
 from collections import deque
 from typing import Callable, Iterable, Iterator, Protocol
 
+from rich.cells import cell_len
 from rich.markup import escape
+from rich.style import Style
 from textual import on
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.message import Message
 from textual.screen import ModalScreen
+from textual.selection import Selection
+from textual.strip import Strip
 from textual.timer import Timer
 from textual.widget import Widget
 from textual.widgets import Button, Input, Label, RichLog, Select
@@ -96,6 +100,94 @@ class LogSource(Protocol):
     def stop(self) -> None: ...
 
 
+class SelectableRichLog(RichLog):
+    """A `RichLog` with working mouse text selection (drag-select + `Ctrl+C`).
+
+    Upstream `RichLog` inherits `ALLOW_SELECT = True` but implements none of the
+    machinery selection needs, so a drag highlights nothing and copies an empty
+    (or wrong) region. This mirrors what textual's own `Log` widget does,
+    adapted to RichLog's `Strip`-based lines:
+
+    - `render_line` bakes document offsets (`apply_offsets`) into the returned
+      strip so the screen ↔ (line, column) mapping is correct even when scrolled.
+    - `_render_line` paints the `screen--selection` style over the selected
+      column span of each line (splitting the strip with `divide`/`join`).
+    - `selection_updated` refreshes so the highlight repaints as the drag moves.
+    - `get_selection` reconstructs the selected text from the line strips.
+
+    `self.lines` holds one `Strip` per shown line, so selection operates on
+    exactly what's on screen (filtered view included). No `max_lines` is set on
+    this widget, so `self.lines` indexes are document line indexes (`_start_line`
+    stays 0).
+    """
+
+    def _render_line(self, y: int, scroll_x: int, width: int) -> Strip:
+        selection = self.text_selection
+        if selection is None or y >= len(self.lines):
+            # No selection → the cached fast path in the base class.
+            return super()._render_line(y, scroll_x, width)
+        # Paint the selected span onto the full line before cropping, so the
+        # highlight survives horizontal scroll the same way the text does.
+        full = self.lines[y]
+        span = selection.get_span(y)
+        if span is not None:
+            start, end = span
+            # `get_span` returns *character* offsets — Textual converts the
+            # mouse's cell position to a character index when the drag
+            # happens (see `_compositor.get_widget_and_offset_at`), so that
+            # wide characters land on the right side of the cut regardless of
+            # cell width. `Strip.divide` instead cuts at *cell* positions, so
+            # the character indices must be converted before use or a line
+            # with CJK/wide characters would highlight short of the actual
+            # selection.
+            text = full.text
+            char_length = len(text)
+            if end == -1:
+                end = char_length
+            start = max(0, min(start, char_length))
+            end = max(0, min(end, char_length))
+            if end > start:
+                cell_start = cell_len(text[:start])
+                cell_end = cell_len(text[:end])
+                cell_length = full.cell_length
+                parts = full.divide([cell_start, cell_end, cell_length])
+                if len(parts) == 3:
+                    before, selected, after = parts
+                    full = Strip.join(
+                        [before, selected.apply_style(self._selection_style), after]
+                    )
+        return full.crop_extend(scroll_x, scroll_x + width, self.rich_style)
+
+    @property
+    def _selection_style(self) -> Style:
+        """The highlight style — the `screen--selection` **background only**.
+
+        Dropping the component's foreground keeps every line's own text colour
+        (a translucent tint over readable text), and — crucially — stops plain,
+        uncoloured log lines from inheriting the selection fg and vanishing.
+        Style the tint (e.g. a translucent `background`) via the
+        `screen--selection` rule in `app.tcss`."""
+        component = self.screen.get_component_rich_style("screen--selection")
+        return Style(bgcolor=component.bgcolor) if component.bgcolor else component
+
+    def render_line(self, y: int) -> Strip:
+        # Bake offsets onto the strip the base class already produced (order
+        # vs. the base's own `apply_style` doesn't matter — `Style.__add__`
+        # unions `meta` regardless of which side offsets are applied from).
+        strip = super().render_line(y)
+        scroll_x, scroll_y = self.scroll_offset
+        return strip.apply_offsets(scroll_x, scroll_y + y)
+
+    def selection_updated(self, selection: Selection | None) -> None:
+        # Re-run render_line so the highlight tracks the drag (the with-selection
+        # path above bypasses the strip cache, so no cache clear is needed).
+        self.refresh()
+
+    def get_selection(self, selection: Selection) -> tuple[str, str] | None:
+        text = "\n".join(strip.text for strip in self.lines)
+        return selection.extract(text), "\n"
+
+
 class LogPane(Widget):
     """Inline log viewer that lives in the right panel, expandable to full width."""
 
@@ -139,7 +231,7 @@ class LogPane(Widget):
             yield Label("", id=LOG_PANE_HEADER_ID)
             yield Button("⛶ Expand", id=BTN_EXPAND_ID)
         yield Input(placeholder="Filter logs... (Esc to clear)", id=LOG_PANE_SEARCH_ID)
-        yield RichLog(id=LOG_PANE_VIEW_ID, markup=True, highlight=False)
+        yield SelectableRichLog(id=LOG_PANE_VIEW_ID, markup=True, highlight=False)
 
     def on_mount(self) -> None:
         self.query_one(f"#{LOG_PANE_SEARCH_ID}", Input).display = False

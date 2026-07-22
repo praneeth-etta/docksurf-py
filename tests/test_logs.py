@@ -4,7 +4,7 @@
 import unittest
 
 from docksurf_py.constants import LogLine, LogOptions
-from docksurf_py.docker import LogStream, _split_timestamp
+from docksurf_py.docker import LogStream, _split_timestamp, _strip_ansi
 from docksurf_py.widgets import _buffer_to_text, _render_log_line
 from docksurf_py.widgets.log_pane import _LOG_BUFFER_MAXLEN, LogPane
 
@@ -48,6 +48,21 @@ class SplitTimestampTests(unittest.TestCase):
         self.assertEqual(text, "Container abc not found")
 
 
+class StripAnsiTests(unittest.TestCase):
+    def test_strips_sgr_reset(self) -> None:
+        self.assertEqual(
+            _strip_ansi("Running boot step rabbit\x1b[0m"), "Running boot step rabbit"
+        )
+
+    def test_strips_sgr_color_codes(self) -> None:
+        self.assertEqual(_strip_ansi("\x1b[36minfo\x1b[0m message"), "info message")
+
+    def test_leaves_plain_text_untouched(self) -> None:
+        self.assertEqual(
+            _strip_ansi("plain text, no escapes"), "plain text, no escapes"
+        )
+
+
 class LogStreamTests(unittest.TestCase):
     def _collect(self, container, options=None):
         stream = LogStream("cid", FakeSDK(container), options)
@@ -82,6 +97,14 @@ class LogStreamTests(unittest.TestCase):
         container = FakeContainer(status="exited", frames=[])
         _, kwargs = self._collect(container)
         self.assertFalse(kwargs["follow"])
+
+    def test_strips_ansi_from_raw_frames(self) -> None:
+        container = FakeContainer(
+            frames=[b"2024-01-01T00:00:00Z \x1b[36mRunning boot step\x1b[0m\n"]
+        )
+        lines, _ = self._collect(container)
+        self.assertEqual(lines[0].text, "Running boot step")
+        self.assertEqual(lines[0].ts, "2024-01-01T00:00:00Z")
 
 
 class RenderHelperTests(unittest.TestCase):

@@ -88,6 +88,7 @@ from docksurf_py.widgets import (
     PromptScreen,
     PruneScreen,
     PullProgressScreen,
+    SelectableRichLog,
     StatusBar,
 )
 from tests.test_compose import make_container
@@ -2852,6 +2853,98 @@ class DeleteForceTests(unittest.IsolatedAsyncioTestCase):
                 ("disconnect_container", "net1", "web"),
                 svc.calls,
             )
+
+
+class SelectableRichLogSelectionTests(unittest.TestCase):
+    """`get_selection` reconstructs the selected text from the line strips —
+    upstream `RichLog` leaves it unimplemented. Pure logic, no app needed."""
+
+    def _log(self, texts: list[str]) -> "SelectableRichLog":
+        from rich.segment import Segment
+        from textual.strip import Strip
+
+        log = SelectableRichLog()
+        log.lines = [Strip([Segment(t)]) for t in texts]
+        return log
+
+    def test_extracts_partial_single_line(self) -> None:
+        from textual.geometry import Offset
+        from textual.selection import Selection
+
+        log = self._log(["hello world"])
+        text, ending = log.get_selection(Selection(Offset(0, 0), Offset(5, 0)))
+        self.assertEqual(text, "hello")
+        self.assertEqual(ending, "\n")
+
+    def test_extracts_whole_buffer_when_unbounded(self) -> None:
+        from textual.selection import Selection
+
+        log = self._log(["alpha", "beta", "gamma"])
+        text, _ = log.get_selection(Selection(None, None))
+        self.assertEqual(text, "alpha\nbeta\ngamma")
+
+
+class SelectableRichLogRenderTests(unittest.IsolatedAsyncioTestCase):
+    """The highlight path (`divide`/`join`/`apply_style` + offset baking) can't
+    be driven headlessly by a real mouse, but this smoke-tests that rendering a
+    selected line runs without error and that the selection extracts correctly
+    once mounted."""
+
+    async def test_selected_line_renders_and_extracts(self) -> None:
+        from textual.app import App as _App
+        from textual.geometry import Offset
+        from textual.selection import Selection
+
+        class _Host(_App):
+            def compose(self):
+                yield SelectableRichLog(id="log", markup=True, highlight=False)
+
+        app = _Host()
+        async with app.run_test() as pilot:
+            log = app.query_one("#log", SelectableRichLog)
+            log.write("hello world")
+            log.write("second line")
+            await pilot.pause()
+            app.screen.selections = {log: Selection(Offset(0, 0), Offset(5, 0))}
+            await pilot.pause()
+            text, _ = log.get_selection(log.text_selection)
+            self.assertIn("hello", text)
+            # Rendering the selected line exercises the highlight span split.
+            self.assertIsNotNone(log.render_line(0))
+
+    async def test_wide_character_selection_highlights_and_extracts_correctly(
+        self,
+    ) -> None:
+        """`get_span` returns *character* offsets, but `Strip.divide` cuts at
+        *cell* positions — regression test for that mismatch dropping the
+        highlight short of the actual selection on CJK/wide-character lines."""
+        from textual.app import App as _App
+        from textual.geometry import Offset
+        from textual.selection import Selection
+
+        class _Host(_App):
+            def compose(self):
+                yield SelectableRichLog(id="log", markup=True, highlight=False)
+
+        app = _Host()
+        async with app.run_test() as pilot:
+            log = app.query_one("#log", SelectableRichLog)
+            log.write("你好world")
+            await pilot.pause()
+            # Character offsets 0..2 select "你好" (4 screen cells).
+            app.screen.selections = {log: Selection(Offset(0, 0), Offset(2, 0))}
+            await pilot.pause()
+            text, _ = log.get_selection(log.text_selection)
+            self.assertEqual(text, "你好")
+            highlight_bgcolor = log._selection_style.bgcolor
+            strip = log.render_line(0)
+            highlighted = "".join(
+                segment.text
+                for segment in strip._segments
+                if segment.style is not None
+                and segment.style.bgcolor == highlight_bgcolor
+            )
+            self.assertEqual(highlighted, "你好")
 
 
 class PullProgressScreenBufferTests(unittest.IsolatedAsyncioTestCase):
