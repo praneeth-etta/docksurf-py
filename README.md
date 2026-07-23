@@ -51,12 +51,11 @@ uvx docksurf
 
 - Linux: `docksurf-linux-x86_64`
 - macOS (Apple Silicon): `docksurf-macos-arm64`
-- macOS (Intel): `docksurf-macos-x86_64`
 - Windows: `docksurf-windows-x86_64.exe`
 
 ```bash
 chmod +x docksurf-linux-x86_64   # or the macOS binary you downloaded
-mv docksurf-linux-x86_64 /usr/local/bin/docksurf
+sudo mv docksurf-linux-x86_64 /usr/local/bin/docksurf
 docksurf
 ```
 

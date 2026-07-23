@@ -65,9 +65,6 @@ jobs:
           - os: windows-latest
             asset_name: docksurf-windows-x86_64.exe
             built_name: docksurf.exe
-          - os: macos-13
-            asset_name: docksurf-macos-x86_64
-            built_name: docksurf
           - os: macos-14
             asset_name: docksurf-macos-arm64
             built_name: docksurf
