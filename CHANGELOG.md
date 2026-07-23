@@ -11,7 +11,7 @@ the caveat that pre-1.0 (`0.x`) minor bumps may still include breaking changes.
 commit, then tag the commit `vx.y.z` and push the tag — that triggers the
 PyPI publish workflow.
 
-## [0.3.0] - 2026-07-23
+## [0.3.1] - 2026-07-23
 
 ### Added
 - Rebuild a Compose service in place (`B`): rebuilds the service's image from
