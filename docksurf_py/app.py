@@ -345,7 +345,7 @@ class DockSurfApp(
         self._resource_registry = {
             TabID.CONTAINERS: ResourceEntry(
                 table_id=TableID.CONTAINERS,
-                columns=("Name", "Image", "Status"),
+                columns=("Name", "Image"),
                 label="container",
                 snapshot_items=lambda snap: snap.containers,
                 populate=self._populate_container_table,
@@ -355,7 +355,6 @@ class DockSurfApp(
                 sort_keys={
                     "Name": lambda c: c.name.lower(),
                     "Image": lambda c: c.image_name.lower(),
-                    "Status": lambda c: (not c.running, c.status.lower()),
                 },
             ),
             TabID.IMAGES: ResourceEntry(

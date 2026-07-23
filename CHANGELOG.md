@@ -11,7 +11,7 @@ the caveat that pre-1.0 (`0.x`) minor bumps may still include breaking changes.
 commit, then tag the commit `vx.y.z` and push the tag — that triggers the
 PyPI publish workflow.
 
-## [Unreleased]
+## [0.3.0] - 2026-07-23
 
 ### Added
 - Rebuild a Compose service in place (`B`): rebuilds the service's image from
@@ -23,6 +23,14 @@ PyPI publish workflow.
   then `Ctrl+C` to copy. Textual's `RichLog` has no selection support (it never
   maps click coordinates or paints the highlight), so DockSurf ships a
   `SelectableRichLog` that implements selection over the rendered lines.
+
+### Changed
+- Containers tab: dropped the Status column (it scrolled off-screen on
+  narrower terminals and duplicated what the detail pane already shows) in
+  favour of a colored dot before each container's name — and each Compose
+  project's name — so state is visible at a glance without scrolling.
+  Sorting by Status is no longer available now that there's no column header
+  to click; sort by Name or Image instead.
 
 ### Fixed
 - Log pane: container log lines containing raw ANSI escape codes (some apps

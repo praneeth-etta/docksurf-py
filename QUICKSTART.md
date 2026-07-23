@@ -16,6 +16,8 @@ Or without installing, via [`uvx`](https://docs.astral.sh/uv/guides/tools/):
 uvx docksurf
 ```
 
+Download a standalone binary for your OS from the [latest release](https://github.com/praneeth-etta/docksurf/releases/latest) — `chmod +x` it (Linux/macOS) and run it; on Windows just run the `.exe`.
+
 From source (development, or an unreleased change):
 
 ```bash

@@ -40,8 +40,9 @@ The container/project keys are context-sensitive: on a Compose **project header*
 | `E` | Exec with a custom command and/or user (`-u`), pre-filled with the detected shell | — |
 | `t` | Toggle a `docker top` running-process snapshot in the detail pane | — |
 | `C` | Copy files in/out of the container (`docker cp`), via a source/destination prompt | — |
-| `u` | Compose **up** (`docker compose up -d`) — brings the focused project up |
-| `k` | Compose **down** (`docker compose down`, confirmed) — tears the project down |
+| `B` | Rebuild image from source + recreate this container (Compose services only; skipped for image-only services, e.g. `postgres`), streamed live | — |
+| `ctrl+u` | Compose **up** — brings the whole project up (`docker compose up -d`) | Compose **up** — brings the whole project up |
+| `ctrl+k` | Compose **down** — tears the whole project down (confirmed) | Compose **down** — tears the whole project down |
 | `space` | Mark for bulk action                          | Collapse / expand project group  |
 
 ## Images / Volumes / Networks tabs
@@ -76,3 +77,5 @@ Like the container keys, these are tab-scoped — each acts on the focused row o
 | `l`       | Close log viewer, return to detail pane                          |
 
 The `⛶ Expand` / `⊡ Collapse` button in the log toolbar is also clickable.
+
+**Mouse drag-to-select**: drag over log text to highlight it, then `Ctrl+C` to copy — Textual's log widget has no built-in selection support, so DockSurf implements it directly.

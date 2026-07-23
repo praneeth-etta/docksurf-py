@@ -69,20 +69,10 @@ def _status_markup(c: Container) -> SafeMarkup:
     return SafeMarkup(f"[{_status_color(c)}]{label}[/]")
 
 
-def _status_cell(
-    c: Container, container_details: dict[str, ContainerDetail]
-) -> SafeMarkup:
-    """Return the status markup, adding a restart-count badge if available.
-
-    Restart counts come from per-container inspect data, so the badge only
-    appears for containers whose details have already been loaded.
-    """
-    base = _status_markup(c)
-    detail = container_details.get(c.id)
-    if detail and detail.restart_count > 0:
-        badge = f"({detail.restart_count} restarts)"
-        return SafeMarkup(f"{base} [{STATUS_YELLOW}]{badge}[/]")
-    return base
+def _status_dot(color: str) -> str:
+    """Colored bullet prefixed to a Name cell — an at-a-glance state
+    indicator so users don't need to scroll a wide table to see Status."""
+    return f"[{color}]●[/]"
 
 
 def _safe_row(table: DataTable, *values) -> None:
@@ -324,12 +314,12 @@ class TableRenderer(_Base):
                 else ""
             )
             rows.append(project)
+            dot = _status_dot(_project_status_color(project))
             _safe_row(
                 table,
                 "",  # project headers can't be marked
-                SafeMarkup(f"[b]{glyph} {escape(project.name)}[/b]"),
+                SafeMarkup(f"[b]{glyph}[/b] {dot} [b]{escape(project.name)}[/b]"),
                 config,
-                _project_status_markup(project),
             )
             if collapsed:
                 continue
@@ -337,23 +327,25 @@ class TableRenderer(_Base):
             for idx, c in enumerate(members):
                 rows.append(c)
                 branch = "└" if idx == len(members) - 1 else "├"
-                name = SafeMarkup(f"  {branch} {escape(c.compose_service or c.name)}")
+                dot = _status_dot(_status_color(c))
+                name = SafeMarkup(
+                    f"  {branch} {dot} {escape(c.compose_service or c.name)}"
+                )
                 _safe_row(
                     table,
                     _mark_cell(marked, self._row_key(c)),
                     name,
                     c.image_name,
-                    _status_cell(c, self._container_details),
                 )
 
         for c in standalone:
             rows.append(c)
+            dot = _status_dot(_status_color(c))
             _safe_row(
                 table,
                 _mark_cell(marked, self._row_key(c)),
-                c.name,
+                SafeMarkup(f"{dot} {escape(c.name)}"),
                 c.image_name,
-                _status_cell(c, self._container_details),
             )
 
         self._current[TabID.CONTAINERS] = rows

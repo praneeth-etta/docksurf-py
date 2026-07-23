@@ -10,25 +10,24 @@ A keyboard-driven terminal UI for visualising and managing Docker resources like
 ## Highlights
 
 - **Live by default** — the tables auto-refresh on `docker events` (container start/stop/die, image pull/delete, …); `r` is a manual reload.
-- **Local or remote** — honours your active `docker context` on startup, so it manages the same daemon your CLI does: local, Docker Desktop, Colima, or a remote host over SSH/TCP.
-- **Docker Compose aware** — containers are grouped by project into a collapsible tree, with project-wide up / down / stop / start / restart and interleaved, colour-coded-per-service logs.
+- **Local or remote** — honours your active `docker context` on startup: local, Docker Desktop, Colima, or a remote host over SSH/TCP.
+- **Docker Compose aware** — containers grouped by project into a collapsible tree, with project-wide up/down/stop/start/restart, colour-coded per-service logs, and `B` to rebuild + recreate a single service in place.
 - **Live resource stats** — CPU %, memory, network and block I/O streamed into the detail pane for the selected running container.
 - **Full lifecycle control** — pause/unpause and kill sit alongside stop/start/restart, so a `stop` that hangs on its 10s timeout never needs the CLI.
 - **Multi-select + bulk actions** — mark rows on any tab and stop/start/remove them as a batch; ideal for cleaning up after a test run.
 - **Inspect & prune** — the full raw `docker inspect` JSON for any resource in a searchable modal, plus a one-key menu to prune stopped containers, dangling images, unused volumes/networks, or everything at once.
-- **Image / volume / network operations** — pull images with live progress, view layer history, tag, and bulk-clean dangling images; create volumes and check per-volume disk size; create networks and connect/disconnect containers, with per-container IP/MAC in the detail pane.
+- **Full image/volume/network CRUD** — pull, tag, and layer-history for images; create + size-on-disk for volumes; create + connect/disconnect for networks (see [Tabs](#tabs)).
 - **Power-user exec & copy** — a custom exec command with a chosen user, `docker cp` in/out of a container, and an on-demand `docker top` process snapshot, all via quick prompts.
-- **Full control log viewer** — live follow, in-log search with `n`/`N` match jumping, a timestamps toggle, configurable tail depth and `--since` window, line wrap for long JSON, jump-to-top/bottom, and one-key export of the buffer to a file.
-- **Operational signals at a glance** — colour-coded health column, uptime and restart count, plus recent health-check probe output in the detail pane.
+- **Full control log viewer** — live follow, in-log search, timestamps, configurable tail/`--since`, and mouse drag-to-select text to copy (`Ctrl+C`).
+- **Operational signals at a glance** — colour-coded health, uptime and restart count, plus recent health-check probe output in the detail pane.
 - **Disk usage** — a `docker system df` breakdown (per-type size + reclaimable) on demand.
-- **In-app context switching** — list and switch Docker contexts from inside the TUI (`D`) without ever running `docker context use`, so other terminals keep whatever context they already had. The choice is remembered across restarts.
-- **Auto-reconnect** — if the daemon goes down mid-session, the status bar flags it immediately and DockSurf reconnects on its own the moment it's back, with a full refresh — no restart required.
+- **In-app context switching** — list and switch Docker contexts from inside the TUI (`D`), remembered across restarts.
+- **Auto-reconnect** — if the daemon goes down mid-session, DockSurf reconnects and refreshes on its own the moment it's back.
 
 ## Requirements
 
-- Python 3.11+
 - A reachable Docker daemon (local, or a remote one via `docker context`)
-- [`uv`](https://github.com/astral-sh/uv) (package manager)
+- Python 3.11+ and [`uv`](https://github.com/astral-sh/uv) — not needed if you're using the [standalone binary](#install)
 - The `docker` CLI on `PATH` — only needed for exec-shell (`e`/`E`), Compose project actions (`u`/`k`), and file copy (`C`); everything else uses the SDK. DockSurf degrades gracefully if it's absent.
 
 ## Install
@@ -47,6 +46,21 @@ Or run it without installing, via [`uvx`](https://docs.astral.sh/uv/guides/tools
 ```bash
 uvx docksurf
 ```
+
+**Standalone binary** (no Python/pip/uv required) — download the file for your OS from the [latest release](https://github.com/praneeth-etta/docksurf/releases/latest):
+
+- Linux: `docksurf-linux-x86_64`
+- macOS (Apple Silicon): `docksurf-macos-arm64`
+- macOS (Intel): `docksurf-macos-x86_64`
+- Windows: `docksurf-windows-x86_64.exe`
+
+```bash
+chmod +x docksurf-linux-x86_64   # or the macOS binary you downloaded
+mv docksurf-linux-x86_64 /usr/local/bin/docksurf
+docksurf
+```
+
+On Windows, just run the `.exe` directly — no `chmod`/`mv` step needed.
 
 **From source** (for development, or to run an unreleased change):
 
@@ -95,7 +109,7 @@ The essentials — full reference (per-tab keys, log pane, Compose header behavi
 
 Every tab has a leading mark column (`space` to toggle) for multi-select + bulk actions — see [Keybindings](#keybindings).
 
-**Containers** — all containers (running and stopped), **grouped by Compose project** into a collapsible tree (project header → service rows), with standalone containers listed below. Columns: name, status, colour-coded health, and uptime. The detail pane shows image, ports, networks, project/service, uptime, restart count, a collapsible environment-variable section, a collapsible recent-health-probe log, a live CPU/mem/net/block-IO panel for a running container, and — on demand (`t`) — a `docker top` running-process snapshot.
+**Containers** — all containers (running and stopped), **grouped by Compose project** into a collapsible tree, with standalone containers below. Columns: name (with a colour-coded status dot) and image. The detail pane adds status, health, uptime, restart count, ports, networks, env vars, health-probe history, live CPU/mem/net/block-IO stats, and an on-demand `docker top` snapshot (`t`). For a Compose service, `B` rebuilds and recreates just that container, streamed live.
 
 **Images** — all images, tagged as *In Use*, *Unused*, or *Dangling*. Detail pane shows size, created date, architecture, and which containers reference the image. Pull new images with live progress (`+`), view per-layer history (`h`), retag (`y`), and one-key mark-all-dangling for bulk cleanup (`a`).
 
@@ -105,24 +119,13 @@ Every tab has a leading mark column (`space` to toggle) for multi-select + bulk 
 
 ## Architecture
 
-Eleven top-level modules/packages with strict layering (_models.py_ and _constants.py_ are leaf nodes and nothing imports into them). Four of the eleven — `docker`, `renderer`, `actions`, `widgets` — are packages split into one file per class/mixin, each re-exporting exactly what the equivalent single file used to expose, so nothing outside the package needed to change:
-
-- **`constants.py`** — widget/tab/table IDs, the _SafeMarkup_ render-boundary marker, and Rich markup helpers.
-- **`models.py`** — typed dataclasses for every resource (_Container_, _Image_, _Volume_, _Network_, _ComposeProject_, _ContainerStats_, _ContainerTop_, _SystemDf_, _ContextInfo_, …). No presentation logic.
-- **`connection.py`** — Docker connection detection/classification, context and host resolution.
-- **`docker/`** — all Docker I/O via the [Docker SDK for Python](https://docker-py.readthedocs.io/). _DockerClient_ (`client.py`) owns the SDK connection (honouring _docker context_, with an in-app override for `switch_context`) and every management call — full container lifecycle (stop/start/restart/pause/kill/remove), prune, inspect, `top`, file copy, and context listing/switching; it also detects a dropped daemon (`mark_disconnected`) so reconnecting doesn't need a restart. _DockerResourceFetcher_ (`fetcher.py`) does the parallel reads; _LogStream_/_MergedLogStream_/_StatsStream_/_EventStream_ (`streams.py`) are the live iterators; context resolution (`context.py`) and display formatting (`format.py`) round out the package.
-- **`service.py`** — the _DockerService_ protocol _DockerClient_ implements (swappable in tests).
-- **`widgets/`** — Textual UI components with no Docker knowledge, one file per widget/screen: _ContainerTable_, _DetailPane_, _LogPane_, _SearchBar_, _ConfirmDialog_, _HelpScreen_, _SystemDfScreen_, _InspectScreen_, _PruneScreen_, _PromptScreen_, _StatusBar_ (renders a connection-lost indicator).
-- **`renderer/`**, **`actions/`**, **`search.py`**, **`observability.py`** — focused mixin classes composed into _DockSurfApp_ in **_app.py_**, driven by a single per-tab ResourceEntry registry: table rendering, snapshot/event lifecycle, connection-state tracking, and multi-select marking (`renderer/`); container lifecycle, Compose, delete, bulk actions, inspect, prune, exec, file-copy, and context-switching actions (`actions/`); search (`search.py`); live stats, disk usage, and `docker top` (`observability.py`).
+Strict layering: `models.py` and `constants.py` are leaf modules nothing imports into. All Docker I/O lives in `docker/` (via the [Docker SDK for Python](https://docker-py.readthedocs.io/)) behind a `DockerService` protocol, so it's swappable in tests. `widgets/` is presentation-only, with no Docker knowledge. `renderer/`, `actions/`, `search.py`, and `observability.py` compose into the app itself — table rendering, resource actions, search, and live stats/`docker top` — driven by a single per-tab resource registry rather than branching on resource type throughout.
 
 ## How data is fetched
 
-DockSurf talks to Docker through the SDK (`docker-py`), not the CLI but with three sanctioned exceptions, all guarded on the `docker` CLI being present: the interactive **exec-shell** (needs a real TTY the SDK can't hand back), **Compose project actions** (docker-py has no Compose support, and `up` must recreate containers from the compose file), and **file copy** (`docker cp`) — the SDK only exposes raw tar archives, and safely reproducing `docker cp`'s copy semantics isn't worth it for a convenience feature.
+DockSurf talks to Docker through the SDK (`docker-py`), not the CLI — with three sanctioned exceptions, all guarded on the `docker` CLI being present: interactive **exec-shell** (needs a real TTY), **Compose project actions** (docker-py has no Compose support), and **file copy** (`docker cp` semantics aren't worth reproducing over the SDK's raw tar archives).
 
-- **Snapshots** — all four resource types are fetched in parallel via `ThreadPoolExecutor` on each refresh, so the UI never blocks.
-- **Event-driven refresh** — a background worker subscribes to `docker events` and debounces bursts into a refresh, ignoring high-frequency noise (exec probes, per-interval health-status pings). A refresh preserves your current selection rather than resetting the cursor.
-- **Live stats** — `container.stats(stream=True)` is streamed for the selected running container on a background thread and rendered into the detail pane (one stream at a time, to stay cheap).
-- **Logs** — streamed live from the SDK's generator; timestamps are always fetched (shown on demand), and tail depth / `--since` window are configurable per view. A Compose project's logs are merged across its containers with a colour-coded per-service prefix.
+Resource lists are fetched in parallel on every refresh and kept live via `docker events` (debounced, selection-preserving); stats and logs stream straight from the SDK, with a Compose project's logs merged and colour-coded per service.
 
 ## Docker contexts — local and remote
 
@@ -144,13 +147,7 @@ docker context create staging --docker "host=tcp://staging.example.com:2375"
 
 **Auto-reconnect** — if the daemon your active context points at goes down mid-session (VM reboot, daemon restart, network blip), the status bar flags it immediately (`● <reason>`) and DockSurf retries on its own every couple of seconds, reconnecting and refreshing the moment it's back — no restart, no manual `r`.
 
-**Common use cases:**
-- Managing a Linux VM (cloud instance, on-prem box, home server) over SSH without keeping a shell session open
-- Switching between staging and production daemons from one tool, mid-session, with `D`
-- Inspecting a production server's containers without full shell access
-- Managing a Raspberry Pi or other edge device from your laptop
-
-Any endpoint that speaks the **Docker Engine API** works this way — a plain Linux daemon, Docker Desktop, Colima, Rancher Desktop, or a remote host over SSH/TCP. Managed platforms that don't expose that API can't be reached this way, even with a custom context — **Azure Container Apps is the common trap**: it's Kubernetes-based under the hood with no Docker Engine endpoint at all, so `docker context`/DockSurf/`docker ps` have nothing to talk to. Azure Container Instances had a (now-deprecated) `docker context create aci` integration; Container Apps never did — manage those via `az containerapp`, the Azure Portal, or the Azure SDK instead.
+Works with any endpoint that speaks the **Docker Engine API** — a plain Linux daemon, Docker Desktop, Colima, Rancher Desktop, or a remote host over SSH/TCP. Managed platforms without that API can't be reached this way even with a custom context.
 
 ## Logging
 

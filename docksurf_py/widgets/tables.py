@@ -15,6 +15,14 @@ from textual.widgets import DataTable
 class ContainerTable(DataTable):
     """A Table specifically for Containers with context-aware bindings."""
 
+    def __init__(self, *args, **kwargs) -> None:
+        # DataTable's default ("css") makes the cursor row's CSS foreground
+        # color override every cell's own color, including the status dot
+        # prefixed to the Name cell, which would otherwise go flat/unreadable
+        # on exactly the row a user is currently looking at.
+        kwargs.setdefault("cursor_foreground_priority", "renderable")
+        super().__init__(*args, **kwargs)
+
     BINDINGS = [
         Binding("s", "stop_container", "Stop"),
         Binding("S", "start_container", "Start"),
