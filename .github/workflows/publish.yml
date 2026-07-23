@@ -52,3 +52,65 @@ jobs:
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
+
+  build-binaries:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            asset_name: docksurf-linux-x86_64
+            built_name: docksurf
+          - os: windows-latest
+            asset_name: docksurf-windows-x86_64.exe
+            built_name: docksurf.exe
+          - os: macos-13
+            asset_name: docksurf-macos-x86_64
+            built_name: docksurf
+          - os: macos-14
+            asset_name: docksurf-macos-arm64
+            built_name: docksurf
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+
+      - name: Set up Python
+        run: uv python install
+
+      - name: Install dependencies
+        run: uv sync --no-default-groups --group pyinstaller
+
+      - name: Build standalone binary
+        run: uv run pyinstaller packaging/docksurf.spec
+
+      - name: Rename binary to release asset name
+        run: mv "dist/${{ matrix.built_name }}" "dist/${{ matrix.asset_name }}"
+        shell: bash
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          path: dist/${{ matrix.asset_name }}
+
+  github-release:
+    needs: build-binaries
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Create GitHub Release with binaries attached
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-assets/*
+          generate_release_notes: true

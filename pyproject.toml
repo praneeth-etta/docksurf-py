@@ -1,6 +1,6 @@
 [project]
 name = "docksurf"
-version = "0.2.1"
+version = "0.3.0"
 description = "Live, keyboard-driven terminal UI for Docker: Compose-aware, real-time stats, zero polling — manage containers, images, volumes, and networks without leaving the terminal"
 readme = "README.md"
 license = "MIT"
@@ -50,6 +50,9 @@ dev = [
     "mypy>=1.11.0",
     "pytest>=8.0.0",
     "ruff>=0.12.0",
+]
+pyinstaller = [
+    "pyinstaller>=6.11.0",
 ]
 
 [tool.ruff]
